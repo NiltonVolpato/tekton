@@ -187,20 +187,16 @@ PROMPT_COMMAND='printf "\e]999;%d\a" $?'
 # Disable job control messages ([1] Done, [1]+ Stopped, etc.)
 set +m
 
-# SIGCHLD trap — writes structured notifications to named pipe
+# SIGCHLD trap — writes a signal byte to the named pipe
 TEKTON_PIPE="/tmp/tekton-jobs-$$"
 mkfifo "$TEKTON_PIPE"
 trap '__tekton_sigchld_handler' SIGCHLD
 
 __tekton_sigchld_handler() {
-    # Write completed job info to named pipe
-    # Format: PID:EXIT_CODE:COMMAND
-    for pid in $(jobs -p 2>/dev/null); do
-        if ! kill -0 "$pid" 2>/dev/null; then
-            wait "$pid" 2>/dev/null
-            echo "$pid:$?:done" > "$TEKTON_PIPE"
-        fi
-    done
+    # Signal the harness that some child's state changed.
+    # No structured data: the harness determines which job(s) finished
+    # by running `jobs -p` and diffing against its tracked state.
+    printf 'x' > "$TEKTON_PIPE"
 }
 ```
 
@@ -208,7 +204,7 @@ __tekton_sigchld_handler() {
 
 - **`PROMPT_COMMAND` with OSC sentinel**: The harness detects `\e]999;EXIT_CODE\a` to know when a command has completed and what its exit code was. OSC escapes are invisible to normal terminal rendering and won't appear in command output, making them unambiguous.
 - **`set +m`**: Disables monitor mode, suppressing bash's default `[1]+ Done  command` messages. These messages would appear asynchronously in the PTY output, interleaved with other content, and cannot be reliably filtered by text matching (the same string could appear in any program's output, e.g., a man page discussing job control). Background jobs, `jobs`, and `&` still work. SIGCHLD is still delivered. The tradeoff is losing `fg`/`bg`, but processes can be managed by PID (`kill`, `wait $pid`, `kill -STOP`, `kill -CONT`).
-- **Named pipe for job notifications**: A separate channel from the PTY output stream. The SIGCHLD trap writes structured data here. The harness has a dedicated reader thread. This avoids any interleaving or parsing ambiguity.
+- **Named pipe for job notifications**: A separate channel from the PTY output stream. The SIGCHLD trap writes a single signal byte here — no structured data. It is not reliably possible to determine from inside the trap which job completed (the state may already be reaped by the time the handler runs). Instead, the harness uses the byte as a prompt to run `jobs -p` and diff the result against its tracked job state (`JobManager`). The harness has a dedicated reader task for this pipe.
 
 **What the model sees as its prompt:**
 
@@ -229,7 +225,14 @@ Format: `[EXIT_CODE] LLM_NAME@HOSTNAME:PWD $`. The exit code gives immediate fee
    - The OSC sentinel (command completed) → return full output + exit code to model.
    - Timeout reached with `interactive=false` → kill foreground process group, return output + error message.
    - Timeout reached with `interactive=true` → return partial output to model, model decides next action.
-5. If the named pipe has notifications, append them to the tool result (e.g., "Background job PID 12345 completed with exit code 0").
+5. After the command completes, harness runs `jobs -p` on the PTY and syncs `JobManager` with the result. Any PIDs that were tracked but are no longer listed have completed; their callback fires out-of-band (not bundled into the tool result).
+
+**Background job notification flow:**
+
+The named pipe reader task runs concurrently with `call`. When it receives a signal byte:
+
+- **If a foreground command is in progress** (`is_running = true`): ignore. The `call` will sync `JobManager` via `jobs -p` when the command finishes anyway.
+- **If the tool is idle** (`is_running = false`): run `jobs -p` on the PTY, sync `JobManager`. If completions are detected, the callback fires and the harness can queue a proactive message to inject into the agent's next turn.
 
 **Timeout enforcement (without killing the shell):**
 
@@ -290,7 +293,7 @@ agent "refactor the auth module" > /tmp/refactor.log 2>&1 &
 cat /tmp/refactor.log
 ```
 
-The model already knows these patterns from pretraining. Output is redirected to files to prevent interleaving with foreground output. The named pipe provides async completion notifications so the model doesn't need to poll.
+The model already knows these patterns from pretraining. Output is redirected to files to prevent interleaving with foreground output. The harness tracks background PIDs via `JobManager` and notifies the model of completions without requiring it to poll.
 
 ### Work Required
 
