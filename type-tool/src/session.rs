@@ -7,21 +7,13 @@ use std::{
     collections::HashSet,
     path::PathBuf,
     process::Command,
-    sync::{Mutex, OnceLock},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
 use sysinfo::{Pid as SysPid, ProcessesToUpdate, System};
 
 use expectrl::{Expect, process::Termios, session::OsSession};
-
-/// Serializes PTY fork calls to avoid a thundering-herd of simultaneous
-/// `fork()`+`exec()` calls when many sessions start concurrently (e.g. tests).
-///
-/// Held only for the duration of `Session::spawn()` (the fork itself),
-/// released before waiting for the sentinel.  This still allows all sessions
-/// to wait for their initial prompt in parallel.
-static FORK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 use crate::{TypeError, parse_jobs_p};
 
@@ -59,16 +51,13 @@ impl PtySession {
 
     fn spawn_blocking_inner() -> Result<Self, TypeError> {
         // 1. Write the init script to a temp file.
-        // Combine PID with subsecond nanos for a collision-resistant filename.
-        // Using subsec_nanos alone wraps every second; two spawns exactly 1 s
-        // apart would collide.  The PID component makes the name unique per
-        // process even across second boundaries.
+        // Use PID + atomic counter for a collision-proof filename.
+        // PID alone isn't unique when multiple threads spawn concurrently
+        // (e.g. cargo test), and subsec_nanos can collide.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let pid = std::process::id();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos();
-        let init_path = format!("/tmp/tekton-init-{pid}-{nanos}.sh");
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let init_path = format!("/tmp/tekton-init-{pid}-{seq}.sh");
 
         // The PROMPT_COMMAND sentinel format: ESC]999;EXIT_CODE;$PWD BEL
         //
@@ -87,18 +76,11 @@ impl PtySession {
         std::fs::write(&init_path, init_content).map_err(|e| TypeError::PtySpawn(e.to_string()))?;
 
         // 2. Spawn bash with the init file.
-        //    Acquire FORK_LOCK only for the fork/exec itself so concurrent PTY
-        //    allocations don't create a thundering-herd of simultaneous forks.
         let mut cmd = Command::new("bash");
         cmd.arg("--init-file").arg(&init_path);
 
-        let mut session = {
-            let _fork_guard = FORK_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            expectrl::Session::spawn(cmd).map_err(|e| TypeError::PtySpawn(e.to_string()))?
-        }; // _fork_guard released here; next spawn may fork concurrently
+        let mut session =
+            expectrl::Session::spawn(cmd).map_err(|e| TypeError::PtySpawn(e.to_string()))?;
 
         // 3. Disable echo so typed input doesn't appear in the output stream.
         session

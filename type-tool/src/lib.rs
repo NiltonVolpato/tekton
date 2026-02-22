@@ -304,6 +304,9 @@ pub enum TypeError {
 
     #[error("PTY spawn failed: {0}")]
     PtySpawn(String),
+
+    #[error("Invalid timeout: {0}")]
+    InvalidTimeout(f64),
 }
 
 /// The Tekton `type` tool.
@@ -465,7 +468,11 @@ impl Tool for TypeTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let timeout = Duration::from_secs_f64(args.resolved_timeout());
+        let raw_timeout = args.resolved_timeout();
+        if raw_timeout.is_nan() || raw_timeout.is_infinite() || raw_timeout < 0.0 {
+            return Err(TypeError::InvalidTimeout(raw_timeout));
+        }
+        let timeout = Duration::from_secs_f64(raw_timeout);
         let keys = args.keys.clone();
         let interactive = args.interactive;
         let background_pids: HashSet<u32> = self
@@ -562,6 +569,12 @@ impl Tool for TypeTool {
             self.job_manager.lock().unwrap().sync(&active_pids);
         }
 
+        // TODO: TypeOutput is not rich enough to capture all outcomes.
+        // It needs to distinguish between: normal completion (sentinel),
+        // timeout (interactive vs non-interactive), and shell death (EOF).
+        // In the shell-death case, the respawned session should be ready
+        // before call() returns, and the output must convey what happened
+        // so the LLM can react appropriately.
         Ok(TypeOutput {
             output: String::from_utf8_lossy(&output_bytes).into_owned(),
             exit_code,
@@ -1367,45 +1380,37 @@ mod tests {
         );
     }
 
-    // ── BUG: NaN / negative / infinite timeout panics instead of returning Err ───
-    //
-    // `call()` unconditionally calls `Duration::from_secs_f64(args.resolved_timeout())`
-    // *before* any session check.  `Duration::from_secs_f64` panics on NaN, negative
-    // values, and ±Infinity — it never returns an Err.  The desired behaviour is a
-    // clean `Err(TypeError::...)`.  These tests are marked `#[should_panic]` to
-    // document the current (broken) behaviour.  When the bug is fixed, replace
-    // `#[should_panic]` with an assertion that `result.is_err()`.
+    // ── Invalid timeout returns Err(InvalidTimeout) ───────────────────────
 
     #[tokio::test]
-    #[should_panic] // BUG: should return Err, not panic
-    async fn call_with_nan_timeout_panics_instead_of_returning_error() {
-        // No PTY needed — the panic occurs before the session is consulted.
+    async fn call_with_nan_timeout_returns_error() {
         let tool = TypeTool::new();
-        let _ = tool
+        let result = tool
             .call(TypeArgs { keys: "echo hi\n".into(), interactive: false, timeout: Some(f64::NAN) })
             .await;
+        assert!(matches!(result, Err(TypeError::InvalidTimeout(t)) if t.is_nan()));
     }
 
     #[tokio::test]
-    #[should_panic] // BUG: should return Err, not panic
-    async fn call_with_negative_timeout_panics_instead_of_returning_error() {
+    async fn call_with_negative_timeout_returns_error() {
         let tool = TypeTool::new();
-        let _ = tool
+        let result = tool
             .call(TypeArgs { keys: "echo hi\n".into(), interactive: false, timeout: Some(-1.0) })
             .await;
+        assert!(matches!(result, Err(TypeError::InvalidTimeout(t)) if t == -1.0));
     }
 
     #[tokio::test]
-    #[should_panic] // BUG: should return Err, not panic
-    async fn call_with_infinite_timeout_panics_instead_of_returning_error() {
+    async fn call_with_infinite_timeout_returns_error() {
         let tool = TypeTool::new();
-        let _ = tool
+        let result = tool
             .call(TypeArgs {
                 keys: "echo hi\n".into(),
                 interactive: false,
                 timeout: Some(f64::INFINITY),
             })
             .await;
+        assert!(matches!(result, Err(TypeError::InvalidTimeout(t)) if t.is_infinite()));
     }
 
     #[tokio::test]
@@ -1526,6 +1531,82 @@ mod tests {
         );
 
         watcher.abort();
+    }
+
+    // ── Shell death / exec: session destruction tests ──────────────────
+
+    #[ignore = "BUG: EOF error discards buffered output — 'Hello Mom!' is lost"]
+    #[tokio::test]
+    async fn exec_replaces_shell_first_call_returns_buffered_output() {
+        // `exec /bin/echo` replaces bash with echo. Echo prints "Hello Mom!"
+        // and exits, closing the PTY slave side. expectrl hits EOF.
+        //
+        // Correct behavior: the output printed before EOF ("Hello Mom!") must
+        // be returned to the caller. The shell is dead so there's no sentinel
+        // — exit_code should be None, but the output must not be discarded.
+        //
+        // Current behavior: the EOF error in call()'s catch-all arm discards
+        // everything in the buffer and returns Err(PtyRead("EOF ...")).
+        let tool = TypeTool::spawn().await.unwrap();
+
+        let result = tool
+            .call(TypeArgs {
+                keys: "exec /bin/echo 'Hello Mom!'\n".into(),
+                interactive: false,
+                timeout: Some(2.0),
+            })
+            .await
+            .expect("call must return Ok with buffered output, not Err on EOF");
+
+        assert!(
+            result.output.contains("Hello Mom!"),
+            "output printed before EOF must be returned to the caller; got: {:?}",
+            result.output
+        );
+        assert_eq!(
+            result.exit_code, None,
+            "no sentinel was emitted (shell is dead), so exit_code must be None"
+        );
+    }
+
+    #[ignore = "BUG: no session recovery after shell death — design doc says harness should respawn"]
+    #[tokio::test]
+    async fn exec_replaces_shell_subsequent_call_recovers_with_new_session() {
+        // After `exec` kills the shell, the PTY slave side is closed.
+        //
+        // Correct behavior (design doc, Recovery): "If the shell dies, the
+        // harness can start a new one." The next call() should transparently
+        // respawn a new bash session and execute the command.
+        //
+        // Current behavior: the session is permanently dead. Every subsequent
+        // call fails with PtyWrite(EIO) forever.
+        let tool = TypeTool::spawn().await.unwrap();
+
+        // Kill the shell.
+        let _ = tool
+            .call(TypeArgs {
+                keys: "exec /bin/echo 'Hello Mom!'\n".into(),
+                interactive: false,
+                timeout: Some(2.0),
+            })
+            .await;
+
+        // Next call should work — the harness should have respawned the shell.
+        let result = tool
+            .call(TypeArgs {
+                keys: "echo 'still alive!'\n".into(),
+                interactive: false,
+                timeout: Some(5.0),
+            })
+            .await
+            .expect("call on a dead session must respawn the shell, not return EIO");
+
+        assert!(
+            result.output.contains("still alive!"),
+            "respawned shell must execute the command; got: {:?}",
+            result.output
+        );
+        assert_eq!(result.exit_code, Some(0));
     }
 
     #[tokio::test]
