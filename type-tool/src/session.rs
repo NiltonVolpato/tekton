@@ -167,7 +167,10 @@ pub(crate) fn run_jobs_p_sync(session: &mut OsSession) -> Option<HashSet<u32>> {
 ///
 /// Uses `sysinfo` to enumerate and signal child processes, avoiding both
 /// the fragility of spawning an external `pgrep` and raw `libc::kill` calls.
-pub(crate) fn kill_foreground(shell_pid: u32, background_pids: &HashSet<u32>) {
+///
+/// Returns `true` if all foreground children are confirmed dead after
+/// signalling, `false` if any survived SIGKILL (the shell is unrecoverable).
+pub(crate) fn kill_foreground(shell_pid: u32, background_pids: &HashSet<u32>) -> bool {
     use sysinfo::Signal;
 
     let mut sys = System::new();
@@ -186,10 +189,14 @@ pub(crate) fn kill_foreground(shell_pid: u32, background_pids: &HashSet<u32>) {
         .filter(|&pid| pid.as_u32() != 0)
         .collect();
 
+    if foreground_pids.is_empty() {
+        return true;
+    }
+
     // SIGTERM first.
     for &pid in &foreground_pids {
         if let Some(process) = sys.process(pid) {
-            process.kill_with(Signal::Term);
+            let _ = process.kill_with(Signal::Term);
         }
     }
 
@@ -202,6 +209,24 @@ pub(crate) fn kill_foreground(shell_pid: u32, background_pids: &HashSet<u32>) {
         if let Some(process) = sys.process(pid) {
             process.kill();
         }
+    }
+
+    // Final check: verify all foreground processes are dead.
+    std::thread::sleep(Duration::from_millis(100));
+    sys.refresh_processes(ProcessesToUpdate::Some(&foreground_pids), true);
+    foreground_pids.iter().all(|pid| sys.process(*pid).is_none())
+}
+
+/// Kill the shell process itself via SIGKILL.
+///
+/// Used when `kill_foreground` fails — the shell is in an unrecoverable
+/// state and must be replaced.
+pub(crate) fn kill_shell(shell_pid: u32) {
+    let mut sys = System::new();
+    let pid = SysPid::from_u32(shell_pid);
+    sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
+    if let Some(process) = sys.process(pid) {
+        process.kill();
     }
 }
 

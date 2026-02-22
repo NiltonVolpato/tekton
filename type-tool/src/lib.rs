@@ -91,7 +91,7 @@ const MAX_TIMEOUT_SECS: f64 = 86_400.0;
 pub struct TypeArgs {
     /// Keystrokes to send to the terminal.
     ///
-    /// Supports escape sequences: `\n` for Enter, `\x03` for Ctrl-C, etc.
+    /// Supports JSON escape sequences: `\n` for Enter, `\u0003` for Ctrl-C, etc.
     pub keys: String,
 
     /// Timeout behavior on expiry.
@@ -423,7 +423,7 @@ impl TypeTool {
                 tokio::time::sleep(WATCHER_POLL_INTERVAL).await;
 
                 let tracked: Vec<sysinfo::Pid> = {
-                    let jm = job_manager.lock().unwrap();
+                    let jm = job_manager.lock().unwrap_or_else(|e| e.into_inner());
                     if jm.jobs.is_empty() {
                         continue;
                     }
@@ -453,7 +453,7 @@ impl TypeTool {
                     .collect();
 
                 {
-                    let mut jm = job_manager.lock().unwrap();
+                    let mut jm = job_manager.lock().unwrap_or_else(|e| e.into_inner());
 
                     // Backfill the command field for alive jobs that don't have one yet.
                     for &pid in &alive {
@@ -505,15 +505,15 @@ impl Tool for TypeTool {
             name: Self::NAME.to_string(),
             description:
                 "Send keystrokes to the terminal. Supports escape sequences: \\n for Enter, \
-                 \\x03 for Ctrl-C, etc. Returns the terminal output captured until the next \
-                 shell prompt or timeout."
+                 \\u0003 for Ctrl-C, \\u0004 for Ctrl-D, etc. Returns the terminal output \
+                 captured until the next shell prompt or timeout."
                     .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "keys": {
                         "type": "string",
-                        "description": "Keystrokes to send. Supports escape sequences: \\n for Enter, \\x03 for Ctrl-C, \\x04 for Ctrl-D, etc."
+                        "description": "Keystrokes to send. Supports escape sequences: \\n for Enter, \\u0003 for Ctrl-C, \\u0004 for Ctrl-D, etc."
                     },
                     "interactive": {
                         "type": "boolean",
@@ -594,7 +594,18 @@ impl Tool for TypeTool {
                     let output = session::drain_buf(&mut pty.session)?;
 
                     // Kill the foreground process (SIGTERM → SIGKILL).
-                    session::kill_foreground(shell_pid, &background_pids);
+                    if !session::kill_foreground(shell_pid, &background_pids) {
+                        // Foreground processes survived SIGKILL — the shell is
+                        // unrecoverable. Kill it entirely and respawn.
+                        session::kill_shell(shell_pid);
+                        let new_pty = session::PtySession::spawn_blocking_inner()?;
+                        let cwd = new_pty.working_directory.clone();
+                        *guard = Some(new_pty);
+                        let outcome = Outcome::ShellExited {
+                            working_directory: cwd,
+                        };
+                        return Ok((output, outcome, None));
+                    }
 
                     // Drain PTY to restore a clean prompt; extract post-kill exit code and $PWD.
                     let (exit_code, cwd) = session::drain_after_kill(&mut pty.session)
@@ -1364,6 +1375,118 @@ mod tests {
         );
     }
 
+    // ── PTY integration: prompt visibility in output ───────────────────────
+    //
+    // Per the design doc, the model should see a prompt like:
+    //   [0] claude@alpha:/Users/nilton/src/tekton $
+    // at the end of each command's output. This tells the model the exit code,
+    // who it is, and where it is — essential context for deciding what to type next.
+    //
+    // Currently, PS1 is rendered AFTER PROMPT_COMMAND. The sentinel is emitted
+    // by PROMPT_COMMAND, so captures.before() only contains text BEFORE the
+    // sentinel. PS1 appears after the sentinel and is only captured as a prefix
+    // of the NEXT command's output — the model never sees the prompt from the
+    // command it just ran.
+
+    #[tokio::test]
+    #[ignore = "BUG: PS1 prompt is emitted after the sentinel, so it's not included in the command's output"]
+    async fn output_ends_with_prompt_showing_exit_code_and_cwd() {
+        // The model must see a prompt at the end of every Completed output.
+        // This is how it knows: (1) the exit code, (2) who it is, (3) where
+        // it is — without having to parse the Outcome struct.
+        //
+        // Expected format: [EXIT_CODE] NAME@HOST:CWD $
+        // Example: [0] claude@alpha:/tmp $
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let result = tool
+            .call(TypeArgs { keys: "echo hello\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+
+        // The output must end with something that looks like a prompt.
+        // We check for the [EXIT_CODE] prefix pattern at minimum.
+        let trimmed = result.output.trim_end();
+        assert!(
+            trimmed.ends_with("$ ") || trimmed.ends_with("$"),
+            "output must end with a shell prompt so the model sees where it is; \
+             got: {:?}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "BUG: PS1 prompt is emitted after the sentinel, so it's not included in the command's output"]
+    async fn prompt_in_output_reflects_exit_code_of_completed_command() {
+        // After `false` (exit code 1), the prompt must show [1].
+        // After `true` (exit code 0), the prompt must show [0].
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+
+        let fail_result = tool
+            .call(TypeArgs { keys: "false\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+        assert!(
+            fail_result.output.contains("[1]"),
+            "prompt after `false` must contain [1]; got: {:?}", fail_result.output
+        );
+
+        let ok_result = tool
+            .call(TypeArgs { keys: "true\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+        assert!(
+            ok_result.output.contains("[0]"),
+            "prompt after `true` must contain [0]; got: {:?}", ok_result.output
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "BUG: PS1 prompt is emitted after the sentinel, so it's not included in the command's output"]
+    async fn prompt_in_output_reflects_cwd_after_cd() {
+        // After `cd /tmp`, the prompt embedded in the output must show /tmp.
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let result = tool
+            .call(TypeArgs { keys: "cd /tmp\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+
+        // The prompt should contain the new cwd.
+        assert!(
+            result.output.contains("/tmp"),
+            "prompt after `cd /tmp` must contain /tmp; got: {:?}", result.output
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "BUG: PS1 prompt is emitted after the sentinel, so it's not included in the command's output"]
+    async fn second_command_output_does_not_start_with_stale_prompt_from_previous_command() {
+        // Currently PS1 from command N leaks into the output of command N+1
+        // as a prefix of captures.before(). If the prompt is properly appended
+        // to command N's output, command N+1's output should start clean.
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+
+        // Command 1: cd /tmp
+        tool.call(TypeArgs { keys: "cd /tmp\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+
+        // Command 2: echo marker
+        let result = tool
+            .call(TypeArgs { keys: "echo output_marker\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+
+        // The output should start with the command's actual output, not a
+        // leftover prompt from the previous command.
+        let trimmed = result.output.trim_start();
+        assert!(
+            trimmed.starts_with("output_marker"),
+            "output of command N+1 must not start with leftover prompt from command N; \
+             got: {:?}",
+            result.output
+        );
+    }
+
     // ── PTY integration: timeout and process-control tests ─────────────────
 
     #[tokio::test]
@@ -1471,6 +1594,90 @@ mod tests {
         assert!(
             matches!(result.outcome, Outcome::Completed { .. }),
             "Ctrl-C must terminate the foreground process and produce a sentinel; got: {:?}", result.outcome
+        );
+    }
+
+    // ── Escape sequence handling: JSON → PTY byte path ────────────────────
+    //
+    // The LLM sends JSON like `{"keys": "ls\n"}`. The tool description
+    // advertises `\n`, `\x03`, `\x04` etc.  JSON only supports `\n`, `\t`,
+    // `\uXXXX`, and a few others — NOT `\xNN`.  These tests verify what
+    // actually arrives at the PTY after serde_json deserialization.
+
+    #[test]
+    fn json_backslash_n_deserializes_to_newline_byte() {
+        // JSON supports \n natively. This is the happy path for Enter.
+        let args: TypeArgs = serde_json::from_str(r#"{"keys": "ls\n"}"#).unwrap();
+        assert!(
+            args.keys.contains('\n'),
+            r#"JSON "ls\n" must deserialize to a string containing 0x0A; got bytes: {:?}"#,
+            args.keys.as_bytes()
+        );
+    }
+
+    #[test]
+    fn json_backslash_x03_does_not_deserialize_to_ctrl_c_byte() {
+        // JSON does NOT support \xNN escape sequences.  serde_json rejects
+        // them outright.  If the LLM sends {"keys": "\x03"}, deserialization
+        // fails — the Ctrl-C never reaches the PTY.
+        //
+        // This documents the current behavior.  The tool description advertises
+        // \x03 for Ctrl-C, but it only works if the framework pre-processes
+        // escape sequences before calling serde, or if the LLM uses \u0003.
+        let result = serde_json::from_str::<TypeArgs>(r#"{"keys": "\x03"}"#);
+        assert!(
+            result.is_err(),
+            r#"JSON "\x03" is not a valid JSON escape; serde_json must reject it. \
+               If this passes, the LLM's \x03 silently becomes something other than Ctrl-C."#
+        );
+    }
+
+    #[test]
+    fn json_backslash_u0003_deserializes_to_ctrl_c_byte() {
+        // \u0003 is JSON's way to encode Ctrl-C (ETX, byte 0x03).
+        // This is the correct escape for sending control characters via JSON.
+        let args: TypeArgs = serde_json::from_str(r#"{"keys": "\u0003"}"#).unwrap();
+        assert_eq!(
+            args.keys.as_bytes(),
+            &[0x03],
+            r#"JSON "\u0003" must deserialize to byte 0x03 (Ctrl-C)"#
+        );
+    }
+
+    #[test]
+    fn json_backslash_u0004_deserializes_to_ctrl_d_byte() {
+        // \u0004 = Ctrl-D (EOT). Same pattern as Ctrl-C.
+        let args: TypeArgs = serde_json::from_str(r#"{"keys": "\u0004"}"#).unwrap();
+        assert_eq!(
+            args.keys.as_bytes(),
+            &[0x04],
+            r#"JSON "\u0004" must deserialize to byte 0x04 (Ctrl-D)"#
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_via_json_u0003_terminates_foreground_process() {
+        // End-to-end: the LLM sends \u0003 (the only correct JSON encoding
+        // of Ctrl-C). Verify it actually delivers SIGINT to the foreground.
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+
+        // Start a long-running foreground process.
+        let _ = tool
+            .call(TypeArgs {
+                keys: "sleep 9999\n".into(),
+                interactive: true,
+                timeout: Some(0.1),
+            })
+            .await;
+
+        // Deserialize from JSON the way the framework would.
+        let args: TypeArgs = serde_json::from_str(r#"{"keys": "\u0003", "interactive": false, "timeout": 2.0}"#).unwrap();
+        let result = tool.call(args).await.unwrap();
+
+        assert!(
+            matches!(result.outcome, Outcome::Completed { .. }),
+            r#"Ctrl-C via JSON \u0003 must terminate the foreground process; got: {:?}"#,
+            result.outcome
         );
     }
 
