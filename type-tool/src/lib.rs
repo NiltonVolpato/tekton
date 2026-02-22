@@ -73,7 +73,7 @@
 
 mod session;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -183,8 +183,6 @@ pub struct JobManager {
     pub(crate) jobs: HashMap<u32, Job>,
     on_complete: Option<Box<dyn Fn(JobNotification) + Send + Sync>>,
 }
-
-use std::collections::HashMap;
 
 impl JobManager {
     /// Create a new, empty `JobManager` with no callback.
@@ -436,56 +434,72 @@ impl Tool for TypeTool {
         }
 
         // Run the blocking PTY I/O in a dedicated thread-pool thread.
-        let (output_bytes, exit_code, timeout_message, working_directory, active_pids) =
-            tokio::task::spawn_blocking(move || -> Result<_, TypeError> {
-                let mut guard = guard;
-                let pty = guard.as_mut().ok_or(TypeError::SessionNotInitialized)?;
-                let shell_pid = pty.shell_pid;
-                let s = &mut pty.session;
+        //
+        // The active_pids slot is `Option<HashSet<u32>>`:
+        //   - `Some(pids)` on a normal return or non-interactive timeout — sync the manager.
+        //   - `None` on an interactive timeout — the foreground process is still alive and
+        //     we have no fresh `jobs -p` snapshot, so syncing with an empty set would
+        //     spuriously fire "job completed" callbacks for every tracked background job.
+        let result = tokio::task::spawn_blocking(move || -> Result<_, TypeError> {
+            let mut guard = guard;
+            let pty = guard.as_mut().ok_or(TypeError::SessionNotInitialized)?;
+            let shell_pid = pty.shell_pid;
+            let s = &mut pty.session;
 
-                // 1. Send keystrokes to the PTY.
-                use expectrl::Expect;
-                s.send(keys.as_bytes())
-                    .map_err(|e| TypeError::PtyWrite(e.to_string()))?;
+            // 1. Send keystrokes to the PTY.
+            use expectrl::Expect;
+            s.send(keys.as_bytes())
+                .map_err(|e| TypeError::PtyWrite(e.to_string()))?;
 
-                // 2. Wait for the prompt sentinel using a polled loop to avoid
-                //    busy-waiting under concurrent load (see session::poll_for_sentinel).
-                match session::poll_for_sentinel(s, timeout) {
-                    Ok(captures) => {
-                        let output = captures.before().to_vec();
-                        let (exit_code, cwd) = session::parse_sentinel(&captures);
-                        let active_pids = session::run_jobs_p_sync(s);
-                        Ok((output, Some(exit_code), None, Some(cwd), active_pids))
-                    }
-
-                    Err(expectrl::Error::ExpectTimeout) if !interactive => {
-                        // Kill the foreground process (SIGTERM → SIGKILL).
-                        session::kill_foreground(shell_pid, &background_pids);
-
-                        // Drain PTY to restore a clean prompt; extract post-kill $PWD.
-                        let cwd = session::drain_after_kill(s);
-
-                        let active_pids = session::run_jobs_p_sync(s);
-                        let msg = format!(
-                            "Command timed out after {:.1}s and was terminated.",
-                            timeout.as_secs_f64()
-                        );
-                        Ok((vec![], None, Some(msg), cwd, active_pids))
-                    }
-
-                    Err(expectrl::Error::ExpectTimeout) => {
-                        // Interactive timeout: return empty output; process still alive.
-                        Ok((vec![], None, None, None, HashSet::new()))
-                    }
-
-                    Err(e) => Err(TypeError::PtyRead(e.to_string())),
+            // 2. Wait for the prompt sentinel using a polled loop to avoid
+            //    busy-waiting under concurrent load (see session::poll_for_sentinel).
+            match session::poll_for_sentinel(s, timeout) {
+                Ok(captures) => {
+                    let output = captures.before().to_vec();
+                    let (exit_code, cwd) = session::parse_sentinel(&captures);
+                    let active_pids = session::run_jobs_p_sync(s);
+                    Ok((output, Some(exit_code), None, Some(cwd), Some(active_pids)))
                 }
-            })
-            .await
-            .map_err(|e| TypeError::PtyRead(e.to_string()))??;
 
+                Err(expectrl::Error::ExpectTimeout) if !interactive => {
+                    // Kill the foreground process (SIGTERM → SIGKILL).
+                    session::kill_foreground(shell_pid, &background_pids);
+
+                    // Drain PTY to restore a clean prompt; extract post-kill $PWD.
+                    let cwd = session::drain_after_kill(s);
+
+                    let active_pids = session::run_jobs_p_sync(s);
+                    let msg = format!(
+                        "Command timed out after {:.1}s and was terminated.",
+                        timeout.as_secs_f64()
+                    );
+                    Ok((vec![], None, Some(msg), cwd, Some(active_pids)))
+                }
+
+                Err(expectrl::Error::ExpectTimeout) => {
+                    // Interactive timeout: return partial output; process still alive.
+                    // active_pids is None to suppress the post-call sync — we have no
+                    // fresh jobs-p snapshot and syncing with an empty set would fire
+                    // spurious completion callbacks for all tracked background jobs.
+                    Ok((vec![], None, None, None, None))
+                }
+
+                Err(e) => Err(TypeError::PtyRead(e.to_string())),
+            }
+        })
+        .await
+        .map_err(|e| TypeError::PtyRead(e.to_string()))?;
+
+        // Always clear is_running before inspecting the inner result.
+        // Splitting the `??` ensures this store is reached on every code path,
+        // including spawn_blocking join errors and PTY write/read errors.
         self.is_running.store(false, Ordering::SeqCst);
-        self.job_manager.lock().unwrap().sync(&active_pids);
+
+        let (output_bytes, exit_code, timeout_message, working_directory, active_pids) = result?;
+
+        if let Some(active_pids) = active_pids {
+            self.job_manager.lock().unwrap().sync(&active_pids);
+        }
 
         Ok(TypeOutput {
             output: String::from_utf8_lossy(&output_bytes).into_owned(),
@@ -1279,6 +1293,34 @@ mod tests {
         assert!(
             !is_running.load(Ordering::SeqCst),
             "is_running must be false after call() returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_running_cleared_after_error_return() {
+        // Regression guard for the is_running flag leak on error paths.
+        // call() sets is_running = true at entry; it must restore it to false
+        // before returning, even when it returns Err.
+        //
+        // SessionNotInitialized is the only error path exercisable without a
+        // real PTY. The fix (splitting ?? into two ? with store(false) between)
+        // covers all error paths including PTY write/read failures.
+        let tool = TypeTool::new(); // no session → guaranteed error
+        let is_running = tool.is_running();
+
+        assert!(!is_running.load(Ordering::SeqCst), "must start false");
+
+        let result = tool
+            .call(TypeArgs { keys: "ls\n".into(), interactive: false, timeout: None })
+            .await;
+
+        assert!(
+            matches!(result, Err(TypeError::SessionNotInitialized)),
+            "expected SessionNotInitialized error"
+        );
+        assert!(
+            !is_running.load(Ordering::SeqCst),
+            "is_running must be cleared even when call() returns an error"
         );
     }
 }
