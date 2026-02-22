@@ -146,9 +146,20 @@ pub(crate) fn parse_sentinel(captures: &expectrl::Captures) -> (i32, String) {
 
 /// Run `jobs -p` on the session and return the set of active background PIDs.
 ///
-/// Sends the built-in and waits for the next prompt sentinel.
+/// First runs `true` to force a full prompt cycle so bash reaps any
+/// recently-completed background jobs before we query the job table.
 /// Returns an empty set on any error or timeout.
 pub(crate) fn run_jobs_p_sync(session: &mut OsSession) -> HashSet<u32> {
+    // Force bash to reap completed background jobs. With `set +m` (monitor
+    // mode off), bash only reaps during a full prompt cycle — PROMPT_COMMAND
+    // + PS1. Running `true` triggers that cycle.
+    if session.send_line("true").is_err() {
+        return HashSet::new();
+    }
+    if wait_for_sentinel(session, Duration::from_secs(5)).is_err() {
+        return HashSet::new();
+    }
+
     if session.send_line("jobs -p").is_err() {
         return HashSet::new();
     }
