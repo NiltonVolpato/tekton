@@ -7,24 +7,18 @@
 //! # Harness wiring
 //!
 //! After constructing the tool and before passing it to the agent builder,
-//! the harness retrieves two shared handles:
+//! the harness calls [`TypeTool::spawn_watcher`] to start a background task
+//! that polls `sysinfo` for tracked PIDs. When a PID disappears from the
+//! process table, [`JobManager::retain`] fires the completion callback.
 //!
-//! - [`TypeTool::job_manager`] — to call [`JobManager::sync`] from the idle path.
-//! - [`TypeTool::is_running`] — to decide whether to act or ignore a pipe signal.
-//!
-//! The harness spawns a background task that reads the named pipe and, on each
-//! signal, checks `is_running`:
-//!
-//! - **Running**: ignore; [`TypeTool::call`] will sync the manager at the end of
-//!   the current command anyway.
-//! - **Idle**: run `jobs -p` on the PTY, parse the output, call
-//!   [`JobManager::sync`]. If any completions are detected, the callback fires
-//!   and the harness can queue a proactive message to the agent.
+//! [`TypeTool::call`] handles **discovery** of new background jobs (via
+//! `jobs -p`) and also detects completions. The watcher handles completions
+//! while the tool is idle. Both paths are safe to run concurrently: `retain()`
+//! never adds PIDs, so there is no risk of re-introducing a reaped PID.
 //!
 //! ```no_run
-//! use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
-//! use std::collections::HashSet;
-//! use tekton_type_tool::{JobManager, TypeTool, parse_jobs_p};
+//! use std::sync::{Arc, Mutex};
+//! use tekton_type_tool::TypeTool;
 //! use rig::{
 //!     agent::AgentBuilder,
 //!     client::{CompletionClient, ProviderClient},
@@ -41,22 +35,8 @@
 //!         eprintln!("job {} done (exit {:?})", notif.pid, notif.exit_code);
 //!     });
 //!
-//!     // Retrieve shared handles before moving `tool` into the agent builder.
-//!     let job_manager = tool.job_manager();
-//!     let is_running = tool.is_running();
-//!
-//!     // Harness task: read the named pipe and sync the manager when idle.
-//!     tokio::spawn(async move {
-//!         loop {
-//!             // TODO: read one signal byte from the named pipe.
-//!             if !is_running.load(Ordering::SeqCst) {
-//!                 // TODO: run `jobs -p` on the PTY and parse the output.
-//!                 let active_pids: HashSet<u32> = HashSet::new(); // stub
-//!                 job_manager.lock().unwrap().sync(&active_pids);
-//!             }
-//!             // If running: call() will sync at the end of the command.
-//!         }
-//!     });
+//!     // Start the sysinfo watcher before moving `tool` into the agent builder.
+//!     let watcher = tool.spawn_watcher();
 //!
 //!     let agent = AgentBuilder::new(model)
 //!         .preamble(
@@ -68,21 +48,23 @@
 //!         )
 //!         .tool(tool)
 //!         .build();
+//!
+//!     // On shutdown: watcher.abort();
 //! }
 //! ```
 
 mod session;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
+
+/// How often the sysinfo watcher polls for completed background jobs.
+const WATCHER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Non-interactive timeout in seconds: how long to wait before killing the foreground process.
 const DEFAULT_TIMEOUT_SECS: f64 = 300.0;
@@ -172,13 +154,13 @@ pub struct JobNotification {
 
 /// Tracks running background jobs and detects completions.
 ///
-/// The shell's `SIGCHLD` trap writes a signal byte to the named pipe; that byte
-/// carries no structured data. Completions are detected by diffing the set of
-/// PIDs reported by `jobs -p` against the set of known tracked jobs.
+/// Two update paths exist:
 ///
-/// [`JobManager::sync`] is the single update point: call it after every
-/// foreground command completes (via [`TypeTool::call`]) and from the harness
-/// task when the signal arrives while the tool is idle.
+/// - [`JobManager::sync`] — called by [`TypeTool::call`] after each command.
+///   Discovers new PIDs (from `jobs -p`) and removes completed ones.
+/// - [`JobManager::retain`] — called by the sysinfo watcher task. Only removes
+///   completed PIDs; never adds new ones. Safe to call concurrently with `sync`
+///   (both are serialized by the `Mutex<JobManager>`).
 pub struct JobManager {
     pub(crate) jobs: HashMap<u32, Job>,
     on_complete: Option<Box<dyn Fn(JobNotification) + Send + Sync>>,
@@ -209,28 +191,15 @@ impl JobManager {
     /// - **PIDs tracked but absent from `active_pids`**: they have completed;
     ///   the callback is fired for each one and they are removed.
     ///
-    /// Call this after every foreground command and from the idle signal path.
+    /// This is the **discovery** path: use it from [`TypeTool::call`] where
+    /// `jobs -p` provides the authoritative set of background PIDs, including
+    /// newly started ones.
+    ///
+    /// For completion-only detection (e.g., the sysinfo watcher), use
+    /// [`JobManager::retain`] instead — it never adds new PIDs, avoiding races
+    /// where a stale active set could re-introduce a PID that was already reaped.
     pub fn sync(&mut self, active_pids: &HashSet<u32>) {
-        // Detect completions: tracked PIDs no longer in active set.
-        let completed: Vec<u32> = self
-            .jobs
-            .keys()
-            .filter(|pid| !active_pids.contains(pid))
-            .copied()
-            .collect();
-
-        for pid in completed {
-            if let Some(job) = self.jobs.remove(&pid) {
-                if let Some(cb) = &self.on_complete {
-                    cb(JobNotification {
-                        pid,
-                        // TODO: use waitpid(WNOHANG) to get the actual exit code.
-                        exit_code: None,
-                        command: job.command,
-                    });
-                }
-            }
-        }
+        self.remove_completed(active_pids);
 
         // Track newly appeared PIDs.
         for &pid in active_pids {
@@ -239,6 +208,63 @@ impl JobManager {
                 // TODO: populate from `jobs -l` or `ps` output for richer info.
                 command: String::new(),
             });
+        }
+    }
+
+    /// Retain only the tracked PIDs that are still alive.
+    ///
+    /// `checked` is the set of PIDs that were actually queried in sysinfo.
+    /// `alive` is the subset of `checked` that sysinfo confirmed are still running.
+    ///
+    /// Only PIDs in `checked` are considered: a tracked PID that was never checked
+    /// (e.g., added by `sync()` between the snapshot and this call) is left alone.
+    ///
+    /// This is the **completion-detection-only** path: use it from the sysinfo
+    /// watcher task, which can determine whether a PID is alive but cannot
+    /// discover new background jobs (that's `jobs -p`'s job inside `call()`).
+    pub fn retain(&mut self, checked: &HashSet<u32>, alive: &HashSet<u32>) {
+        let completed: Vec<u32> = self
+            .jobs
+            .keys()
+            .filter(|pid| checked.contains(pid) && !alive.contains(pid))
+            .copied()
+            .collect();
+
+        for pid in completed {
+            if let Some(job) = self.jobs.remove(&pid)
+                && let Some(cb) = &self.on_complete
+            {
+                cb(JobNotification {
+                    pid,
+                    // TODO: use waitpid(WNOHANG) to get the actual exit code.
+                    exit_code: None,
+                    command: job.command,
+                });
+            }
+        }
+    }
+
+    /// Remove tracked PIDs that are absent from `active_pids` and fire the
+    /// callback for each one.
+    fn remove_completed(&mut self, active_pids: &HashSet<u32>) {
+        let completed: Vec<u32> = self
+            .jobs
+            .keys()
+            .filter(|pid| !active_pids.contains(pid))
+            .copied()
+            .collect();
+
+        for pid in completed {
+            if let Some(job) = self.jobs.remove(&pid)
+                && let Some(cb) = &self.on_complete
+            {
+                cb(JobNotification {
+                    pid,
+                    // TODO: use waitpid(WNOHANG) to get the actual exit code.
+                    exit_code: None,
+                    command: job.command,
+                });
+            }
         }
     }
 }
@@ -287,21 +313,14 @@ pub enum TypeError {
 /// (command complete) or the timeout fires.
 ///
 /// After each command, `call` runs `jobs -p` internally and syncs the
-/// [`JobManager`]. The harness task does the same when the named pipe signals
-/// while the tool is idle (see [`TypeTool::is_running`]).
+/// [`JobManager`]. The sysinfo watcher task (see [`TypeTool::spawn_watcher`])
+/// detects completions while the tool is idle using [`JobManager::retain`].
 pub struct TypeTool {
     /// The persistent PTY session. `None` when constructed via [`TypeTool::new`].
     session: Arc<tokio::sync::Mutex<Option<session::PtySession>>>,
 
-    /// Shared with the harness task so it can run `jobs -p` on the idle path.
+    /// Shared with the watcher task for background job lifecycle tracking.
     job_manager: Arc<Mutex<JobManager>>,
-
-    /// `true` while a foreground command is executing inside `call`.
-    ///
-    /// The harness task checks this flag when the named pipe fires:
-    /// if `true`, it ignores the signal; if `false`, it runs `jobs -p` and
-    /// calls [`JobManager::sync`].
-    is_running: Arc<AtomicBool>,
 }
 
 impl TypeTool {
@@ -314,7 +333,6 @@ impl TypeTool {
         Self {
             session: Arc::new(tokio::sync::Mutex::new(None)),
             job_manager: Arc::new(Mutex::new(JobManager::new())),
-            is_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -324,7 +342,6 @@ impl TypeTool {
         Ok(Self {
             session: Arc::new(tokio::sync::Mutex::new(Some(session))),
             job_manager: Arc::new(Mutex::new(JobManager::new())),
-            is_running: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -345,7 +362,6 @@ impl TypeTool {
         Self {
             session: self.session,
             job_manager: Arc::new(Mutex::new(manager)),
-            is_running: self.is_running,
         }
     }
 
@@ -356,13 +372,52 @@ impl TypeTool {
         Arc::clone(&self.job_manager)
     }
 
-    /// Return a shared handle to the "is running" flag.
+    /// Spawn an async watcher task that polls `sysinfo` for tracked PIDs.
     ///
-    /// The harness task reads this when the named pipe fires:
-    /// - `true` → a `call` is in progress; ignore the signal.
-    /// - `false` → the tool is idle; run `jobs -p` and sync the manager.
-    pub fn is_running(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.is_running)
+    /// Every [`WATCHER_POLL_INTERVAL`], the task refreshes only the tracked PIDs
+    /// in the system process table. PIDs that have disappeared are passed to
+    /// [`JobManager::retain`], which fires the completion callback and removes
+    /// them — without ever adding new PIDs (that's `call()`'s job via `jobs -p`).
+    ///
+    /// Returns a [`JoinHandle`](tokio::task::JoinHandle) the harness can
+    /// `.abort()` on shutdown.
+    pub fn spawn_watcher(&self) -> tokio::task::JoinHandle<()> {
+        let job_manager = Arc::clone(&self.job_manager);
+        tokio::spawn(async move {
+            let mut sys = sysinfo::System::new();
+            loop {
+                tokio::time::sleep(WATCHER_POLL_INTERVAL).await;
+
+                let tracked: Vec<sysinfo::Pid> = {
+                    let jm = job_manager.lock().unwrap();
+                    if jm.jobs.is_empty() {
+                        continue;
+                    }
+                    jm.jobs
+                        .keys()
+                        .map(|&p| sysinfo::Pid::from_u32(p))
+                        .collect()
+                };
+
+                // Refresh only the specific PIDs — no full system scan.
+                // remove_dead_processes=true so dead PIDs are pruned from
+                // sysinfo's internal map, making sys.process() return None.
+                sys.refresh_processes_specifics(
+                    sysinfo::ProcessesToUpdate::Some(&tracked),
+                    true,
+                    sysinfo::ProcessRefreshKind::nothing(),
+                );
+
+                let checked: HashSet<u32> = tracked.iter().map(|pid| pid.as_u32()).collect();
+                let alive: HashSet<u32> = tracked
+                    .iter()
+                    .filter(|pid| sys.process(**pid).is_some())
+                    .map(|pid| pid.as_u32())
+                    .collect();
+
+                job_manager.lock().unwrap().retain(&checked, &alive);
+            }
+        })
     }
 }
 
@@ -410,8 +465,6 @@ impl Tool for TypeTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        self.is_running.store(true, Ordering::SeqCst);
-
         let timeout = Duration::from_secs_f64(args.resolved_timeout());
         let keys = args.keys.clone();
         let interactive = args.interactive;
@@ -429,7 +482,6 @@ impl Tool for TypeTool {
 
         // Fast-path: no session — return the error without spawning a thread.
         if guard.is_none() {
-            self.is_running.store(false, Ordering::SeqCst);
             return Err(TypeError::SessionNotInitialized);
         }
 
@@ -489,11 +541,6 @@ impl Tool for TypeTool {
         })
         .await
         .map_err(|e| TypeError::PtyRead(e.to_string()))?;
-
-        // Always clear is_running before inspecting the inner result.
-        // Splitting the `??` ensures this store is reached on every code path,
-        // including spawn_blocking join errors and PTY write/read errors.
-        self.is_running.store(false, Ordering::SeqCst);
 
         let (output_bytes, exit_code, timeout_message, working_directory, active_pids) = result?;
 
@@ -653,12 +700,6 @@ mod tests {
     fn job_manager_arc_is_shared() {
         let tool = TypeTool::new();
         assert!(Arc::ptr_eq(&tool.job_manager(), &tool.job_manager()));
-    }
-
-    #[test]
-    fn is_running_starts_false() {
-        let tool = TypeTool::new();
-        assert!(!tool.is_running().load(Ordering::SeqCst));
     }
 
     // ── TypeArgs: additional boundary-value tests ──────────────────────────
@@ -921,25 +962,78 @@ mod tests {
         );
     }
 
+    // ── JobManager::retain ─────────────────────────────────────────────────
+
+    #[test]
+    fn retain_removes_completed_jobs() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let cc = Arc::clone(&completed);
+        let mut manager = JobManager::new().with_callback(move |n| {
+            cc.lock().unwrap().push(n.pid);
+        });
+        manager.sync(&HashSet::from([1, 2, 3])); // discover three jobs
+        manager.retain(&HashSet::from([1, 2, 3]), &HashSet::from([1, 3])); // checked all three; PID 2 is gone
+        let fired = completed.lock().unwrap().clone();
+        assert_eq!(fired, vec![2]);
+        assert!(manager.jobs.contains_key(&1));
+        assert!(!manager.jobs.contains_key(&2));
+        assert!(manager.jobs.contains_key(&3));
+    }
+
+    #[test]
+    fn retain_does_not_add_new_pids() {
+        let mut manager = JobManager::new();
+        manager.sync(&HashSet::from([1])); // discover PID 1
+        manager.retain(&HashSet::from([1]), &HashSet::from([1, 2])); // checked PID 1; PID 2 was never tracked
+        assert!(manager.jobs.contains_key(&1));
+        assert!(
+            !manager.jobs.contains_key(&2),
+            "retain must not add new PIDs; that's sync's job"
+        );
+    }
+
+    #[test]
+    fn retain_fires_callback_with_correct_data() {
+        let received = Arc::new(Mutex::new(None));
+        let rc = Arc::clone(&received);
+        let mut manager = JobManager::new().with_callback(move |n| {
+            *rc.lock().unwrap() = Some(n);
+        });
+        manager.sync(&HashSet::from([42]));
+        manager.jobs.get_mut(&42).unwrap().command = "make build".to_string();
+        manager.retain(&HashSet::from([42]), &HashSet::new()); // checked PID 42; it's gone
+        let notif = received.lock().unwrap().take().expect("callback must fire");
+        assert_eq!(notif.pid, 42);
+        assert_eq!(notif.command, "make build");
+        assert_eq!(notif.exit_code, None);
+    }
+
+    #[test]
+    fn retain_no_op_when_all_alive() {
+        let fired = Arc::new(Mutex::new(false));
+        let fc = Arc::clone(&fired);
+        let mut manager = JobManager::new().with_callback(move |_| {
+            *fc.lock().unwrap() = true;
+        });
+        manager.sync(&HashSet::from([1, 2]));
+        manager.retain(&HashSet::from([1, 2]), &HashSet::from([1, 2])); // checked both; both alive
+        assert!(!*fired.lock().unwrap(), "no callback should fire");
+        assert_eq!(manager.jobs.len(), 2);
+    }
+
+    #[test]
+    fn retain_empty_jobs_is_no_op() {
+        let fired = Arc::new(Mutex::new(false));
+        let fc = Arc::clone(&fired);
+        let mut manager = JobManager::new().with_callback(move |_| {
+            *fc.lock().unwrap() = true;
+        });
+        manager.retain(&HashSet::from([1, 2, 3]), &HashSet::from([1, 2, 3])); // nothing tracked
+        assert!(!*fired.lock().unwrap());
+        assert!(manager.jobs.is_empty());
+    }
+
     // ── TypeTool: construction and shared-handle contract ──────────────────
-
-    #[test]
-    fn default_creates_valid_tool_with_is_running_false() {
-        // Default::default() must produce a tool in the correct initial state.
-        let tool = TypeTool::default();
-        assert!(!tool.is_running().load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn is_running_arc_is_same_object_on_repeated_calls() {
-        // All Arc clones from is_running() must point to the same atomic.
-        // A bug that creates a fresh Arc on each call would break the harness
-        // task's ability to observe the flag set inside call().
-        let tool = TypeTool::new();
-        let h1 = tool.is_running();
-        let h2 = tool.is_running();
-        assert!(Arc::ptr_eq(&h1, &h2));
-    }
 
     #[test]
     #[should_panic(expected = "job_manager Arc should have exactly one owner at construction time")]
@@ -1259,68 +1353,191 @@ mod tests {
         );
     }
 
+    // ── BUG: NaN / negative / infinite timeout panics instead of returning Err ───
+    //
+    // `call()` unconditionally calls `Duration::from_secs_f64(args.resolved_timeout())`
+    // *before* any session check.  `Duration::from_secs_f64` panics on NaN, negative
+    // values, and ±Infinity — it never returns an Err.  The desired behaviour is a
+    // clean `Err(TypeError::...)`.  These tests are marked `#[should_panic]` to
+    // document the current (broken) behaviour.  When the bug is fixed, replace
+    // `#[should_panic]` with an assertion that `result.is_err()`.
+
     #[tokio::test]
-    async fn is_running_flag_is_true_during_call_and_false_after() {
-        // Concurrency contract (design §"Background job notification flow"):
-        // is_running is true while call() is executing so the pipe-reader task
-        // knows to ignore SIGCHLD signals; it clears to false afterwards.
-        use std::time::Duration;
-
-        let tool = Arc::new(TypeTool::spawn().await.unwrap());
-        let is_running = tool.is_running();
-
-        assert!(!is_running.load(Ordering::SeqCst), "must start false");
-
-        let tool_bg = Arc::clone(&tool);
-        let handle = tokio::spawn(async move {
-            tool_bg
-                .call(TypeArgs {
-                    keys: "sleep 1\n".into(),
-                    interactive: false,
-                    timeout: None,
-                })
-                .await
-        });
-
-        // Give the spawned task time to reach the PTY write phase.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            is_running.load(Ordering::SeqCst),
-            "is_running must be true while call() is executing"
-        );
-
-        handle.await.unwrap().unwrap();
-        assert!(
-            !is_running.load(Ordering::SeqCst),
-            "is_running must be false after call() returns"
-        );
+    #[should_panic] // BUG: should return Err, not panic
+    async fn call_with_nan_timeout_panics_instead_of_returning_error() {
+        // No PTY needed — the panic occurs before the session is consulted.
+        let tool = TypeTool::new();
+        let _ = tool
+            .call(TypeArgs { keys: "echo hi\n".into(), interactive: false, timeout: Some(f64::NAN) })
+            .await;
     }
 
     #[tokio::test]
-    async fn is_running_cleared_after_error_return() {
-        // Regression guard for the is_running flag leak on error paths.
-        // call() sets is_running = true at entry; it must restore it to false
-        // before returning, even when it returns Err.
-        //
-        // SessionNotInitialized is the only error path exercisable without a
-        // real PTY. The fix (splitting ?? into two ? with store(false) between)
-        // covers all error paths including PTY write/read failures.
-        let tool = TypeTool::new(); // no session → guaranteed error
-        let is_running = tool.is_running();
+    #[should_panic] // BUG: should return Err, not panic
+    async fn call_with_negative_timeout_panics_instead_of_returning_error() {
+        let tool = TypeTool::new();
+        let _ = tool
+            .call(TypeArgs { keys: "echo hi\n".into(), interactive: false, timeout: Some(-1.0) })
+            .await;
+    }
 
-        assert!(!is_running.load(Ordering::SeqCst), "must start false");
+    #[tokio::test]
+    #[should_panic] // BUG: should return Err, not panic
+    async fn call_with_infinite_timeout_panics_instead_of_returning_error() {
+        let tool = TypeTool::new();
+        let _ = tool
+            .call(TypeArgs {
+                keys: "echo hi\n".into(),
+                interactive: false,
+                timeout: Some(f64::INFINITY),
+            })
+            .await;
+    }
 
+    // ── BUG: interactive timeout discards buffered partial output ─────────────
+    //
+    // Design (§The `type` Tool): interactive timeout returns "partial output to
+    // the model so it can decide what to type next."
+    // Implementation: the interactive-timeout arm returns `Ok((vec![], ...))` —
+    // an empty byte vector — regardless of what was buffered before the timeout.
+    // Any output produced by the program before it blocked is silently discarded.
+
+    #[tokio::test]
+    #[ignore = "BUG: interactive timeout discards buffered partial output; returns empty string"]
+    async fn interactive_timeout_returns_buffered_partial_output_not_empty() {
+        let tool = TypeTool::spawn().await.unwrap();
+
+        // `printf` flushes immediately (unlike `echo` which may buffer).
+        // The marker appears in the PTY stream before `cat` blocks on stdin,
+        // so it must be present in the partial output returned on timeout.
         let result = tool
-            .call(TypeArgs { keys: "ls\n".into(), interactive: false, timeout: None })
+            .call(TypeArgs {
+                keys: "printf 'partial_output_marker'; cat\n".into(),
+                interactive: true,
+                timeout: Some(0.3),
+            })
+            .await
+            .unwrap();
+
+        // Clean up: Ctrl-C kills the still-running cat.
+        let _ = tool
+            .call(TypeArgs { keys: "\x03".into(), interactive: false, timeout: Some(2.0) })
             .await;
 
         assert!(
-            matches!(result, Err(TypeError::SessionNotInitialized)),
-            "expected SessionNotInitialized error"
+            result.output.contains("partial_output_marker"),
+            "interactive timeout must return output buffered before the timeout; \
+             got {:?}. Bug: interactive-timeout arm returns Ok((vec![], ...)).",
+            result.output
         );
+    }
+
+    #[test]
+    fn retain_does_not_fire_for_pids_absent_from_sysinfo_snapshot() {
+        // Regression test for the spawn_watcher TOCTOU race.
+        //
+        // The watcher snapshots `tracked` PIDs under the lock, drops the lock,
+        // calls sysinfo for only those PIDs, then calls retain(checked, alive).
+        // If `call()` adds a new PID between the snapshot and retain, that PID
+        // must not be treated as completed — it was never checked by sysinfo.
+        //
+        // Timeline:
+        //   T0: watcher snapshots tracked = {10}, drops lock
+        //   T1: call() runs sync({10, 20}) — PID 20 newly discovered
+        //   T2: watcher refreshes sysinfo for {10} only; checked = {10}, alive = {10}
+        //   T3: watcher calls retain({10}, {10}) — PID 20 is in jobs but not checked
+        //   Fix: retain leaves PID 20 alone; only checked+dead PIDs are removed.
+        let completed = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let cc = Arc::clone(&completed);
+        let mut manager = JobManager::new().with_callback(move |n| {
+            cc.lock().unwrap().push(n.pid);
+        });
+
+        manager.sync(&HashSet::from([10]));     // T0: snapshot — tracked = {10}
+        manager.sync(&HashSet::from([10, 20])); // T1: call() adds PID 20 mid-flight
+
+        // T3: watcher calls retain with only the PIDs it actually asked sysinfo
+        // about. PID 20 is alive; it simply wasn't in the snapshot.
+        manager.retain(&HashSet::from([10]), &HashSet::from([10]));
+
+        let fired = completed.lock().unwrap().clone();
         assert!(
-            !is_running.load(Ordering::SeqCst),
-            "is_running must be cleared even when call() returns an error"
+            !fired.contains(&20),
+            "retain must not fire completion for PID 20 — it was not in the \
+             sysinfo snapshot so its liveness was never checked; \
+             got spurious completions: {:?}",
+            fired
         );
+    }
+
+    // ── spawn_watcher: sysinfo polling integration tests ─────────────────
+
+    #[tokio::test]
+    async fn watcher_detects_background_job_completion() {
+        // Start a short-lived background job, discover it via call(), then let
+        // the watcher detect its completion via sysinfo polling.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tool = TypeTool::spawn().await.unwrap().with_job_callback(move |notif| {
+            let _ = tx.send(notif.pid);
+        });
+
+        // Start the watcher before launching the job so it's already polling.
+        let watcher = tool.spawn_watcher();
+
+        // Launch `sleep 2 &` and discover the background PID via call().
+        let result = tool
+            .call(TypeArgs {
+                keys: "sleep 2 &\n".into(),
+                interactive: false,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(0));
+
+        // Verify the job was discovered.
+        let tracked: Vec<u32> = tool
+            .job_manager
+            .lock()
+            .unwrap()
+            .jobs
+            .keys()
+            .copied()
+            .collect();
+        assert!(!tracked.is_empty(), "background job must be tracked after call()");
+
+        // Wait for the callback to fire (sleep 2 + up to 3s poll margin).
+        let completed_pid = tokio::time::timeout(
+            Duration::from_secs(8),
+            rx.recv(),
+        )
+        .await
+        .expect("watcher must detect background job completion within 8s")
+        .expect("channel must not be closed");
+
+        assert!(
+            tracked.contains(&completed_pid),
+            "completed PID must match a tracked job"
+        );
+
+        watcher.abort();
+    }
+
+    #[tokio::test]
+    async fn watcher_no_op_when_no_jobs() {
+        // The watcher must not panic or fire callbacks when no jobs are tracked.
+        let fired = Arc::new(Mutex::new(false));
+        let fc = Arc::clone(&fired);
+        let tool = TypeTool::spawn().await.unwrap().with_job_callback(move |_| {
+            *fc.lock().unwrap() = true;
+        });
+
+        let watcher = tool.spawn_watcher();
+
+        // Let several poll cycles pass.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        assert!(!*fired.lock().unwrap(), "no callback should fire with no tracked jobs");
+        watcher.abort();
     }
 }

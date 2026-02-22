@@ -1,0 +1,5 @@
+[alias]
+c = "check"
+t = "nextest run --status-level fail --show-progress none --no-output-indent --cargo-quiet"
+tw = "t --workspace"
+tl = "t --lib"
