@@ -229,7 +229,7 @@ impl JobManager {
         for &pid in active_pids {
             self.jobs.entry(pid).or_insert_with(|| Job {
                 pid,
-                // TODO: populate from `jobs -l` or `ps` output for richer info.
+                // command is backfilled by the sysinfo watcher on its next poll.
                 command: String::new(),
             });
         }
@@ -432,10 +432,13 @@ impl TypeTool {
                 // Refresh only the specific PIDs — no full system scan.
                 // remove_dead_processes=true so dead PIDs are pruned from
                 // sysinfo's internal map, making sys.process() return None.
+                // OnlyIfNotSet fetches the command line once per PID (cached
+                // across subsequent refreshes).
                 sys.refresh_processes_specifics(
                     sysinfo::ProcessesToUpdate::Some(&tracked),
                     true,
-                    sysinfo::ProcessRefreshKind::nothing(),
+                    sysinfo::ProcessRefreshKind::nothing()
+                        .with_cmd(sysinfo::UpdateKind::OnlyIfNotSet),
                 );
 
                 let checked: HashSet<u32> = tracked.iter().map(|pid| pid.as_u32()).collect();
@@ -445,7 +448,36 @@ impl TypeTool {
                     .map(|pid| pid.as_u32())
                     .collect();
 
-                job_manager.lock().unwrap().retain(&checked, &alive);
+                {
+                    let mut jm = job_manager.lock().unwrap();
+
+                    // Backfill the command field for alive jobs that don't have one yet.
+                    for &pid in &alive {
+                        if let Some(job) = jm.jobs.get_mut(&pid) {
+                            if job.command.is_empty() {
+                                if let Some(proc) = sys.process(sysinfo::Pid::from_u32(pid)) {
+                                    let cmd = proc.cmd();
+                                    if !cmd.is_empty() {
+                                        job.command = cmd
+                                            .iter()
+                                            .map(|s| s.to_string_lossy())
+                                            .collect::<Vec<_>>()
+                                            .join(" ");
+                                    } else {
+                                        // cmd() can be empty (permissions, kernel threads).
+                                        // Fall back to the process name (short but non-empty).
+                                        let name = proc.name().to_string_lossy();
+                                        if !name.is_empty() {
+                                            job.command = name.into_owned();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    jm.retain(&checked, &alive);
+                }
             }
         })
     }
@@ -1650,6 +1682,127 @@ mod tests {
         assert!(
             tracked.contains(&completed_pid),
             "completed PID must match a tracked job"
+        );
+
+        watcher.abort();
+    }
+
+    #[tokio::test]
+    async fn watcher_backfills_command_field_for_tracked_job() {
+        // After call() discovers a background PID with an empty command,
+        // the watcher's next sysinfo poll must backfill the command field.
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let watcher = tool.spawn_watcher();
+
+        // Launch a background job with a recognizable command.
+        tool.call(TypeArgs {
+            keys: "sleep 30 &\n".into(),
+            interactive: false,
+            timeout: None,
+        })
+        .await
+        .unwrap();
+
+        // sync() adds the PID with an empty command.
+        let pid = {
+            let jm = tool.job_manager.lock().unwrap();
+            assert!(!jm.jobs.is_empty(), "background job must be tracked");
+            let (&pid, job) = jm.jobs.iter().next().unwrap();
+            assert!(job.command.is_empty(), "command must start empty after sync()");
+            pid
+        };
+
+        // Wait for the watcher to poll sysinfo and backfill the command.
+        let backfilled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let jm = tool.job_manager.lock().unwrap();
+                if let Some(job) = jm.jobs.get(&pid) {
+                    if !job.command.is_empty() {
+                        return job.command.clone();
+                    }
+                } else {
+                    break String::new(); // job was reaped, shouldn't happen for sleep 30
+                }
+            }
+        })
+        .await
+        .expect("watcher must backfill the command field within 5s");
+
+        assert!(
+            backfilled.contains("sleep"),
+            "backfilled command must contain 'sleep'; got: {:?}",
+            backfilled
+        );
+
+        watcher.abort();
+    }
+
+    #[tokio::test]
+    async fn watcher_completion_notification_includes_backfilled_command() {
+        // End-to-end: the completion notification must carry the command string
+        // that was backfilled by sysinfo, not the empty string from sync().
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = tool.with_job_callback(move |notif| {
+            let _ = tx.send(notif.command);
+        });
+        let watcher = tool.spawn_watcher();
+
+        // Launch a short-lived background job.
+        tool.call(TypeArgs {
+            keys: "sleep 2 &\n".into(),
+            interactive: false,
+            timeout: None,
+        })
+        .await
+        .unwrap();
+
+        // Wait for the watcher to detect completion and fire the callback.
+        let command = tokio::time::timeout(Duration::from_secs(8), rx.recv())
+            .await
+            .expect("watcher must fire completion callback within 8s")
+            .expect("channel must not be closed");
+
+        assert!(
+            command.contains("sleep"),
+            "completion notification command must contain 'sleep'; got: {:?}",
+            command
+        );
+
+        watcher.abort();
+    }
+
+    #[tokio::test]
+    async fn watcher_does_not_overwrite_already_populated_command() {
+        // If the command was already populated (e.g. by the harness), the
+        // watcher must not overwrite it with sysinfo data.
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let watcher = tool.spawn_watcher();
+
+        tool.call(TypeArgs {
+            keys: "sleep 30 &\n".into(),
+            interactive: false,
+            timeout: None,
+        })
+        .await
+        .unwrap();
+
+        // Manually set the command before the watcher polls.
+        {
+            let mut jm = tool.job_manager.lock().unwrap();
+            let job = jm.jobs.values_mut().next().unwrap();
+            job.command = "harness-provided-command".to_string();
+        }
+
+        // Let a few watcher poll cycles pass.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        let jm = tool.job_manager.lock().unwrap();
+        let job = jm.jobs.values().next().unwrap();
+        assert_eq!(
+            job.command, "harness-provided-command",
+            "watcher must not overwrite a command that was already populated"
         );
 
         watcher.abort();
