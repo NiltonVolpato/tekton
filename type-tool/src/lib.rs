@@ -551,4 +551,656 @@ mod tests {
         let tool = TypeTool::new();
         assert!(!tool.is_running().load(Ordering::SeqCst));
     }
+
+    // ── TypeArgs: additional boundary-value tests ──────────────────────────
+
+    #[test]
+    fn resolved_timeout_explicit_zero_is_honored() {
+        // Zero is a valid (degenerate) timeout. The resolver must not substitute
+        // the default — a bug might treat Some(0.0) like None via `unwrap_or`.
+        let args = TypeArgs { keys: "ls\n".into(), interactive: false, timeout: Some(0.0) };
+        assert_eq!(args.resolved_timeout(), 0.0);
+    }
+
+    #[test]
+    fn resolved_timeout_negative_value_passed_through() {
+        // Validation of the timeout range is the harness's job, not the resolver's.
+        // The resolver must faithfully return whatever the caller supplied, even
+        // nonsensical values like -1.
+        let args = TypeArgs { keys: "ls\n".into(), interactive: false, timeout: Some(-1.0) };
+        assert_eq!(args.resolved_timeout(), -1.0);
+    }
+
+    #[test]
+    fn resolved_timeout_infinity_passed_through() {
+        // Infinite timeout is useful for commands with no known upper bound.
+        let args = TypeArgs {
+            keys: "ls\n".into(),
+            interactive: false,
+            timeout: Some(f64::INFINITY),
+        };
+        assert_eq!(args.resolved_timeout(), f64::INFINITY);
+    }
+
+    #[test]
+    fn resolved_timeout_nan_is_passed_through_not_swapped_for_default() {
+        // NaN is pathological. The resolver must not silently swap it for the
+        // default — that would hide a caller bug. Validation is the harness's job.
+        let args = TypeArgs {
+            keys: "ls\n".into(),
+            interactive: false,
+            timeout: Some(f64::NAN),
+        };
+        assert!(args.resolved_timeout().is_nan());
+    }
+
+    #[test]
+    fn resolved_timeout_override_applies_in_both_interactive_modes() {
+        // The caller-supplied value wins regardless of the `interactive` flag.
+        // A bug might only apply the override in one branch of the if/else.
+        let non_interactive = TypeArgs { keys: String::new(), interactive: false, timeout: Some(42.0) };
+        let interactive = TypeArgs { keys: String::new(), interactive: true, timeout: Some(42.0) };
+        assert_eq!(non_interactive.resolved_timeout(), 42.0);
+        assert_eq!(interactive.resolved_timeout(), 42.0);
+    }
+
+    // ── parse_jobs_p: adversarial inputs ──────────────────────────────────
+
+    #[test]
+    fn parse_jobs_p_skips_negative_numbers() {
+        // Negative integers fall outside u32's range; parse::<u32>() must reject
+        // them. A bug would use parse::<i32>() then as u32, wrapping the value.
+        let pids = parse_jobs_p("-1\n12345\n");
+        assert!(pids.contains(&12345));
+        assert_eq!(pids.len(), 1, "negative number must be silently skipped");
+    }
+
+    #[test]
+    fn parse_jobs_p_skips_u32_overflow() {
+        // 2^32 = 4294967296 overflows u32. A bug using i64→u32 truncating cast
+        // would let it through as 0.
+        let pids = parse_jobs_p("4294967296\n1234\n");
+        assert!(pids.contains(&1234));
+        assert_eq!(pids.len(), 1, "overflowing number must be silently skipped");
+    }
+
+    #[test]
+    fn parse_jobs_p_accepts_u32_max() {
+        // u32::MAX = 4294967295 is a valid u32 and must be accepted.
+        // (Not a realistic PID, but the parser should not impose arbitrary limits.)
+        let output = format!("{}\n", u32::MAX);
+        let pids = parse_jobs_p(&output);
+        assert!(pids.contains(&u32::MAX));
+    }
+
+    #[test]
+    fn parse_jobs_p_skips_floating_point_numbers() {
+        // "123.45" looks numeric but parse::<u32>() must reject it.
+        // A bug might parse via f64 then truncate to u32.
+        let pids = parse_jobs_p("123.45\n999\n");
+        assert!(pids.contains(&999));
+        assert_eq!(pids.len(), 1, "floating-point string must be silently skipped");
+    }
+
+    #[test]
+    fn parse_jobs_p_skips_hex_strings() {
+        // Default parse::<u32>() uses base 10 only; "0x…" must be skipped.
+        // A bug might call u32::from_str_radix or accept hex implicitly.
+        let pids = parse_jobs_p("0xDEAD\n5678\n");
+        assert!(pids.contains(&5678));
+        assert_eq!(pids.len(), 1, "hex string must be silently skipped");
+    }
+
+    #[test]
+    fn parse_jobs_p_deduplicates_repeated_pids() {
+        // `jobs -p` should never repeat a PID, but if it does the result is
+        // still a set with exactly one entry for that PID.
+        let pids = parse_jobs_p("1234\n1234\n");
+        assert_eq!(pids.len(), 1);
+        assert!(pids.contains(&1234));
+    }
+
+    #[test]
+    fn parse_jobs_p_handles_crlf_line_endings() {
+        // A misconfigured PTY may emit CRLF. str::lines() splits on \r\n and
+        // trim() removes stray \r. Both PIDs should be parsed correctly.
+        let pids = parse_jobs_p("12345\r\n67890\r\n");
+        assert!(pids.contains(&12345));
+        assert!(pids.contains(&67890));
+        assert_eq!(pids.len(), 2);
+    }
+
+    #[test]
+    fn parse_jobs_p_handles_no_trailing_newline() {
+        // `jobs -p` may omit the trailing newline on the last line.
+        // The final PID must still be parsed.
+        let pids = parse_jobs_p("12345");
+        assert!(pids.contains(&12345));
+        assert_eq!(pids.len(), 1);
+    }
+
+    #[test]
+    fn parse_jobs_p_returns_empty_for_whitespace_only_input() {
+        // Pure whitespace contains no valid PIDs.
+        assert!(parse_jobs_p("   \n\t\n  ").is_empty());
+    }
+
+    #[test]
+    fn parse_jobs_p_includes_pid_zero_when_present() {
+        // PID 0 is a valid u32 and parse::<u32>() accepts it.
+        // Whether it is a meaningful job PID is a higher-level concern.
+        let pids = parse_jobs_p("0\n1\n");
+        assert!(pids.contains(&0));
+        assert!(pids.contains(&1));
+    }
+
+    // ── JobManager: additional state-machine tests ─────────────────────────
+
+    #[test]
+    fn sync_with_empty_set_when_no_jobs_does_not_fire_callback() {
+        // Syncing against an empty active set when nothing is tracked is a no-op.
+        // A bug might fire spurious callbacks or panic on an empty map.
+        let fired = Arc::new(Mutex::new(false));
+        let fired_clone = Arc::clone(&fired);
+        let mut manager = JobManager::new().with_callback(move |_| {
+            *fired_clone.lock().unwrap() = true;
+        });
+        manager.sync(&HashSet::new());
+        assert!(!*fired.lock().unwrap(), "no callback should fire for empty→empty transition");
+    }
+
+    #[test]
+    fn sync_fires_callback_for_every_simultaneously_completed_job() {
+        // When multiple jobs vanish between two syncs, each must produce exactly
+        // one notification. A bug might only fire for the first or last PID found.
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let cc = Arc::clone(&completed);
+        let mut manager = JobManager::new().with_callback(move |n| {
+            cc.lock().unwrap().push(n.pid);
+        });
+        manager.sync(&HashSet::from([10, 20, 30]));
+        manager.sync(&HashSet::new()); // all three complete simultaneously
+        let mut fired = completed.lock().unwrap().clone();
+        fired.sort(); // HashMap iteration order is non-deterministic
+        assert_eq!(fired, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn sync_does_not_fire_callback_for_still_running_jobs() {
+        // Only departed PIDs trigger notifications. Surviving jobs must not.
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let cc = Arc::clone(&completed);
+        let mut manager = JobManager::new().with_callback(move |n| {
+            cc.lock().unwrap().push(n.pid);
+        });
+        manager.sync(&HashSet::from([1, 2, 3]));
+        manager.sync(&HashSet::from([2, 3])); // only PID 1 completed
+        let fired = completed.lock().unwrap().clone();
+        assert_eq!(fired, vec![1]);
+        assert!(manager.jobs.contains_key(&2), "PID 2 must remain tracked");
+        assert!(manager.jobs.contains_key(&3), "PID 3 must remain tracked");
+    }
+
+    #[test]
+    fn sync_without_callback_silently_removes_completed_jobs() {
+        // No callback registered: a completed job must be quietly removed, not
+        // kept in the map indefinitely or cause a panic.
+        let mut manager = JobManager::new();
+        manager.sync(&HashSet::from([99]));
+        manager.sync(&HashSet::new()); // 99 completes
+        assert!(
+            manager.jobs.is_empty(),
+            "completed job must be removed from the map even when no callback is registered"
+        );
+    }
+
+    #[test]
+    fn sync_handles_pid_reuse_fires_callback_each_lifecycle() {
+        // The OS reuses PIDs. A PID that completed and was removed can
+        // reappear for an entirely new process. Each appearance+disappearance
+        // must produce exactly one notification — not zero, not two.
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let cc = Arc::clone(&completed);
+        let mut manager = JobManager::new().with_callback(move |n| {
+            cc.lock().unwrap().push(n.pid);
+        });
+        manager.sync(&HashSet::from([42])); // first process with PID 42 starts
+        manager.sync(&HashSet::new());      // first process completes → callback
+        manager.sync(&HashSet::from([42])); // PID 42 reused by a new process
+        manager.sync(&HashSet::new());      // second process completes → callback
+        let fired = completed.lock().unwrap().clone();
+        assert_eq!(
+            fired,
+            vec![42, 42],
+            "callback must fire once per lifecycle, including across PID reuse"
+        );
+    }
+
+    #[test]
+    fn sync_notification_preserves_backfilled_command_field() {
+        // The harness may backfill the `command` field after the initial sync
+        // (e.g., from `jobs -l` or `ps` output). The notification must carry
+        // that value, not an empty string from the initial or_insert_with.
+        let received = Arc::new(Mutex::new(String::new()));
+        let rc = Arc::clone(&received);
+        let mut manager = JobManager::new().with_callback(move |n| {
+            *rc.lock().unwrap() = n.command.clone();
+        });
+        manager.sync(&HashSet::from([7]));
+        // Simulate the harness backfilling richer info (design §"Background Jobs").
+        manager.jobs.get_mut(&7).unwrap().command = "long_task".to_string();
+        manager.sync(&HashSet::new()); // job 7 completes
+        assert_eq!(*received.lock().unwrap(), "long_task");
+    }
+
+    #[test]
+    fn sync_notification_exit_code_is_none_for_jobs_p_detection() {
+        // Per the design doc: exit_code is always None when completion is
+        // detected by diffing `jobs -p` output (the harness has not yet called
+        // waitpid). A bug would default it to Some(0).
+        let received_exit_code = Arc::new(Mutex::new(Some(-999_i32)));
+        let rc = Arc::clone(&received_exit_code);
+        let mut manager = JobManager::new().with_callback(move |n| {
+            *rc.lock().unwrap() = n.exit_code;
+        });
+        manager.sync(&HashSet::from([5]));
+        manager.sync(&HashSet::new()); // completes
+        assert_eq!(
+            *received_exit_code.lock().unwrap(),
+            None,
+            "exit_code must be None when completion is detected via jobs-p diff, not waitpid"
+        );
+    }
+
+    // ── TypeTool: construction and shared-handle contract ──────────────────
+
+    #[test]
+    fn default_creates_valid_tool_with_is_running_false() {
+        // Default::default() must produce a tool in the correct initial state.
+        let tool = TypeTool::default();
+        assert!(!tool.is_running().load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn is_running_arc_is_same_object_on_repeated_calls() {
+        // All Arc clones from is_running() must point to the same atomic.
+        // A bug that creates a fresh Arc on each call would break the harness
+        // task's ability to observe the flag set inside call().
+        let tool = TypeTool::new();
+        let h1 = tool.is_running();
+        let h2 = tool.is_running();
+        assert!(Arc::ptr_eq(&h1, &h2));
+    }
+
+    #[test]
+    #[should_panic(expected = "job_manager Arc should have exactly one owner at construction time")]
+    fn with_job_callback_panics_when_job_manager_arc_already_cloned() {
+        // API contract: register the callback BEFORE calling job_manager().
+        // If the harness already holds a clone of the Arc, with_job_callback
+        // cannot take exclusive ownership and must panic to surface the misuse.
+        let tool = TypeTool::new();
+        let _shared = tool.job_manager(); // second owner created here
+        let _tool = tool.with_job_callback(|_| {}); // must panic
+    }
+
+    #[test]
+    fn with_job_callback_fires_when_registered_before_job_manager_clone() {
+        // Happy-path ordering: callback first, then Arc shared with the harness.
+        // Completions detected via the shared handle must reach the callback.
+        let fired = Arc::new(Mutex::new(false));
+        let fired_clone = Arc::clone(&fired);
+        let tool = TypeTool::new().with_job_callback(move |_| {
+            *fired_clone.lock().unwrap() = true;
+        });
+        let jm = tool.job_manager();
+        jm.lock().unwrap().sync(&HashSet::from([1]));
+        jm.lock().unwrap().sync(&HashSet::new()); // triggers completion
+        assert!(*fired.lock().unwrap());
+    }
+
+    // ── PTY integration: state-persistence tests ───────────────────────────
+    //
+    // These tests define the behavioral contract for the persistent shell
+    // session described in the design doc. They are marked `#[ignore]` because
+    // the PTY is not yet implemented; making them pass is the implementation goal.
+
+    #[tokio::test]
+    #[ignore = "PTY session not implemented — these tests define the target behavior"]
+    async fn env_var_exported_in_one_call_is_visible_in_next_call() {
+        // Core persistence contract: exported env vars must survive across tool
+        // calls. A stateless fresh-shell implementation would fail this test.
+        let tool = TypeTool::new();
+        tool.call(TypeArgs {
+            keys: "export TEKTON_PERSIST_TEST=hello\n".into(),
+            interactive: false,
+            timeout: None,
+        })
+        .await
+        .unwrap();
+        let result = tool
+            .call(TypeArgs {
+                keys: "echo $TEKTON_PERSIST_TEST\n".into(),
+                interactive: false,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.output.contains("hello"),
+            "exported env var must persist across calls; got: {:?}", result.output
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "PTY session not implemented — these tests define the target behavior"]
+    async fn working_directory_persists_after_cd() {
+        // `cd` must permanently change $PWD for all subsequent calls.
+        // Regression guard: fresh-shell execution resets $PWD on every call.
+        let tool = TypeTool::new();
+        tool.call(TypeArgs {
+            keys: "cd /tmp\n".into(),
+            interactive: false,
+            timeout: None,
+        })
+        .await
+        .unwrap();
+        let result = tool
+            .call(TypeArgs {
+                keys: "pwd\n".into(),
+                interactive: false,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.output.contains("/tmp"),
+            "$PWD must persist across calls; got: {:?}", result.output
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "PTY session not implemented — these tests define the target behavior"]
+    async fn shell_function_defined_in_one_call_is_callable_in_next() {
+        // Shell functions live in the session's environment. A function defined
+        // in call N must be invocable in call N+1.
+        let tool = TypeTool::new();
+        tool.call(TypeArgs {
+            keys: "tekton_greet() { echo \"greetings $1\"; }\n".into(),
+            interactive: false,
+            timeout: None,
+        })
+        .await
+        .unwrap();
+        let result = tool
+            .call(TypeArgs {
+                keys: "tekton_greet world\n".into(),
+                interactive: false,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.output.contains("greetings world"),
+            "shell function must persist across calls; got: {:?}", result.output
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "PTY session not implemented — these tests define the target behavior"]
+    async fn non_exported_shell_variable_does_not_leak_to_subprocesses() {
+        // Standard bash scoping: non-exported variables must not be visible to
+        // child processes, even across calls within the same session.
+        let tool = TypeTool::new();
+        tool.call(TypeArgs {
+            keys: "TEKTON_LOCAL=secret\n".into(),
+            interactive: false,
+            timeout: None,
+        })
+        .await
+        .unwrap();
+        let result = tool
+            .call(TypeArgs {
+                keys: "bash -c 'echo ${TEKTON_LOCAL:-UNSET}'\n".into(),
+                interactive: false,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.output.contains("UNSET"),
+            "non-exported var must not be visible to subprocesses; got: {:?}", result.output
+        );
+    }
+
+    // ── PTY integration: OSC sentinel and exit-code tests ─────────────────
+
+    #[tokio::test]
+    #[ignore = "PTY session not implemented — these tests define the target behavior"]
+    async fn exit_code_zero_for_successful_command() {
+        // `true` always exits 0. The OSC sentinel must carry that value.
+        let tool = TypeTool::new();
+        let result = tool
+            .call(TypeArgs { keys: "true\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    #[ignore = "PTY session not implemented — these tests define the target behavior"]
+    async fn exit_code_one_for_failing_command() {
+        // `false` always exits 1. Tests that non-zero codes are relayed.
+        let tool = TypeTool::new();
+        let result = tool
+            .call(TypeArgs { keys: "false\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(1));
+    }
+
+    #[tokio::test]
+    #[ignore = "PTY session not implemented — these tests define the target behavior"]
+    async fn exit_code_arbitrary_value_faithfully_captured_from_sentinel() {
+        // The OSC sentinel must relay any exit code, not just 0/1.
+        // A bug might mask the code by always returning 0 or 1.
+        let tool = TypeTool::new();
+        let result = tool
+            .call(TypeArgs {
+                keys: "sh -c 'exit 42'\n".into(),
+                interactive: false,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(42));
+    }
+
+    #[tokio::test]
+    #[ignore = "PTY session not implemented — these tests define the target behavior"]
+    async fn exit_code_127_for_unknown_command() {
+        // Bash exits 127 on "command not found". Verifies the sentinel works
+        // for error paths that never reach the program's own exit() call.
+        let tool = TypeTool::new();
+        let result = tool
+            .call(TypeArgs {
+                keys: "tekton_nonexistent_command_xyz_abc\n".into(),
+                interactive: false,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(127));
+    }
+
+    #[tokio::test]
+    #[ignore = "PTY session not implemented — these tests define the target behavior"]
+    async fn osc_sentinel_bytes_are_stripped_from_output() {
+        // The sentinel `\e]999;EXIT\a` is machine metadata. It must not appear
+        // in the output string returned to the model — only clean terminal text.
+        let tool = TypeTool::new();
+        let result = tool
+            .call(TypeArgs { keys: "echo hello\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+        assert!(
+            !result.output.contains("\x1b]999;"),
+            "OSC sentinel bytes must be stripped from output; got: {:?}", result.output
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "PTY session not implemented — these tests define the target behavior"]
+    async fn keystroke_echo_disabled_so_typed_input_does_not_appear_in_output() {
+        // Design: echo is disabled on the PTY. The model's keystrokes must not
+        // be reflected back in the output it receives.
+        //
+        // If echo is ON, the input "echo marker_xyz\n" appears in the output
+        // stream, making "marker_xyz" occur twice (once as echoed input, once
+        // as command output). With echo OFF it occurs exactly once.
+        let tool = TypeTool::new();
+        let result = tool
+            .call(TypeArgs {
+                keys: "echo tekton_echo_marker_xyz\n".into(),
+                interactive: false,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+        let count = result.output.matches("tekton_echo_marker_xyz").count();
+        assert_eq!(
+            count, 1,
+            "marker must appear exactly once (command output only, not echoed input); got: {:?}",
+            result.output
+        );
+    }
+
+    // ── PTY integration: timeout and process-control tests ─────────────────
+
+    #[tokio::test]
+    #[ignore = "PTY session not implemented — these tests define the target behavior"]
+    async fn non_interactive_timeout_kills_foreground_and_sets_timeout_message() {
+        // Non-interactive timeout: kill the foreground process group, return
+        // captured output plus a timeout_message. exit_code is None because no
+        // sentinel was emitted before the kill.
+        let tool = TypeTool::new();
+        let result = tool
+            .call(TypeArgs {
+                keys: "sleep 9999\n".into(),
+                interactive: false,
+                timeout: Some(0.1), // 100 ms — much shorter than sleep
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.timeout_message.is_some(),
+            "non-interactive timeout must set timeout_message; got: {:?}", result
+        );
+        assert_eq!(
+            result.exit_code, None,
+            "no sentinel was emitted before the kill, so exit_code must be None; got: {:?}", result
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "PTY session not implemented — these tests define the target behavior"]
+    async fn interactive_timeout_returns_partial_output_without_killing_process() {
+        // Interactive timeout: return partial output so the model can decide
+        // what to type next. The process must remain alive.
+        let tool = TypeTool::new();
+        // `cat` with no args blocks on stdin — ideal for testing interactive mode.
+        let partial = tool
+            .call(TypeArgs {
+                keys: "cat\n".into(),
+                interactive: true,
+                timeout: Some(0.1),
+            })
+            .await
+            .unwrap();
+        // No sentinel yet — cat is still running.
+        assert_eq!(
+            partial.exit_code, None,
+            "interactive timeout must not emit a sentinel (process is still running)"
+        );
+        // Clean up: Ctrl-D (EOF) so cat exits and the shell returns to prompt.
+        let cleanup = tool
+            .call(TypeArgs {
+                keys: "\x04".into(), // Ctrl-D
+                interactive: false,
+                timeout: Some(2.0),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            cleanup.exit_code, Some(0),
+            "cat must exit cleanly after receiving EOF via Ctrl-D"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "PTY session not implemented — these tests define the target behavior"]
+    async fn ctrl_c_sends_sigint_terminating_foreground_process_group() {
+        // Ctrl-C (\x03) must terminate the foreground process so the shell
+        // returns to the prompt and emits an OSC sentinel.
+        let tool = TypeTool::new();
+        // Start a long-running process in interactive mode, let it time out so
+        // we get partial output quickly.
+        let _ = tool
+            .call(TypeArgs {
+                keys: "sleep 9999\n".into(),
+                interactive: true,
+                timeout: Some(0.1),
+            })
+            .await;
+        // Send Ctrl-C to kill the still-running sleep.
+        let result = tool
+            .call(TypeArgs {
+                keys: "\x03".into(),
+                interactive: false,
+                timeout: Some(2.0),
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.exit_code.is_some(),
+            "Ctrl-C must terminate the foreground process and produce a sentinel; got: {:?}", result
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "PTY session not implemented — these tests define the target behavior"]
+    async fn is_running_flag_is_true_during_call_and_false_after() {
+        // Concurrency contract (design §"Background job notification flow"):
+        // is_running is true while call() is executing so the pipe-reader task
+        // knows to ignore SIGCHLD signals; it clears to false afterwards.
+        use std::time::Duration;
+
+        let tool = Arc::new(TypeTool::new());
+        let is_running = tool.is_running();
+
+        assert!(!is_running.load(Ordering::SeqCst), "must start false");
+
+        let tool_bg = Arc::clone(&tool);
+        let handle = tokio::spawn(async move {
+            tool_bg
+                .call(TypeArgs {
+                    keys: "sleep 1\n".into(),
+                    interactive: false,
+                    timeout: None,
+                })
+                .await
+        });
+
+        // Give the spawned task time to reach the PTY write phase.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            is_running.load(Ordering::SeqCst),
+            "is_running must be true while call() is executing"
+        );
+
+        handle.await.unwrap().ok(); // ignore result — PTY not implemented yet
+        assert!(
+            !is_running.load(Ordering::SeqCst),
+            "is_running must be false after call() returns"
+        );
+    }
 }
