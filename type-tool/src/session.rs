@@ -110,8 +110,7 @@ impl PtySession {
         let pipe_path = PathBuf::from(format!("/tmp/tekton-jobs-{shell_pid}"));
 
         // 5. Wait up to 15 s for the first sentinel (shell ready).
-        //    Use the polled helper to avoid busy-waiting under concurrent load.
-        poll_for_sentinel(&mut session, Duration::from_secs(15))
+        wait_for_sentinel(&mut session, Duration::from_secs(15))
             .map_err(|e| TypeError::PtySpawn(format!("waiting for initial prompt: {e}")))?;
 
         // 6. Clean up the temp init file.
@@ -129,9 +128,13 @@ impl PtySession {
 ///
 /// Uses expectrl's built-in `expect()` with its timeout mechanism.
 ///
+/// TODO: Verify that `expect()` does not cause high CPU usage under concurrent
+/// load. The old polling implementation assumed it did, but that was never
+/// confirmed.
+///
 /// Returns the [`expectrl::Captures`] on success, or
 /// [`expectrl::Error::ExpectTimeout`] if `timeout` elapses first.
-pub(crate) fn poll_for_sentinel(
+pub(crate) fn wait_for_sentinel(
     session: &mut OsSession,
     timeout: Duration,
 ) -> Result<expectrl::Captures, expectrl::Error> {
@@ -165,10 +168,10 @@ pub(crate) fn parse_sentinel(captures: &expectrl::Captures) -> (i32, String) {
 /// Sends the built-in and waits for the next prompt sentinel.
 /// Returns an empty set on any error or timeout.
 pub(crate) fn run_jobs_p_sync(session: &mut OsSession) -> HashSet<u32> {
-    if session.send("jobs -p\n").is_err() {
+    if session.send_line("jobs -p").is_err() {
         return HashSet::new();
     }
-    match poll_for_sentinel(session, Duration::from_secs(5)) {
+    match wait_for_sentinel(session, Duration::from_secs(5)) {
         Ok(captures) => parse_jobs_p(&String::from_utf8_lossy(captures.before())),
         Err(_) => HashSet::new(),
     }
@@ -177,37 +180,42 @@ pub(crate) fn run_jobs_p_sync(session: &mut OsSession) -> HashSet<u32> {
 /// Send SIGTERM then SIGKILL to foreground children of `shell_pid`,
 /// skipping known background PIDs.
 ///
-/// Uses `sysinfo` to enumerate child processes, avoiding the fragility of
-/// spawning an external `pgrep` (path issues, platform differences, races).
+/// Uses `sysinfo` to enumerate and signal child processes, avoiding both
+/// the fragility of spawning an external `pgrep` and raw `libc::kill` calls.
 pub(crate) fn kill_foreground(shell_pid: u32, background_pids: &HashSet<u32>) {
+    use sysinfo::Signal;
+
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::All, false);
 
     let parent = SysPid::from_u32(shell_pid);
-    let foreground_pids: Vec<u32> = sys
+    let foreground_pids: Vec<SysPid> = sys
         .processes()
         .values()
         .filter(|p| p.parent() == Some(parent))
-        .map(|p| p.pid().as_u32())
+        .map(|p| p.pid())
         // Skip known background jobs.
-        .filter(|pid| !background_pids.contains(pid))
-        // PID 0 is a valid u32 but kill(0, sig) sends the signal to the entire
+        .filter(|pid| !background_pids.contains(&pid.as_u32()))
+        // PID 0 is a valid u32 but signalling it would affect the entire
         // process group, which would kill the harness and its parent.
-        .filter(|&pid| pid != 0)
+        .filter(|&pid| pid.as_u32() != 0)
         .collect();
 
     // SIGTERM first.
     for &pid in &foreground_pids {
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if let Some(process) = sys.process(pid) {
+            process.kill_with(Signal::Term);
+        }
     }
 
-    // Give processes a moment to exit gracefully.
+    // Give processes a moment to exit gracefully, then refresh to check survivors.
     std::thread::sleep(Duration::from_millis(500));
+    sys.refresh_processes(ProcessesToUpdate::Some(&foreground_pids), true);
 
     // SIGKILL any survivors.
     for &pid in &foreground_pids {
-        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        if let Some(process) = sys.process(pid) {
+            process.kill();
         }
     }
 }
@@ -216,7 +224,7 @@ pub(crate) fn kill_foreground(shell_pid: u32, background_pids: &HashSet<u32>) {
 ///
 /// Returns the `$PWD` reported in the post-kill sentinel, or `None` on timeout.
 pub(crate) fn drain_after_kill(session: &mut OsSession) -> Option<String> {
-    poll_for_sentinel(session, DRAIN_TIMEOUT)
+    wait_for_sentinel(session, DRAIN_TIMEOUT)
         .ok()
         .map(|c| parse_sentinel(&c).1)
 }
@@ -362,7 +370,7 @@ mod tests {
     // ── parse_sentinel: integration tests ─────────────────────────────────
     //
     // These spawn a real PTY and call parse_sentinel on the Captures returned
-    // by poll_for_sentinel, testing the full parsing path end-to-end.
+    // by wait_for_sentinel, testing the full parsing path end-to-end.
 
     #[tokio::test]
     async fn parse_sentinel_exit_code_zero_for_true() {
@@ -370,8 +378,8 @@ mod tests {
         let (exit_code, _) = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
             use expectrl::Expect;
-            pty.session.send(b"true\n").unwrap();
-            let caps = poll_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
+            pty.session.send_line("true").unwrap();
+            let caps = wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             parse_sentinel(&caps)
         })
         .await
@@ -385,8 +393,8 @@ mod tests {
         let (exit_code, _) = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
             use expectrl::Expect;
-            pty.session.send(b"false\n").unwrap();
-            let caps = poll_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
+            pty.session.send_line("false").unwrap();
+            let caps = wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             parse_sentinel(&caps)
         })
         .await
@@ -401,8 +409,8 @@ mod tests {
         let (exit_code, _) = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
             use expectrl::Expect;
-            pty.session.send(b"sh -c 'exit 99'\n").unwrap();
-            let caps = poll_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
+            pty.session.send_line("sh -c 'exit 99'").unwrap();
+            let caps = wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             parse_sentinel(&caps)
         })
         .await
@@ -418,8 +426,8 @@ mod tests {
         let (_, cwd) = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
             use expectrl::Expect;
-            pty.session.send(b"cd /\n").unwrap();
-            let caps = poll_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
+            pty.session.send_line("cd /").unwrap();
+            let caps = wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             parse_sentinel(&caps)
         })
         .await
@@ -442,13 +450,13 @@ mod tests {
             use expectrl::Expect;
             // Override PROMPT_COMMAND to emit an exit-code field that overflows i32.
             pty.session
-                .send(b"PROMPT_COMMAND='printf \"\\033]999;9999999999;$PWD\\007\"'\n")
+                .send_line("PROMPT_COMMAND='printf \"\\033]999;9999999999;$PWD\\007\"'")
                 .unwrap();
             // Consume the sentinel produced by this PROMPT_COMMAND change itself.
-            poll_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
+            wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             // Run any command; the sentinel will carry "9999999999" as the exit code.
-            pty.session.send(b"false\n").unwrap();
-            let caps = poll_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
+            pty.session.send_line("false").unwrap();
+            let caps = wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             let (exit_code, _) = parse_sentinel(&caps);
             exit_code
         })
@@ -461,23 +469,23 @@ mod tests {
         );
     }
 
-    // ── poll_for_sentinel: timeout behaviour ──────────────────────────────
+    // ── wait_for_sentinel: timeout behaviour ──────────────────────────────
 
     #[tokio::test]
-    async fn poll_for_sentinel_times_out_when_no_new_sentinel_emitted() {
+    async fn wait_for_sentinel_times_out_when_no_new_sentinel_emitted() {
         // After spawn the initial sentinel is consumed. With no command sent,
-        // no new sentinel arrives and poll_for_sentinel must return ExpectTimeout.
+        // no new sentinel arrives and wait_for_sentinel must return ExpectTimeout.
         let pty = PtySession::spawn().await.unwrap();
         let result = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
             // No command sent — no sentinel will arrive.
-            poll_for_sentinel(&mut pty.session, Duration::from_millis(200))
+            wait_for_sentinel(&mut pty.session, Duration::from_millis(200))
         })
         .await
         .unwrap();
         assert!(
             matches!(result, Err(expectrl::Error::ExpectTimeout)),
-            "poll_for_sentinel must return ExpectTimeout when no sentinel arrives; \
+            "wait_for_sentinel must return ExpectTimeout when no sentinel arrives; \
              got: {:?}",
             result
         );
@@ -485,14 +493,14 @@ mod tests {
 
     #[ignore = "expectrl's expect() overshoots short timeouts by ~670ms"]
     #[tokio::test]
-    async fn poll_for_sentinel_does_not_dramatically_overshoot_timeout() {
+    async fn wait_for_sentinel_does_not_dramatically_overshoot_timeout() {
         // Guards against an implementation that loops with a fixed sleep much
         // larger than POLL_INTERVAL, making the effective timeout 10× the request.
         let pty = PtySession::spawn().await.unwrap();
         let start = std::time::Instant::now();
         let _result = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-            poll_for_sentinel(&mut pty.session, Duration::from_millis(150))
+            wait_for_sentinel(&mut pty.session, Duration::from_millis(150))
         })
         .await
         .unwrap();
@@ -525,9 +533,9 @@ mod tests {
             let mut pty = pty;
             use expectrl::Expect;
             // Start a long-running background job.
-            pty.session.send(b"sleep 9999 &\n").unwrap();
+            pty.session.send_line("sleep 9999 &").unwrap();
             // Shell returns to prompt after backgrounding; wait for sentinel.
-            poll_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
+            wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             run_jobs_p_sync(&mut pty.session)
         })
         .await
@@ -549,13 +557,13 @@ mod tests {
         let pids = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
             use expectrl::Expect;
-            pty.session.send(b"sleep 0.1 &\n").unwrap();
-            poll_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
+            pty.session.send_line("sleep 0.1 &").unwrap();
+            wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             // Wait for the background job to finish, then force a full prompt
             // cycle so bash reaps it and purges it from the job table.
             std::thread::sleep(Duration::from_millis(300));
-            pty.session.send(b"true\n").unwrap();
-            poll_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
+            pty.session.send_line("true").unwrap();
+            wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             run_jobs_p_sync(&mut pty.session)
         })
         .await
@@ -573,16 +581,16 @@ mod tests {
             let mut pty = pty;
             use expectrl::Expect;
             // Start a foreground process that would run indefinitely.
-            pty.session.send(b"sleep 9999\n").unwrap();
+            pty.session.send_line("sleep 9999").unwrap();
             // Read from the PTY so bash can make progress forking the child.
             // sleep produces no sentinel, so this will time out — that's expected.
-            let _ = poll_for_sentinel(&mut pty.session, Duration::from_secs(1));
+            let _ = wait_for_sentinel(&mut pty.session, Duration::from_secs(1));
 
             // Kill foreground processes (no background PIDs to spare).
             kill_foreground(shell_pid, &HashSet::new());
 
             // Bash regains control, runs PROMPT_COMMAND, emits a sentinel.
-            poll_for_sentinel(&mut pty.session, Duration::from_secs(5))
+            wait_for_sentinel(&mut pty.session, Duration::from_secs(5))
         })
         .await
         .unwrap();
@@ -605,20 +613,20 @@ mod tests {
             use expectrl::Expect;
 
             // Start a background job and record its PID.
-            pty.session.send(b"sleep 9999 &\n").unwrap();
-            poll_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
+            pty.session.send_line("sleep 9999 &").unwrap();
+            wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             let bg_pids = run_jobs_p_sync(&mut pty.session);
             assert_eq!(bg_pids.len(), 1, "expected exactly one background job");
             let bg_pid = *bg_pids.iter().next().unwrap();
 
             // Start a foreground process.
-            pty.session.send(b"sleep 9999\n").unwrap();
+            pty.session.send_line("sleep 9999").unwrap();
             // Read from the PTY so bash can make progress forking the child.
-            let _ = poll_for_sentinel(&mut pty.session, Duration::from_secs(1));
+            let _ = wait_for_sentinel(&mut pty.session, Duration::from_secs(1));
 
             // Kill foreground only — background PID is in the protection set.
             kill_foreground(shell_pid, &bg_pids);
-            poll_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
+            wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
 
             // The background job must still be running.
             let remaining = run_jobs_p_sync(&mut pty.session);
@@ -642,13 +650,13 @@ mod tests {
             use expectrl::Expect;
 
             // Navigate to a known directory first.
-            pty.session.send(b"cd /\n").unwrap();
-            poll_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
+            pty.session.send_line("cd /").unwrap();
+            wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
 
             // Start a foreground process and read from the PTY so bash can
             // make progress forking the child.
-            pty.session.send(b"sleep 9999\n").unwrap();
-            let _ = poll_for_sentinel(&mut pty.session, Duration::from_secs(1));
+            pty.session.send_line("sleep 9999").unwrap();
+            let _ = wait_for_sentinel(&mut pty.session, Duration::from_secs(1));
             kill_foreground(shell_pid, &HashSet::new());
 
             drain_after_kill(&mut pty.session)

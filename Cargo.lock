@@ -1568,7 +1568,6 @@ name = "tekton-type-tool"
 version = "0.0.0"
 dependencies = [
  "expectrl",
- "libc",
  "regex",
  "rig-core",
  "serde",

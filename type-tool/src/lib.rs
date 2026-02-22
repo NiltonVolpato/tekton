@@ -503,9 +503,8 @@ impl Tool for TypeTool {
             s.send(keys.as_bytes())
                 .map_err(|e| TypeError::PtyWrite(e.to_string()))?;
 
-            // 2. Wait for the prompt sentinel using a polled loop to avoid
-            //    busy-waiting under concurrent load (see session::poll_for_sentinel).
-            match session::poll_for_sentinel(s, timeout) {
+            // 2. Wait for the prompt sentinel.
+            match session::wait_for_sentinel(s, timeout) {
                 Ok(captures) => {
                     let output = captures.before().to_vec();
                     let (exit_code, cwd) = session::parse_sentinel(&captures);
@@ -514,6 +513,13 @@ impl Tool for TypeTool {
                 }
 
                 Err(expectrl::Error::ExpectTimeout) if !interactive => {
+                    // Drain partial output buffered by expect() before the timeout.
+                    use std::io::BufRead;
+                    let output = s.fill_buf()
+                        .map(|b| b.to_vec())
+                        .unwrap_or_default();
+                    s.consume(output.len());
+
                     // Kill the foreground process (SIGTERM → SIGKILL).
                     session::kill_foreground(shell_pid, &background_pids);
 
@@ -525,7 +531,7 @@ impl Tool for TypeTool {
                         "Command timed out after {:.1}s and was terminated.",
                         timeout.as_secs_f64()
                     );
-                    Ok((vec![], None, Some(msg), cwd, Some(active_pids)))
+                    Ok((output, None, Some(msg), cwd, Some(active_pids)))
                 }
 
                 Err(expectrl::Error::ExpectTimeout) => {
@@ -533,7 +539,15 @@ impl Tool for TypeTool {
                     // active_pids is None to suppress the post-call sync — we have no
                     // fresh jobs-p snapshot and syncing with an empty set would fire
                     // spurious completion callbacks for all tracked background jobs.
-                    Ok((vec![], None, None, None, None))
+                    //
+                    // expect() already read data into its internal buffer before
+                    // timing out. Drain it via BufRead::fill_buf + consume.
+                    use std::io::BufRead;
+                    let output = s.fill_buf()
+                        .map(|b| b.to_vec())
+                        .unwrap_or_default();
+                    s.consume(output.len());
+                    Ok((output, None, None, None, None))
                 }
 
                 Err(e) => Err(TypeError::PtyRead(e.to_string())),
@@ -1394,16 +1408,7 @@ mod tests {
             .await;
     }
 
-    // ── BUG: interactive timeout discards buffered partial output ─────────────
-    //
-    // Design (§The `type` Tool): interactive timeout returns "partial output to
-    // the model so it can decide what to type next."
-    // Implementation: the interactive-timeout arm returns `Ok((vec![], ...))` —
-    // an empty byte vector — regardless of what was buffered before the timeout.
-    // Any output produced by the program before it blocked is silently discarded.
-
     #[tokio::test]
-    #[ignore = "BUG: interactive timeout discards buffered partial output; returns empty string"]
     async fn interactive_timeout_returns_buffered_partial_output_not_empty() {
         let tool = TypeTool::spawn().await.unwrap();
 
