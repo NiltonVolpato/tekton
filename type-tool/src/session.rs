@@ -5,7 +5,6 @@
 
 use std::{
     collections::HashSet,
-    path::PathBuf,
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
@@ -33,9 +32,6 @@ pub(crate) struct PtySession {
     pub(crate) session: OsSession,
     /// PID of the bash shell (used for `pgrep -P`).
     pub(crate) shell_pid: u32,
-    /// Path to the SIGCHLD named pipe (`/tmp/tekton-jobs-<shell_pid>`).
-    #[allow(dead_code)]
-    pub(crate) pipe_path: PathBuf,
     /// Working directory from the initial sentinel (`$PWD` at shell startup).
     pub(crate) working_directory: String,
 }
@@ -63,12 +59,6 @@ impl PtySession {
 
         // The PROMPT_COMMAND sentinel format: ESC]999;EXIT_CODE;$PWD BEL
         //
-        // NOTE: The SIGCHLD trap + named pipe for background job notifications
-        // is intentionally omitted here.  The pipe's open() call blocks until a
-        // reader opens the other end; without the harness running (e.g. in tests)
-        // the trap handler would deadlock the shell the first time any external
-        // command exits.  The SIGCHLD mechanism will be wired back once the
-        // harness implementation exists.
         // TODO: PS1 uses \u (system username) but the design doc says the LLM's
         // name should appear (e.g. "claude@alpha" not "nilton@alpha"). The name
         // needs to be configurable and injected into the init script.
@@ -96,9 +86,8 @@ impl PtySession {
             .set_echo(false)
             .map_err(|e| TypeError::PtySpawn(format!("set_echo failed: {e}")))?;
 
-        // 4. Derive pipe path from the shell PID.
+        // 4. Get the shell PID.
         let shell_pid = session.get_process().pid().as_raw() as u32;
-        let pipe_path = PathBuf::from(format!("/tmp/tekton-jobs-{shell_pid}"));
 
         // 5. Wait up to 15 s for the first sentinel (shell ready).
         let captures = wait_for_sentinel(&mut session, Duration::from_secs(15))
@@ -111,7 +100,6 @@ impl PtySession {
         Ok(Self {
             session,
             shell_pid,
-            pipe_path,
             working_directory,
         })
     }
