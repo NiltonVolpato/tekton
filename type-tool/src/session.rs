@@ -36,6 +36,8 @@ pub(crate) struct PtySession {
     /// Path to the SIGCHLD named pipe (`/tmp/tekton-jobs-<shell_pid>`).
     #[allow(dead_code)]
     pub(crate) pipe_path: PathBuf,
+    /// Working directory from the initial sentinel (`$PWD` at shell startup).
+    pub(crate) working_directory: String,
 }
 
 impl PtySession {
@@ -49,7 +51,7 @@ impl PtySession {
             .map_err(|e| TypeError::PtySpawn(format!("spawn_blocking panicked: {e}")))?
     }
 
-    fn spawn_blocking_inner() -> Result<Self, TypeError> {
+    pub(crate) fn spawn_blocking_inner() -> Result<Self, TypeError> {
         // 1. Write the init script to a temp file.
         // Use PID + atomic counter for a collision-proof filename.
         // PID alone isn't unique when multiple threads spawn concurrently
@@ -92,8 +94,9 @@ impl PtySession {
         let pipe_path = PathBuf::from(format!("/tmp/tekton-jobs-{shell_pid}"));
 
         // 5. Wait up to 15 s for the first sentinel (shell ready).
-        wait_for_sentinel(&mut session, Duration::from_secs(15))
+        let captures = wait_for_sentinel(&mut session, Duration::from_secs(15))
             .map_err(|e| TypeError::PtySpawn(format!("waiting for initial prompt: {e}")))?;
+        let (_, working_directory) = parse_sentinel(&captures);
 
         // 6. Clean up the temp init file.
         let _ = std::fs::remove_file(&init_path);
@@ -102,6 +105,7 @@ impl PtySession {
             session,
             shell_pid,
             pipe_path,
+            working_directory,
         })
     }
 }

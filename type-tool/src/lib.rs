@@ -30,7 +30,8 @@
 //!     let anthropic = anthropic::Client::from_env();
 //!     let model = anthropic.completion_model(CLAUDE_4_SONNET);
 //!
-//!     let tool = TypeTool::spawn().await.unwrap().with_job_callback(|notif| {
+//!     let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+//!     let tool = tool.with_job_callback(|notif| {
 //!         // Queue a proactive message to the agent, wake it up if idle, etc.
 //!         eprintln!("job {} done (exit {:?})", notif.pid, notif.exit_code);
 //!     });
@@ -113,20 +114,35 @@ pub struct TypeOutput {
     /// Terminal output captured between the keystroke and the next prompt (or timeout).
     pub output: String,
 
-    /// Exit code of the last foreground command, as read from the OSC sentinel.
-    ///
-    /// `None` if the command timed out before emitting a sentinel.
-    pub exit_code: Option<i32>,
+    /// What happened after the keystrokes were sent.
+    pub outcome: Outcome,
+}
 
-    /// If the call timed out, a human-readable explanation.
-    pub timeout_message: Option<String>,
+/// Describes how a `type` call concluded.
+#[derive(Debug, Serialize)]
+pub enum Outcome {
+    /// The command ran to completion and the shell emitted a prompt sentinel.
+    Completed {
+        exit_code: i32,
+        working_directory: String,
+    },
 
-    /// Working directory reported by the OSC sentinel (`$PWD`).
-    ///
-    /// - **Happy path**: `Some(dir)` from the command's sentinel.
-    /// - **Non-interactive timeout**: `Some(dir)` from the post-kill drain sentinel.
-    /// - **Interactive timeout**: `None` — process still running, directory unknown.
-    pub working_directory: Option<String>,
+    /// The command timed out (non-interactive) and was killed.
+    /// The shell is back at a prompt and ready for the next command.
+    Killed {
+        working_directory: String,
+        timeout_secs: f64,
+    },
+
+    /// The command timed out (interactive) and is still running.
+    /// The foreground process was not killed — the caller can send more input.
+    Waiting,
+
+    /// The shell process exited (e.g. `exec`, `exit`, crash).
+    /// A new session has been spawned and is ready.
+    ShellExited {
+        working_directory: String,
+    },
 }
 
 // ── Job tracking ─────────────────────────────────────────────────────────────
@@ -339,13 +355,16 @@ impl TypeTool {
         }
     }
 
-    /// Spawn a bash PTY session and return a fully initialized `TypeTool`.
-    pub async fn spawn() -> Result<Self, TypeError> {
+    /// Spawn a bash PTY session and return a fully initialized `TypeTool`
+    /// along with the shell's initial working directory.
+    pub async fn spawn() -> Result<(Self, String), TypeError> {
         let session = session::PtySession::spawn().await?;
-        Ok(Self {
+        let working_directory = session.working_directory.clone();
+        let tool = Self {
             session: Arc::new(tokio::sync::Mutex::new(Some(session))),
             job_manager: Arc::new(Mutex::new(JobManager::new())),
-        })
+        };
+        Ok((tool, working_directory))
     }
 
     /// Register a callback invoked whenever a background job completes.
@@ -496,9 +515,10 @@ impl Tool for TypeTool {
         //
         // The active_pids slot is `Option<HashSet<u32>>`:
         //   - `Some(pids)` on a normal return or non-interactive timeout — sync the manager.
-        //   - `None` on an interactive timeout — the foreground process is still alive and
-        //     we have no fresh `jobs -p` snapshot, so syncing with an empty set would
-        //     spuriously fire "job completed" callbacks for every tracked background job.
+        //   - `None` on an interactive timeout or shell exit — the foreground process is
+        //     still alive (Waiting) or gone (ShellExited), so we have no fresh `jobs -p`
+        //     snapshot.
+        let timeout_secs = timeout.as_secs_f64();
         let result = tokio::task::spawn_blocking(move || -> Result<_, TypeError> {
             let mut guard = guard;
             let pty = guard.as_mut().ok_or(TypeError::SessionNotInitialized)?;
@@ -516,7 +536,11 @@ impl Tool for TypeTool {
                     let output = captures.before().to_vec();
                     let (exit_code, cwd) = session::parse_sentinel(&captures);
                     let active_pids = session::run_jobs_p_sync(s);
-                    Ok((output, Some(exit_code), None, Some(cwd), Some(active_pids)))
+                    let outcome = Outcome::Completed {
+                        exit_code,
+                        working_directory: cwd,
+                    };
+                    Ok((output, outcome, Some(active_pids)))
                 }
 
                 Err(expectrl::Error::ExpectTimeout) if !interactive => {
@@ -531,14 +555,15 @@ impl Tool for TypeTool {
                     session::kill_foreground(shell_pid, &background_pids);
 
                     // Drain PTY to restore a clean prompt; extract post-kill $PWD.
-                    let cwd = session::drain_after_kill(s);
+                    let cwd = session::drain_after_kill(s)
+                        .unwrap_or_default();
 
                     let active_pids = session::run_jobs_p_sync(s);
-                    let msg = format!(
-                        "Command timed out after {:.1}s and was terminated.",
-                        timeout.as_secs_f64()
-                    );
-                    Ok((output, None, Some(msg), cwd, Some(active_pids)))
+                    let outcome = Outcome::Killed {
+                        working_directory: cwd,
+                        timeout_secs,
+                    };
+                    Ok((output, outcome, Some(active_pids)))
                 }
 
                 Err(expectrl::Error::ExpectTimeout) => {
@@ -554,7 +579,27 @@ impl Tool for TypeTool {
                         .map(|b| b.to_vec())
                         .unwrap_or_default();
                     s.consume(output.len());
-                    Ok((output, None, None, None, None))
+                    Ok((output, Outcome::Waiting, None))
+                }
+
+                Err(expectrl::Error::Eof) => {
+                    // Shell process exited (exec, exit, crash, etc.).
+                    // Drain any buffered output before EOF.
+                    use std::io::BufRead;
+                    let output = s.fill_buf()
+                        .map(|b| b.to_vec())
+                        .unwrap_or_default();
+                    s.consume(output.len());
+
+                    // Respawn a fresh session so the next call() works.
+                    let new_pty = session::PtySession::spawn_blocking_inner()?;
+                    let cwd = new_pty.working_directory.clone();
+                    *guard = Some(new_pty);
+
+                    let outcome = Outcome::ShellExited {
+                        working_directory: cwd,
+                    };
+                    Ok((output, outcome, None))
                 }
 
                 Err(e) => Err(TypeError::PtyRead(e.to_string())),
@@ -563,23 +608,15 @@ impl Tool for TypeTool {
         .await
         .map_err(|e| TypeError::PtyRead(e.to_string()))?;
 
-        let (output_bytes, exit_code, timeout_message, working_directory, active_pids) = result?;
+        let (output_bytes, outcome, active_pids) = result?;
 
         if let Some(active_pids) = active_pids {
             self.job_manager.lock().unwrap().sync(&active_pids);
         }
 
-        // TODO: TypeOutput is not rich enough to capture all outcomes.
-        // It needs to distinguish between: normal completion (sentinel),
-        // timeout (interactive vs non-interactive), and shell death (EOF).
-        // In the shell-death case, the respawned session should be ready
-        // before call() returns, and the output must convey what happened
-        // so the LLM can react appropriately.
         Ok(TypeOutput {
             output: String::from_utf8_lossy(&output_bytes).into_owned(),
-            exit_code,
-            timeout_message,
-            working_directory,
+            outcome,
         })
     }
 }
@@ -1094,7 +1131,7 @@ mod tests {
     async fn env_var_exported_in_one_call_is_visible_in_next_call() {
         // Core persistence contract: exported env vars must survive across tool
         // calls. A stateless fresh-shell implementation would fail this test.
-        let tool = TypeTool::spawn().await.unwrap();
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
         tool.call(TypeArgs {
             keys: "export TEKTON_PERSIST_TEST=hello\n".into(),
             interactive: false,
@@ -1120,7 +1157,7 @@ mod tests {
     async fn working_directory_persists_after_cd() {
         // `cd` must permanently change $PWD for all subsequent calls.
         // Regression guard: fresh-shell execution resets $PWD on every call.
-        let tool = TypeTool::spawn().await.unwrap();
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
         tool.call(TypeArgs {
             keys: "cd /tmp\n".into(),
             interactive: false,
@@ -1140,14 +1177,17 @@ mod tests {
             result.output.contains("/tmp"),
             "$PWD must persist across calls; got: {:?}", result.output
         );
-        assert_eq!(result.working_directory, Some("/tmp".to_string()));
+        assert!(
+            matches!(result.outcome, Outcome::Completed { ref working_directory, .. } if working_directory == "/tmp"),
+            "working directory must be /tmp; got: {:?}", result.outcome
+        );
     }
 
     #[tokio::test]
     async fn shell_function_defined_in_one_call_is_callable_in_next() {
         // Shell functions live in the session's environment. A function defined
         // in call N must be invocable in call N+1.
-        let tool = TypeTool::spawn().await.unwrap();
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
         tool.call(TypeArgs {
             keys: "tekton_greet() { echo \"greetings $1\"; }\n".into(),
             interactive: false,
@@ -1173,7 +1213,7 @@ mod tests {
     async fn non_exported_shell_variable_does_not_leak_to_subprocesses() {
         // Standard bash scoping: non-exported variables must not be visible to
         // child processes, even across calls within the same session.
-        let tool = TypeTool::spawn().await.unwrap();
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
         tool.call(TypeArgs {
             keys: "TEKTON_LOCAL=secret\n".into(),
             interactive: false,
@@ -1200,30 +1240,30 @@ mod tests {
     #[tokio::test]
     async fn exit_code_zero_for_successful_command() {
         // `true` always exits 0. The OSC sentinel must carry that value.
-        let tool = TypeTool::spawn().await.unwrap();
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
         let result = tool
             .call(TypeArgs { keys: "true\n".into(), interactive: false, timeout: None })
             .await
             .unwrap();
-        assert_eq!(result.exit_code, Some(0));
+        assert!(matches!(result.outcome, Outcome::Completed { exit_code: 0, .. }));
     }
 
     #[tokio::test]
     async fn exit_code_one_for_failing_command() {
         // `false` always exits 1. Tests that non-zero codes are relayed.
-        let tool = TypeTool::spawn().await.unwrap();
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
         let result = tool
             .call(TypeArgs { keys: "false\n".into(), interactive: false, timeout: None })
             .await
             .unwrap();
-        assert_eq!(result.exit_code, Some(1));
+        assert!(matches!(result.outcome, Outcome::Completed { exit_code: 1, .. }));
     }
 
     #[tokio::test]
     async fn exit_code_arbitrary_value_faithfully_captured_from_sentinel() {
         // The OSC sentinel must relay any exit code, not just 0/1.
         // A bug might mask the code by always returning 0 or 1.
-        let tool = TypeTool::spawn().await.unwrap();
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
         let result = tool
             .call(TypeArgs {
                 keys: "sh -c 'exit 42'\n".into(),
@@ -1232,14 +1272,14 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(result.exit_code, Some(42));
+        assert!(matches!(result.outcome, Outcome::Completed { exit_code: 42, .. }));
     }
 
     #[tokio::test]
     async fn exit_code_127_for_unknown_command() {
         // Bash exits 127 on "command not found". Verifies the sentinel works
         // for error paths that never reach the program's own exit() call.
-        let tool = TypeTool::spawn().await.unwrap();
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
         let result = tool
             .call(TypeArgs {
                 keys: "tekton_nonexistent_command_xyz_abc\n".into(),
@@ -1248,14 +1288,14 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(result.exit_code, Some(127));
+        assert!(matches!(result.outcome, Outcome::Completed { exit_code: 127, .. }));
     }
 
     #[tokio::test]
     async fn osc_sentinel_bytes_are_stripped_from_output() {
         // The sentinel `\e]999;EXIT\a` is machine metadata. It must not appear
         // in the output string returned to the model — only clean terminal text.
-        let tool = TypeTool::spawn().await.unwrap();
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
         let result = tool
             .call(TypeArgs { keys: "echo hello\n".into(), interactive: false, timeout: None })
             .await
@@ -1274,7 +1314,7 @@ mod tests {
         // If echo is ON, the input "echo marker_xyz\n" appears in the output
         // stream, making "marker_xyz" occur twice (once as echoed input, once
         // as command output). With echo OFF it occurs exactly once.
-        let tool = TypeTool::spawn().await.unwrap();
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
         let result = tool
             .call(TypeArgs {
                 keys: "echo tekton_echo_marker_xyz\n".into(),
@@ -1296,9 +1336,8 @@ mod tests {
     #[tokio::test]
     async fn non_interactive_timeout_kills_foreground_and_sets_timeout_message() {
         // Non-interactive timeout: kill the foreground process group, return
-        // captured output plus a timeout_message. exit_code is None because no
-        // sentinel was emitted before the kill.
-        let tool = TypeTool::spawn().await.unwrap();
+        // captured output. The outcome is Killed.
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
         let result = tool
             .call(TypeArgs {
                 keys: "sleep 9999\n".into(),
@@ -1308,12 +1347,8 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            result.timeout_message.is_some(),
-            "non-interactive timeout must set timeout_message; got: {:?}", result
-        );
-        assert_eq!(
-            result.exit_code, None,
-            "no sentinel was emitted before the kill, so exit_code must be None; got: {:?}", result
+            matches!(result.outcome, Outcome::Killed { .. }),
+            "non-interactive timeout must result in Outcome::Killed; got: {:?}", result.outcome
         );
     }
 
@@ -1321,7 +1356,7 @@ mod tests {
     async fn interactive_timeout_returns_partial_output_without_killing_process() {
         // Interactive timeout: return partial output so the model can decide
         // what to type next. The process must remain alive.
-        let tool = TypeTool::spawn().await.unwrap();
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
         // `cat` with no args blocks on stdin — ideal for testing interactive mode.
         let partial = tool
             .call(TypeArgs {
@@ -1331,10 +1366,10 @@ mod tests {
             })
             .await
             .unwrap();
-        // No sentinel yet — cat is still running.
-        assert_eq!(
-            partial.exit_code, None,
-            "interactive timeout must not emit a sentinel (process is still running)"
+        // No sentinel yet — cat is still running (Waiting state).
+        assert!(
+            matches!(partial.outcome, Outcome::Waiting),
+            "interactive timeout must return Outcome::Waiting (process is still running)"
         );
         // Clean up: Ctrl-D (EOF) so cat exits and the shell returns to prompt.
         let cleanup = tool
@@ -1345,8 +1380,8 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(
-            cleanup.exit_code, Some(0),
+        assert!(
+            matches!(cleanup.outcome, Outcome::Completed { exit_code: 0, .. }),
             "cat must exit cleanly after receiving EOF via Ctrl-D"
         );
     }
@@ -1355,7 +1390,7 @@ mod tests {
     async fn ctrl_c_sends_sigint_terminating_foreground_process_group() {
         // Ctrl-C (\x03) must terminate the foreground process so the shell
         // returns to the prompt and emits an OSC sentinel.
-        let tool = TypeTool::spawn().await.unwrap();
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
         // Start a long-running process in interactive mode, let it time out so
         // we get partial output quickly.
         let _ = tool
@@ -1375,8 +1410,8 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            result.exit_code.is_some(),
-            "Ctrl-C must terminate the foreground process and produce a sentinel; got: {:?}", result
+            matches!(result.outcome, Outcome::Completed { .. }),
+            "Ctrl-C must terminate the foreground process and produce a sentinel; got: {:?}", result.outcome
         );
     }
 
@@ -1415,7 +1450,7 @@ mod tests {
 
     #[tokio::test]
     async fn interactive_timeout_returns_buffered_partial_output_not_empty() {
-        let tool = TypeTool::spawn().await.unwrap();
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
 
         // `printf` flushes immediately (unlike `echo` which may buffer).
         // The marker appears in the PTY stream before `cat` blocks on stdin,
@@ -1487,7 +1522,8 @@ mod tests {
         // Start a short-lived background job, discover it via call(), then let
         // the watcher detect its completion via sysinfo polling.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let tool = TypeTool::spawn().await.unwrap().with_job_callback(move |notif| {
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = tool.with_job_callback(move |notif| {
             let _ = tx.send(notif.pid);
         });
 
@@ -1503,7 +1539,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(result.exit_code, Some(0));
+        assert!(matches!(result.outcome, Outcome::Completed { exit_code: 0, .. }));
 
         // Verify the job was discovered.
         let tracked: Vec<u32> = tool
@@ -1535,7 +1571,6 @@ mod tests {
 
     // ── Shell death / exec: session destruction tests ──────────────────
 
-    #[ignore = "BUG: EOF error discards buffered output — 'Hello Mom!' is lost"]
     #[tokio::test]
     async fn exec_replaces_shell_first_call_returns_buffered_output() {
         // `exec /bin/echo` replaces bash with echo. Echo prints "Hello Mom!"
@@ -1543,11 +1578,8 @@ mod tests {
         //
         // Correct behavior: the output printed before EOF ("Hello Mom!") must
         // be returned to the caller. The shell is dead so there's no sentinel
-        // — exit_code should be None, but the output must not be discarded.
-        //
-        // Current behavior: the EOF error in call()'s catch-all arm discards
-        // everything in the buffer and returns Err(PtyRead("EOF ...")).
-        let tool = TypeTool::spawn().await.unwrap();
+        // — the outcome should be ShellExited.
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
 
         let result = tool
             .call(TypeArgs {
@@ -1556,42 +1588,45 @@ mod tests {
                 timeout: Some(2.0),
             })
             .await
-            .expect("call must return Ok with buffered output, not Err on EOF");
+            .expect("call must return Ok with buffered output on shell exit");
 
         assert!(
             result.output.contains("Hello Mom!"),
             "output printed before EOF must be returned to the caller; got: {:?}",
             result.output
         );
-        assert_eq!(
-            result.exit_code, None,
-            "no sentinel was emitted (shell is dead), so exit_code must be None"
+        assert!(
+            matches!(result.outcome, Outcome::ShellExited { .. }),
+            "shell is dead, so outcome must be ShellExited; got: {:?}", result.outcome
         );
     }
 
-    #[ignore = "BUG: no session recovery after shell death — design doc says harness should respawn"]
     #[tokio::test]
     async fn exec_replaces_shell_subsequent_call_recovers_with_new_session() {
         // After `exec` kills the shell, the PTY slave side is closed.
         //
-        // Correct behavior (design doc, Recovery): "If the shell dies, the
-        // harness can start a new one." The next call() should transparently
-        // respawn a new bash session and execute the command.
-        //
-        // Current behavior: the session is permanently dead. Every subsequent
-        // call fails with PtyWrite(EIO) forever.
-        let tool = TypeTool::spawn().await.unwrap();
+        // Correct behavior: When the shell dies, call() detects EOF and
+        // respawns a new bash session transparently. The first call returns
+        // ShellExited, and the second call should work normally.
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
 
         // Kill the shell.
-        let _ = tool
+        let first_result = tool
             .call(TypeArgs {
                 keys: "exec /bin/echo 'Hello Mom!'\n".into(),
                 interactive: false,
                 timeout: Some(2.0),
             })
-            .await;
+            .await
+            .expect("call must return Ok with ShellExited on exec");
 
-        // Next call should work — the harness should have respawned the shell.
+        // First call should result in ShellExited.
+        assert!(
+            matches!(first_result.outcome, Outcome::ShellExited { .. }),
+            "exec must kill the shell, resulting in ShellExited; got: {:?}", first_result.outcome
+        );
+
+        // Next call should work — the shell has been respawned.
         let result = tool
             .call(TypeArgs {
                 keys: "echo 'still alive!'\n".into(),
@@ -1599,14 +1634,14 @@ mod tests {
                 timeout: Some(5.0),
             })
             .await
-            .expect("call on a dead session must respawn the shell, not return EIO");
+            .expect("call on a respawned session must work normally");
 
         assert!(
             result.output.contains("still alive!"),
             "respawned shell must execute the command; got: {:?}",
             result.output
         );
-        assert_eq!(result.exit_code, Some(0));
+        assert!(matches!(result.outcome, Outcome::Completed { exit_code: 0, .. }));
     }
 
     #[tokio::test]
@@ -1614,7 +1649,8 @@ mod tests {
         // The watcher must not panic or fire callbacks when no jobs are tracked.
         let fired = Arc::new(Mutex::new(false));
         let fc = Arc::clone(&fired);
-        let tool = TypeTool::spawn().await.unwrap().with_job_callback(move |_| {
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = tool.with_job_callback(move |_| {
             *fc.lock().unwrap() = true;
         });
 

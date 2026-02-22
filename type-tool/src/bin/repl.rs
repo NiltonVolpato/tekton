@@ -1,11 +1,12 @@
 use std::io::{self, BufRead, Write};
 
 use rig::tool::Tool;
-use tekton_type_tool::{TypeArgs, TypeTool};
+use tekton_type_tool::{Outcome, TypeArgs, TypeTool};
 
 #[tokio::main]
 async fn main() {
-    let tool = TypeTool::spawn().await.expect("failed to spawn PTY session");
+    let (tool, cwd) = TypeTool::spawn().await.expect("failed to spawn PTY session");
+    eprintln!("[cwd: {cwd}]");
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -38,15 +39,23 @@ async fn main() {
                 if !out.output.is_empty() {
                     print!("{}", out.output);
                 }
-                if let Some(msg) = &out.timeout_message {
-                    eprintln!("[timeout: {msg}]");
-                }
-                if let Some(cwd) = &out.working_directory {
-                    eprintln!("[cwd: {cwd}]");
-                }
-                if let Some(code) = out.exit_code {
-                    if code != 0 {
-                        eprintln!("[exit: {code}]");
+                match &out.outcome {
+                    Outcome::Completed { exit_code, working_directory } => {
+                        eprintln!("[cwd: {working_directory}]");
+                        if *exit_code != 0 {
+                            eprintln!("[exit: {exit_code}]");
+                        }
+                    }
+                    Outcome::Killed { working_directory, timeout_secs } => {
+                        eprintln!("[timeout: Command timed out after {timeout_secs:.1}s and was terminated.]");
+                        eprintln!("[cwd: {working_directory}]");
+                    }
+                    Outcome::Waiting => {
+                        eprintln!("[waiting]");
+                    }
+                    Outcome::ShellExited { working_directory } => {
+                        eprintln!("[shell exited, respawned]");
+                        eprintln!("[cwd: {working_directory}]");
                     }
                 }
             }
