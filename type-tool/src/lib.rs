@@ -73,6 +73,10 @@ const DEFAULT_TIMEOUT_SECS: f64 = 300.0;
 /// Interactive timeout in seconds: how long to wait before returning partial output to the model.
 const DEFAULT_INTERACTIVE_TIMEOUT_SECS: f64 = 5.0;
 
+/// Exit code used when `drain_after_kill` fails to extract the real exit code
+/// from the post-kill sentinel. Must not be 0 (which would look like success).
+const DRAIN_FAILURE_EXIT_CODE: i32 = -1;
+
 /// Maximum allowed timeout in seconds (~24 hours).
 ///
 /// Values above this are rejected with [`TypeError::InvalidTimeout`].
@@ -565,48 +569,45 @@ impl Tool for TypeTool {
             let mut guard = guard;
             let pty = guard.as_mut().ok_or(TypeError::SessionNotInitialized)?;
             let shell_pid = pty.shell_pid;
-            let s = &mut pty.session;
 
             // 1. Send keystrokes to the PTY.
             use expectrl::Expect;
-            s.send(keys.as_bytes())
+            pty.session.send(keys.as_bytes())
                 .map_err(|e| TypeError::PtyWrite(e.to_string()))?;
 
             // 2. Wait for the prompt sentinel.
-            match session::wait_for_sentinel(s, timeout) {
+            match session::wait_for_sentinel(&mut pty.session, timeout) {
                 Ok(captures) => {
                     let output = captures.before().to_vec();
                     let (exit_code, cwd) = session::parse_sentinel(&captures);
-                    let active_pids = session::run_jobs_p_sync(s);
+                    let active_pids = session::run_jobs_p_sync(&mut pty.session);
+                    pty.working_directory = cwd.clone();
                     let outcome = Outcome::Completed {
                         exit_code,
                         working_directory: cwd,
                     };
-                    Ok((output, outcome, Some(active_pids)))
+                    Ok((output, outcome, active_pids))
                 }
 
                 Err(expectrl::Error::ExpectTimeout) if !interactive => {
                     // Drain partial output buffered by expect() before the timeout.
-                    use std::io::BufRead;
-                    let output = s.fill_buf()
-                        .map(|b| b.to_vec())
-                        .unwrap_or_default();
-                    s.consume(output.len());
+                    let output = session::drain_buf(&mut pty.session)?;
 
                     // Kill the foreground process (SIGTERM → SIGKILL).
                     session::kill_foreground(shell_pid, &background_pids);
 
                     // Drain PTY to restore a clean prompt; extract post-kill exit code and $PWD.
-                    let (exit_code, cwd) = session::drain_after_kill(s)
-                        .unwrap_or_default();
+                    let (exit_code, cwd) = session::drain_after_kill(&mut pty.session)
+                        .unwrap_or_else(|| (DRAIN_FAILURE_EXIT_CODE, pty.working_directory.clone()));
 
-                    let active_pids = session::run_jobs_p_sync(s);
+                    let active_pids = session::run_jobs_p_sync(&mut pty.session);
+                    pty.working_directory = cwd.clone();
                     let outcome = Outcome::Killed {
                         exit_code,
                         working_directory: cwd,
                         timeout_secs,
                     };
-                    Ok((output, outcome, Some(active_pids)))
+                    Ok((output, outcome, active_pids))
                 }
 
                 Err(expectrl::Error::ExpectTimeout) => {
@@ -614,25 +615,14 @@ impl Tool for TypeTool {
                     // active_pids is None to suppress the post-call sync — we have no
                     // fresh jobs-p snapshot and syncing with an empty set would fire
                     // spurious completion callbacks for all tracked background jobs.
-                    //
-                    // expect() already read data into its internal buffer before
-                    // timing out. Drain it via BufRead::fill_buf + consume.
-                    use std::io::BufRead;
-                    let output = s.fill_buf()
-                        .map(|b| b.to_vec())
-                        .unwrap_or_default();
-                    s.consume(output.len());
+                    let output = session::drain_buf(&mut pty.session)?;
                     Ok((output, Outcome::Waiting, None))
                 }
 
                 Err(expectrl::Error::Eof) => {
                     // Shell process exited (exec, exit, crash, etc.).
                     // Drain any buffered output before EOF.
-                    use std::io::BufRead;
-                    let output = s.fill_buf()
-                        .map(|b| b.to_vec())
-                        .unwrap_or_default();
-                    s.consume(output.len());
+                    let output = session::drain_buf(&mut pty.session)?;
 
                     // Respawn a fresh session so the next call() works.
                     let new_pty = session::PtySession::spawn_blocking_inner()?;
@@ -1886,33 +1876,21 @@ mod tests {
     // ── Bug exposure: silently swallowed errors ─────────────────────────
 
     #[test]
-    #[ignore = "BUG: drain_after_kill failure produces exit_code=0 via unwrap_or_default()"]
-    fn drain_after_kill_failure_must_not_report_exit_code_zero() {
+    fn drain_failure_exit_code_is_not_zero() {
         // When drain_after_kill returns None (drain timed out after kill),
-        // the current code does .unwrap_or_default() → (0, "").
-        // exit_code=0 is indistinguishable from a genuinely successful command,
-        // hiding the fact that a kill+drain sequence failed.
-        //
-        // The fix: use (-1, last_known_cwd) instead of (0, "").
-        let default: (i32, String) = Default::default();
+        // the fallback exit code must indicate failure, not success.
+        // DRAIN_FAILURE_EXIT_CODE = -1, distinguishable from a genuine exit 0.
         assert_ne!(
-            default.0, 0,
-            "Default exit_code must not be 0 (success); \
-             drain_after_kill failure must be distinguishable from success. \
-             Currently (i32, String)::default() = (0, \"\") which hides the failure."
+            DRAIN_FAILURE_EXIT_CODE, 0,
+            "drain failure exit code must not be 0 (success); \
+             drain_after_kill failure must be distinguishable from success"
         );
     }
 
     #[test]
-    #[ignore = "BUG: run_jobs_p_sync returns empty set on error, causing spurious completion callbacks"]
-    fn sync_with_empty_set_fires_spurious_completions_for_all_tracked_jobs() {
-        // When run_jobs_p_sync encounters ANY error (send_line fails, sentinel
-        // timeout, etc.), it returns HashSet::new(). The caller passes this to
-        // sync(&empty_set), which interprets every tracked PID as "completed"
-        // and fires the callback for ALL of them — even still-running jobs.
-        //
-        // This test demonstrates the data corruption: 3 tracked jobs, sync
-        // against empty set → 3 spurious completion notifications.
+    fn run_jobs_p_sync_error_does_not_cause_spurious_completions() {
+        // When run_jobs_p_sync returns None (error), call() skips the sync.
+        // This test verifies the gating pattern: only Some(pids) triggers sync.
         let completed = Arc::new(Mutex::new(Vec::new()));
         let cc = Arc::clone(&completed);
         let mut manager = JobManager::new().with_callback(move |n| {
@@ -1922,21 +1900,20 @@ mod tests {
         // Three background jobs are running.
         manager.sync(&HashSet::from([100, 200, 300]));
 
-        // Simulate run_jobs_p_sync failing and returning empty set.
-        // This is what happens when the PTY is in a bad state after a kill.
-        let error_fallback: HashSet<u32> = HashSet::new();
-        manager.sync(&error_fallback);
+        // Simulate run_jobs_p_sync returning None (error) — sync is skipped.
+        let active_pids: Option<HashSet<u32>> = None;
+        if let Some(pids) = active_pids {
+            manager.sync(&pids);
+        }
 
         let fired = completed.lock().unwrap().clone();
-        // BUG: all three jobs get spurious completion notifications.
-        // The fix: run_jobs_p_sync should return Option<HashSet<u32>>,
-        // and call() should skip the sync when it returns None.
         assert!(
             fired.is_empty(),
-            "sync against an error-fallback empty set must NOT fire completion \
-             callbacks for still-running jobs; got spurious completions for: {:?}",
+            "when run_jobs_p_sync returns None, sync must be skipped; \
+             got spurious completions for: {:?}",
             fired
         );
+        assert_eq!(manager.jobs.len(), 3, "all jobs must remain tracked");
     }
 
     #[tokio::test]

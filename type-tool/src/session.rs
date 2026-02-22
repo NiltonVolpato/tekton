@@ -148,25 +148,18 @@ pub(crate) fn parse_sentinel(captures: &expectrl::Captures) -> (i32, String) {
 ///
 /// First runs `true` to force a full prompt cycle so bash reaps any
 /// recently-completed background jobs before we query the job table.
-/// Returns an empty set on any error or timeout.
-pub(crate) fn run_jobs_p_sync(session: &mut OsSession) -> HashSet<u32> {
+/// Returns `None` on any error or timeout — the caller must skip the
+/// `sync()` call to avoid spurious completion callbacks.
+pub(crate) fn run_jobs_p_sync(session: &mut OsSession) -> Option<HashSet<u32>> {
     // Force bash to reap completed background jobs. With `set +m` (monitor
     // mode off), bash only reaps during a full prompt cycle — PROMPT_COMMAND
     // + PS1. Running `true` triggers that cycle.
-    if session.send_line("true").is_err() {
-        return HashSet::new();
-    }
-    if wait_for_sentinel(session, Duration::from_secs(5)).is_err() {
-        return HashSet::new();
-    }
+    session.send_line("true").ok()?;
+    wait_for_sentinel(session, Duration::from_secs(5)).ok()?;
 
-    if session.send_line("jobs -p").is_err() {
-        return HashSet::new();
-    }
-    match wait_for_sentinel(session, Duration::from_secs(5)) {
-        Ok(captures) => parse_jobs_p(&String::from_utf8_lossy(captures.before())),
-        Err(_) => HashSet::new(),
-    }
+    session.send_line("jobs -p").ok()?;
+    let captures = wait_for_sentinel(session, Duration::from_secs(5)).ok()?;
+    Some(parse_jobs_p(&String::from_utf8_lossy(captures.before())))
 }
 
 /// Send SIGTERM then SIGKILL to foreground children of `shell_pid`,
@@ -219,6 +212,19 @@ pub(crate) fn drain_after_kill(session: &mut OsSession) -> Option<(i32, String)>
     wait_for_sentinel(session, DRAIN_TIMEOUT)
         .ok()
         .map(|c| parse_sentinel(&c))
+}
+
+/// Drain the internal buffer of an expectrl session.
+///
+/// After `expect()` times out or hits EOF, data it read is sitting in the
+/// session's internal buffer. This helper extracts it via `BufRead`.
+pub(crate) fn drain_buf(session: &mut OsSession) -> Result<Vec<u8>, crate::TypeError> {
+    use std::io::BufRead;
+    let buf = session.fill_buf()
+        .map_err(|e| crate::TypeError::PtyRead(e.to_string()))?;
+    let output = buf.to_vec();
+    session.consume(output.len());
+    Ok(output)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -515,6 +521,7 @@ mod tests {
         })
         .await
         .unwrap();
+        let pids = pids.expect("run_jobs_p_sync must succeed on a healthy session");
         assert!(pids.is_empty(), "freshly spawned shell must report no background jobs");
     }
 
@@ -532,6 +539,7 @@ mod tests {
         })
         .await
         .unwrap();
+        let pids = pids.expect("run_jobs_p_sync must succeed");
         assert_eq!(pids.len(), 1, "exactly one background job must be tracked");
     }
 
@@ -545,6 +553,9 @@ mod tests {
         // `jobs -p` is NOT sufficient: bash has received SIGCHLD but hasn't
         // cleaned up the job table yet.  We must force a prompt cycle first by
         // sending a no-op command (`true`) and waiting for its sentinel.
+        //
+        // Note: run_jobs_p_sync itself now runs `true` first, plus the explicit
+        // one below — two reap cycles, ensuring robustness.
         let pty = PtySession::spawn().await.unwrap();
         let pids = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
@@ -560,6 +571,7 @@ mod tests {
         })
         .await
         .unwrap();
+        let pids = pids.expect("run_jobs_p_sync must succeed");
         assert!(pids.is_empty(), "completed background job must not appear in jobs -p");
     }
 
@@ -607,7 +619,8 @@ mod tests {
             // Start a background job and record its PID.
             pty.session.send_line("sleep 9999 &").unwrap();
             wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
-            let bg_pids = run_jobs_p_sync(&mut pty.session);
+            let bg_pids = run_jobs_p_sync(&mut pty.session)
+                .expect("run_jobs_p_sync must succeed");
             assert_eq!(bg_pids.len(), 1, "expected exactly one background job");
             let bg_pid = *bg_pids.iter().next().unwrap();
 
@@ -621,7 +634,8 @@ mod tests {
             wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
 
             // The background job must still be running.
-            let remaining = run_jobs_p_sync(&mut pty.session);
+            let remaining = run_jobs_p_sync(&mut pty.session)
+                .expect("run_jobs_p_sync must succeed");
             remaining.contains(&bg_pid)
         })
         .await
