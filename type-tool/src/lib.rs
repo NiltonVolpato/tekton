@@ -1883,6 +1883,106 @@ mod tests {
         assert!(matches!(result.outcome, Outcome::Completed { exit_code: 0, .. }));
     }
 
+    // ── Bug exposure: silently swallowed errors ─────────────────────────
+
+    #[test]
+    #[ignore = "BUG: drain_after_kill failure produces exit_code=0 via unwrap_or_default()"]
+    fn drain_after_kill_failure_must_not_report_exit_code_zero() {
+        // When drain_after_kill returns None (drain timed out after kill),
+        // the current code does .unwrap_or_default() → (0, "").
+        // exit_code=0 is indistinguishable from a genuinely successful command,
+        // hiding the fact that a kill+drain sequence failed.
+        //
+        // The fix: use (-1, last_known_cwd) instead of (0, "").
+        let default: (i32, String) = Default::default();
+        assert_ne!(
+            default.0, 0,
+            "Default exit_code must not be 0 (success); \
+             drain_after_kill failure must be distinguishable from success. \
+             Currently (i32, String)::default() = (0, \"\") which hides the failure."
+        );
+    }
+
+    #[test]
+    #[ignore = "BUG: run_jobs_p_sync returns empty set on error, causing spurious completion callbacks"]
+    fn sync_with_empty_set_fires_spurious_completions_for_all_tracked_jobs() {
+        // When run_jobs_p_sync encounters ANY error (send_line fails, sentinel
+        // timeout, etc.), it returns HashSet::new(). The caller passes this to
+        // sync(&empty_set), which interprets every tracked PID as "completed"
+        // and fires the callback for ALL of them — even still-running jobs.
+        //
+        // This test demonstrates the data corruption: 3 tracked jobs, sync
+        // against empty set → 3 spurious completion notifications.
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let cc = Arc::clone(&completed);
+        let mut manager = JobManager::new().with_callback(move |n| {
+            cc.lock().unwrap().push(n.pid);
+        });
+
+        // Three background jobs are running.
+        manager.sync(&HashSet::from([100, 200, 300]));
+
+        // Simulate run_jobs_p_sync failing and returning empty set.
+        // This is what happens when the PTY is in a bad state after a kill.
+        let error_fallback: HashSet<u32> = HashSet::new();
+        manager.sync(&error_fallback);
+
+        let fired = completed.lock().unwrap().clone();
+        // BUG: all three jobs get spurious completion notifications.
+        // The fix: run_jobs_p_sync should return Option<HashSet<u32>>,
+        // and call() should skip the sync when it returns None.
+        assert!(
+            fired.is_empty(),
+            "sync against an error-fallback empty set must NOT fire completion \
+             callbacks for still-running jobs; got spurious completions for: {:?}",
+            fired
+        );
+    }
+
+    #[tokio::test]
+    async fn killed_outcome_working_directory_must_not_be_empty_after_drain_failure() {
+        // When drain_after_kill times out, unwrap_or_default() produces
+        // working_directory: "". The model loses all navigation context.
+        // This is a real scenario: if the killed process left the PTY in a
+        // dirty state, the drain sentinel might never arrive.
+        //
+        // This test checks the contract: Killed outcome must always have
+        // a non-empty working_directory (fall back to last-known cwd).
+        let (tool, initial_cwd) = TypeTool::spawn().await.unwrap();
+
+        // Navigate somewhere specific so we have a known cwd.
+        tool.call(TypeArgs {
+            keys: "cd /tmp\n".into(),
+            interactive: false,
+            timeout: None,
+        })
+        .await
+        .unwrap();
+
+        // Trigger a non-interactive timeout + kill.
+        let result = tool
+            .call(TypeArgs {
+                keys: "sleep 9999\n".into(),
+                interactive: false,
+                timeout: Some(0.1),
+            })
+            .await
+            .unwrap();
+
+        match &result.outcome {
+            Outcome::Killed { working_directory, .. } => {
+                assert!(
+                    !working_directory.is_empty(),
+                    "Killed outcome must report a non-empty working_directory; \
+                     if drain_after_kill fails, fall back to the last-known cwd. \
+                     initial_cwd was: {:?}",
+                    initial_cwd
+                );
+            }
+            other => panic!("expected Outcome::Killed; got: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn watcher_no_op_when_no_jobs() {
         // The watcher must not panic or fire callbacks when no jobs are tracked.
