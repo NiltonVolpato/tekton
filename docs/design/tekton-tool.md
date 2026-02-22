@@ -181,8 +181,8 @@ type(keys="analyze dataset.csv\n", interactive=true, timeout=30)
 The bash session is initialized with the following configuration:
 
 ```bash
-# Sentinel for command completion — emits OSC with exit code
-PROMPT_COMMAND='printf "\e]999;%d\a" $?'
+# Sentinel for command completion — emits OSC with exit code and $PWD
+PROMPT_COMMAND='printf "\e]999;%d;%s\a" $? "$PWD"'
 
 # Disable job control messages ([1] Done, [1]+ Stopped, etc.)
 set +m
@@ -202,9 +202,9 @@ __tekton_sigchld_handler() {
 
 **Key configuration choices:**
 
-- **`PROMPT_COMMAND` with OSC sentinel**: The harness detects `\e]999;EXIT_CODE\a` to know when a command has completed and what its exit code was. OSC escapes are invisible to normal terminal rendering and won't appear in command output, making them unambiguous.
+- **`PROMPT_COMMAND` with OSC sentinel**: The harness detects `\e]999;EXIT_CODE;$PWD\a` to know when a command has completed, what its exit code was, and the current working directory. OSC escapes are invisible to normal terminal rendering and won't appear in command output, making them unambiguous.
 - **`set +m`**: Disables monitor mode, suppressing bash's default `[1]+ Done  command` messages. These messages would appear asynchronously in the PTY output, interleaved with other content, and cannot be reliably filtered by text matching (the same string could appear in any program's output, e.g., a man page discussing job control). Background jobs, `jobs`, and `&` still work. SIGCHLD is still delivered. The tradeoff is losing `fg`/`bg`, but processes can be managed by PID (`kill`, `wait $pid`, `kill -STOP`, `kill -CONT`).
-- **Named pipe for job notifications**: A separate channel from the PTY output stream. The SIGCHLD trap writes a single signal byte here — no structured data. It is not reliably possible to determine from inside the trap which job completed (the state may already be reaped by the time the handler runs). Instead, the harness uses the byte as a prompt to run `jobs -p` and diff the result against its tracked job state (`JobManager`). The harness has a dedicated reader task for this pipe.
+- **Named pipe for job notifications** *(v1: replaced by sysinfo polling)*: The original design used a SIGCHLD trap writing to a named pipe. In practice, with `set +m` bash only processes background job state changes during a prompt cycle — SIGCHLD is delivered but bash won't asynchronously notify until it next displays PS1 and runs PROMPT_COMMAND. This means the named pipe would only receive a signal byte at prompt time, not immediately on job completion, eliminating its latency advantage over polling. The v1 implementation uses `sysinfo` polling on a 1-second interval instead: a watcher task periodically checks whether tracked PIDs are still alive. PIDs are discovered via `jobs -p` after each `call()` and tracked by the `JobManager`.
 
 **What the model sees as its prompt:**
 
@@ -236,7 +236,7 @@ The named pipe reader task runs concurrently with `call`. When it receives a sig
 
 **Timeout enforcement (without killing the shell):**
 
-When a non-interactive timeout is reached, the harness identifies the foreground process by iterating child processes of the shell PID, filtering out known background jobs, and sends SIGKILL (or SIGINT first, then SIGKILL) to that process or its process group. The shell itself survives because it's not in the foreground process group — standard job control behavior even with `set +m`.
+When a non-interactive timeout is reached, the harness identifies the foreground process by iterating child processes of the shell PID, filtering out known background jobs, and sends SIGTERM first, then SIGKILL to that process or its process group. SIGTERM (not SIGINT) is used because the harness is enforcing a policy decision, not simulating a keypress — the model can always type `\x03` (Ctrl-C) to send SIGINT explicitly. The shell itself survives because it's not in the foreground process group — standard job control behavior even with `set +m`.
 
 **Echo is disabled.** The harness controls the PTY's termios settings and disables echo. The model doesn't need to see its own keystrokes repeated back — it knows what it typed. The output stream contains only command output and the PROMPT_COMMAND sentinel.
 

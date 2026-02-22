@@ -69,6 +69,13 @@ impl PtySession {
         // the trap handler would deadlock the shell the first time any external
         // command exits.  The SIGCHLD mechanism will be wired back once the
         // harness implementation exists.
+        // TODO: PS1 uses \u (system username) but the design doc says the LLM's
+        // name should appear (e.g. "claude@alpha" not "nilton@alpha"). The name
+        // needs to be configurable and injected into the init script.
+        //
+        // TODO: Bracketed paste mode (\e[?2004h / \e[?2004l) leaks into the
+        // output stream. Disable it in the init script:
+        //   bind 'set enable-bracketed-paste off' 2>/dev/null
         let init_content = concat!(
             "PROMPT_COMMAND='printf \"\\033]999;%d;%s\\007\" $? \"$PWD\"'\n",
             "set +m\n",

@@ -73,6 +73,13 @@ const DEFAULT_TIMEOUT_SECS: f64 = 300.0;
 /// Interactive timeout in seconds: how long to wait before returning partial output to the model.
 const DEFAULT_INTERACTIVE_TIMEOUT_SECS: f64 = 5.0;
 
+/// Maximum allowed timeout in seconds (~24 hours).
+///
+/// Values above this are rejected with [`TypeError::InvalidTimeout`].
+/// This prevents panics in [`Duration::from_secs_f64`] for very large finite
+/// values (e.g., `f64::MAX` ≈ 1.8e308 overflows `Duration`'s internal `u64`).
+const MAX_TIMEOUT_SECS: f64 = 86_400.0;
+
 // ── Arguments & output ──────────────────────────────────────────────────────
 
 /// Arguments for the `type` tool.
@@ -488,7 +495,9 @@ impl Tool for TypeTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let raw_timeout = args.resolved_timeout();
-        if raw_timeout.is_nan() || raw_timeout.is_infinite() || raw_timeout < 0.0 {
+        if raw_timeout.is_nan() || raw_timeout.is_infinite() || raw_timeout < 0.0
+            || raw_timeout > MAX_TIMEOUT_SECS
+        {
             return Err(TypeError::InvalidTimeout(raw_timeout));
         }
         let timeout = Duration::from_secs_f64(raw_timeout);
@@ -1352,6 +1361,45 @@ mod tests {
         );
     }
 
+    #[ignore = "BUG: Outcome::Killed discards post-kill exit code from drain_after_kill"]
+    #[tokio::test]
+    async fn non_interactive_timeout_killed_outcome_includes_exit_code() {
+        // After kill_foreground sends SIGTERM/SIGKILL, bash regains control and
+        // emits a sentinel whose exit code reflects the killed process (typically
+        // 143 for SIGTERM or 137 for SIGKILL). drain_after_kill reads that
+        // sentinel but currently discards the exit code, returning only the cwd.
+        //
+        // Correct behavior: Outcome::Killed should include the post-kill exit
+        // code so the model can distinguish "timed out and killed" from other
+        // failure modes. The exit code is already available in the sentinel —
+        // drain_after_kill just needs to return it, and Outcome::Killed needs
+        // an exit_code field.
+        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let result = tool
+            .call(TypeArgs {
+                keys: "sleep 9999\n".into(),
+                interactive: false,
+                timeout: Some(0.1),
+            })
+            .await
+            .unwrap();
+        match result.outcome {
+            // TODO: Change to `Outcome::Killed { exit_code, .. }` once the field exists.
+            Outcome::Killed { .. } => {
+                // SIGTERM = 143, SIGKILL = 137. Either is acceptable.
+                // assert!(
+                //     exit_code == 143 || exit_code == 137,
+                //     "killed process exit code must be 143 (SIGTERM) or 137 (SIGKILL); got: {exit_code}"
+                // );
+                panic!(
+                    "Outcome::Killed does not yet have an exit_code field. \
+                     Add it, then uncomment the assertion above."
+                );
+            }
+            other => panic!("expected Outcome::Killed; got: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn interactive_timeout_returns_partial_output_without_killing_process() {
         // Interactive timeout: return partial output so the model can decide
@@ -1446,6 +1494,55 @@ mod tests {
             })
             .await;
         assert!(matches!(result, Err(TypeError::InvalidTimeout(t)) if t.is_infinite()));
+    }
+
+    #[tokio::test]
+    async fn call_with_huge_finite_timeout_returns_error_instead_of_panicking() {
+        // f64::MAX is finite but overflows Duration::from_secs_f64, which panics.
+        // The validation must reject values above MAX_TIMEOUT_SECS.
+        let tool = TypeTool::new();
+        let result = tool
+            .call(TypeArgs {
+                keys: "echo hi\n".into(),
+                interactive: false,
+                timeout: Some(f64::MAX),
+            })
+            .await;
+        assert!(
+            matches!(result, Err(TypeError::InvalidTimeout(_))),
+            "f64::MAX must be rejected as InvalidTimeout, not panic; got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_with_timeout_just_above_max_returns_error() {
+        let tool = TypeTool::new();
+        let result = tool
+            .call(TypeArgs {
+                keys: "echo hi\n".into(),
+                interactive: false,
+                timeout: Some(MAX_TIMEOUT_SECS + 1.0),
+            })
+            .await;
+        assert!(matches!(result, Err(TypeError::InvalidTimeout(_))));
+    }
+
+    #[tokio::test]
+    async fn call_with_timeout_at_max_is_accepted() {
+        // Exactly MAX_TIMEOUT_SECS must be valid.
+        let tool = TypeTool::new();
+        let result = tool
+            .call(TypeArgs {
+                keys: "echo hi\n".into(),
+                interactive: false,
+                timeout: Some(MAX_TIMEOUT_SECS),
+            })
+            .await;
+        // Should fail with SessionNotInitialized (timeout is valid, no session).
+        assert!(
+            matches!(result, Err(TypeError::SessionNotInitialized)),
+            "MAX_TIMEOUT_SECS must be accepted; got: {result:?}"
+        );
     }
 
     #[tokio::test]
