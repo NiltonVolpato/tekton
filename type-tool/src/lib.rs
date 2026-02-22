@@ -36,7 +36,7 @@
 //!     let anthropic = anthropic::Client::from_env();
 //!     let model = anthropic.completion_model(CLAUDE_4_SONNET);
 //!
-//!     let tool = TypeTool::new().with_job_callback(|notif| {
+//!     let tool = TypeTool::spawn().await.unwrap().with_job_callback(|notif| {
 //!         // Queue a proactive message to the agent, wake it up if idle, etc.
 //!         eprintln!("job {} done (exit {:?})", notif.pid, notif.exit_code);
 //!     });
@@ -71,11 +71,14 @@
 //! }
 //! ```
 
+mod session;
+
 use std::collections::HashSet;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Duration;
 
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
@@ -135,6 +138,13 @@ pub struct TypeOutput {
 
     /// If the call timed out, a human-readable explanation.
     pub timeout_message: Option<String>,
+
+    /// Working directory reported by the OSC sentinel (`$PWD`).
+    ///
+    /// - **Happy path**: `Some(dir)` from the command's sentinel.
+    /// - **Non-interactive timeout**: `Some(dir)` from the post-kill drain sentinel.
+    /// - **Interactive timeout**: `None` — process still running, directory unknown.
+    pub working_directory: Option<String>,
 }
 
 // ── Job tracking ─────────────────────────────────────────────────────────────
@@ -170,7 +180,7 @@ pub struct JobNotification {
 /// foreground command completes (via [`TypeTool::call`]) and from the harness
 /// task when the signal arrives while the tool is idle.
 pub struct JobManager {
-    jobs: HashMap<u32, Job>,
+    pub(crate) jobs: HashMap<u32, Job>,
     on_complete: Option<Box<dyn Fn(JobNotification) + Send + Sync>>,
 }
 
@@ -267,6 +277,9 @@ pub enum TypeError {
 
     #[error("Session not initialized")]
     SessionNotInitialized,
+
+    #[error("PTY spawn failed: {0}")]
+    PtySpawn(String),
 }
 
 /// The Tekton `type` tool.
@@ -279,8 +292,10 @@ pub enum TypeError {
 /// [`JobManager`]. The harness task does the same when the named pipe signals
 /// while the tool is idle (see [`TypeTool::is_running`]).
 pub struct TypeTool {
-    // TODO: hold the PTY session handle (e.g., Arc<Mutex<PtySession>>).
-    // Shared with the harness task so it can run `jobs -p` on the idle path.
+    /// The persistent PTY session. `None` when constructed via [`TypeTool::new`].
+    session: Arc<tokio::sync::Mutex<Option<session::PtySession>>>,
+
+    /// Shared with the harness task so it can run `jobs -p` on the idle path.
     job_manager: Arc<Mutex<JobManager>>,
 
     /// `true` while a foreground command is executing inside `call`.
@@ -292,15 +307,32 @@ pub struct TypeTool {
 }
 
 impl TypeTool {
-    /// Create a new `TypeTool` with an empty [`JobManager`] and no callback.
+    /// Create a new `TypeTool` with no session, an empty [`JobManager`], and no callback.
+    ///
+    /// Calling `call()` on a tool created this way returns
+    /// [`TypeError::SessionNotInitialized`]. Use [`TypeTool::spawn`] to get a
+    /// fully initialized tool with an active PTY session.
     pub fn new() -> Self {
         Self {
+            session: Arc::new(tokio::sync::Mutex::new(None)),
             job_manager: Arc::new(Mutex::new(JobManager::new())),
             is_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    /// Spawn a bash PTY session and return a fully initialized `TypeTool`.
+    pub async fn spawn() -> Result<Self, TypeError> {
+        let session = session::PtySession::spawn().await?;
+        Ok(Self {
+            session: Arc::new(tokio::sync::Mutex::new(Some(session))),
+            job_manager: Arc::new(Mutex::new(JobManager::new())),
+            is_running: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     /// Register a callback invoked whenever a background job completes.
+    ///
+    /// Must be called **before** [`TypeTool::job_manager`] is cloned.
     ///
     /// Delegates to [`JobManager::with_callback`].
     pub fn with_job_callback(
@@ -313,6 +345,7 @@ impl TypeTool {
             .unwrap_or_else(|_| panic!("job_manager Mutex should not be poisoned at construction time"))
             .with_callback(callback);
         Self {
+            session: self.session,
             job_manager: Arc::new(Mutex::new(manager)),
             is_running: self.is_running,
         }
@@ -381,23 +414,85 @@ impl Tool for TypeTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         self.is_running.store(true, Ordering::SeqCst);
 
-        // TODO: implement actual PTY interaction:
-        //   1. Write `args.keys` to the PTY stdin (interpreting escape sequences).
-        //   2. Read PTY output, buffering bytes.
-        //   3. Wait for either:
-        //      a. OSC sentinel `\e]999;EXIT_CODE\a` → command finished.
-        //      b. Timeout with interactive=false → SIGKILL foreground process group.
-        //      c. Timeout with interactive=true → return partial output.
+        let timeout = Duration::from_secs_f64(args.resolved_timeout());
+        let keys = args.keys.clone();
+        let interactive = args.interactive;
+        let background_pids: HashSet<u32> = self
+            .job_manager
+            .lock()
+            .unwrap()
+            .jobs
+            .keys()
+            .copied()
+            .collect();
+
+        // Acquire session as an OwnedMutexGuard so it can be sent to spawn_blocking.
+        let guard = Arc::clone(&self.session).lock_owned().await;
+
+        // Fast-path: no session — return the error without spawning a thread.
+        if guard.is_none() {
+            self.is_running.store(false, Ordering::SeqCst);
+            return Err(TypeError::SessionNotInitialized);
+        }
+
+        // Run the blocking PTY I/O in a dedicated thread-pool thread.
+        let (output_bytes, exit_code, timeout_message, working_directory, active_pids) =
+            tokio::task::spawn_blocking(move || -> Result<_, TypeError> {
+                let mut guard = guard;
+                let pty = guard.as_mut().ok_or(TypeError::SessionNotInitialized)?;
+                let shell_pid = pty.shell_pid;
+                let s = &mut pty.session;
+
+                // 1. Send keystrokes to the PTY.
+                use expectrl::Expect;
+                s.send(keys.as_bytes())
+                    .map_err(|e| TypeError::PtyWrite(e.to_string()))?;
+
+                // 2. Wait for the prompt sentinel using a polled loop to avoid
+                //    busy-waiting under concurrent load (see session::poll_for_sentinel).
+                match session::poll_for_sentinel(s, timeout) {
+                    Ok(captures) => {
+                        let output = captures.before().to_vec();
+                        let (exit_code, cwd) = session::parse_sentinel(&captures);
+                        let active_pids = session::run_jobs_p_sync(s);
+                        Ok((output, Some(exit_code), None, Some(cwd), active_pids))
+                    }
+
+                    Err(expectrl::Error::ExpectTimeout) if !interactive => {
+                        // Kill the foreground process (SIGTERM → SIGKILL).
+                        session::kill_foreground(shell_pid, &background_pids);
+
+                        // Drain PTY to restore a clean prompt; extract post-kill $PWD.
+                        let cwd = session::drain_after_kill(s);
+
+                        let active_pids = session::run_jobs_p_sync(s);
+                        let msg = format!(
+                            "Command timed out after {:.1}s and was terminated.",
+                            timeout.as_secs_f64()
+                        );
+                        Ok((vec![], None, Some(msg), cwd, active_pids))
+                    }
+
+                    Err(expectrl::Error::ExpectTimeout) => {
+                        // Interactive timeout: return empty output; process still alive.
+                        Ok((vec![], None, None, None, HashSet::new()))
+                    }
+
+                    Err(e) => Err(TypeError::PtyRead(e.to_string())),
+                }
+            })
+            .await
+            .map_err(|e| TypeError::PtyRead(e.to_string()))??;
 
         self.is_running.store(false, Ordering::SeqCst);
-
-        // Sync the job manager with whatever background jobs are now running.
-        // TODO: run `jobs -p` on the PTY and parse the output.
-        let active_pids = HashSet::new(); // stub
         self.job_manager.lock().unwrap().sync(&active_pids);
 
-        let _timeout = args.resolved_timeout();
-        Err(TypeError::SessionNotInitialized)
+        Ok(TypeOutput {
+            output: String::from_utf8_lossy(&output_bytes).into_owned(),
+            exit_code,
+            timeout_message,
+            working_directory,
+        })
     }
 }
 
@@ -859,17 +954,12 @@ mod tests {
     }
 
     // ── PTY integration: state-persistence tests ───────────────────────────
-    //
-    // These tests define the behavioral contract for the persistent shell
-    // session described in the design doc. They are marked `#[ignore]` because
-    // the PTY is not yet implemented; making them pass is the implementation goal.
 
     #[tokio::test]
-    #[ignore = "PTY session not implemented — these tests define the target behavior"]
     async fn env_var_exported_in_one_call_is_visible_in_next_call() {
         // Core persistence contract: exported env vars must survive across tool
         // calls. A stateless fresh-shell implementation would fail this test.
-        let tool = TypeTool::new();
+        let tool = TypeTool::spawn().await.unwrap();
         tool.call(TypeArgs {
             keys: "export TEKTON_PERSIST_TEST=hello\n".into(),
             interactive: false,
@@ -892,11 +982,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "PTY session not implemented — these tests define the target behavior"]
     async fn working_directory_persists_after_cd() {
         // `cd` must permanently change $PWD for all subsequent calls.
         // Regression guard: fresh-shell execution resets $PWD on every call.
-        let tool = TypeTool::new();
+        let tool = TypeTool::spawn().await.unwrap();
         tool.call(TypeArgs {
             keys: "cd /tmp\n".into(),
             interactive: false,
@@ -916,14 +1005,14 @@ mod tests {
             result.output.contains("/tmp"),
             "$PWD must persist across calls; got: {:?}", result.output
         );
+        assert_eq!(result.working_directory, Some("/tmp".to_string()));
     }
 
     #[tokio::test]
-    #[ignore = "PTY session not implemented — these tests define the target behavior"]
     async fn shell_function_defined_in_one_call_is_callable_in_next() {
         // Shell functions live in the session's environment. A function defined
         // in call N must be invocable in call N+1.
-        let tool = TypeTool::new();
+        let tool = TypeTool::spawn().await.unwrap();
         tool.call(TypeArgs {
             keys: "tekton_greet() { echo \"greetings $1\"; }\n".into(),
             interactive: false,
@@ -946,11 +1035,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "PTY session not implemented — these tests define the target behavior"]
     async fn non_exported_shell_variable_does_not_leak_to_subprocesses() {
         // Standard bash scoping: non-exported variables must not be visible to
         // child processes, even across calls within the same session.
-        let tool = TypeTool::new();
+        let tool = TypeTool::spawn().await.unwrap();
         tool.call(TypeArgs {
             keys: "TEKTON_LOCAL=secret\n".into(),
             interactive: false,
@@ -975,10 +1063,9 @@ mod tests {
     // ── PTY integration: OSC sentinel and exit-code tests ─────────────────
 
     #[tokio::test]
-    #[ignore = "PTY session not implemented — these tests define the target behavior"]
     async fn exit_code_zero_for_successful_command() {
         // `true` always exits 0. The OSC sentinel must carry that value.
-        let tool = TypeTool::new();
+        let tool = TypeTool::spawn().await.unwrap();
         let result = tool
             .call(TypeArgs { keys: "true\n".into(), interactive: false, timeout: None })
             .await
@@ -987,10 +1074,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "PTY session not implemented — these tests define the target behavior"]
     async fn exit_code_one_for_failing_command() {
         // `false` always exits 1. Tests that non-zero codes are relayed.
-        let tool = TypeTool::new();
+        let tool = TypeTool::spawn().await.unwrap();
         let result = tool
             .call(TypeArgs { keys: "false\n".into(), interactive: false, timeout: None })
             .await
@@ -999,11 +1085,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "PTY session not implemented — these tests define the target behavior"]
     async fn exit_code_arbitrary_value_faithfully_captured_from_sentinel() {
         // The OSC sentinel must relay any exit code, not just 0/1.
         // A bug might mask the code by always returning 0 or 1.
-        let tool = TypeTool::new();
+        let tool = TypeTool::spawn().await.unwrap();
         let result = tool
             .call(TypeArgs {
                 keys: "sh -c 'exit 42'\n".into(),
@@ -1016,11 +1101,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "PTY session not implemented — these tests define the target behavior"]
     async fn exit_code_127_for_unknown_command() {
         // Bash exits 127 on "command not found". Verifies the sentinel works
         // for error paths that never reach the program's own exit() call.
-        let tool = TypeTool::new();
+        let tool = TypeTool::spawn().await.unwrap();
         let result = tool
             .call(TypeArgs {
                 keys: "tekton_nonexistent_command_xyz_abc\n".into(),
@@ -1033,11 +1117,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "PTY session not implemented — these tests define the target behavior"]
     async fn osc_sentinel_bytes_are_stripped_from_output() {
         // The sentinel `\e]999;EXIT\a` is machine metadata. It must not appear
         // in the output string returned to the model — only clean terminal text.
-        let tool = TypeTool::new();
+        let tool = TypeTool::spawn().await.unwrap();
         let result = tool
             .call(TypeArgs { keys: "echo hello\n".into(), interactive: false, timeout: None })
             .await
@@ -1049,7 +1132,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "PTY session not implemented — these tests define the target behavior"]
     async fn keystroke_echo_disabled_so_typed_input_does_not_appear_in_output() {
         // Design: echo is disabled on the PTY. The model's keystrokes must not
         // be reflected back in the output it receives.
@@ -1057,7 +1139,7 @@ mod tests {
         // If echo is ON, the input "echo marker_xyz\n" appears in the output
         // stream, making "marker_xyz" occur twice (once as echoed input, once
         // as command output). With echo OFF it occurs exactly once.
-        let tool = TypeTool::new();
+        let tool = TypeTool::spawn().await.unwrap();
         let result = tool
             .call(TypeArgs {
                 keys: "echo tekton_echo_marker_xyz\n".into(),
@@ -1077,12 +1159,11 @@ mod tests {
     // ── PTY integration: timeout and process-control tests ─────────────────
 
     #[tokio::test]
-    #[ignore = "PTY session not implemented — these tests define the target behavior"]
     async fn non_interactive_timeout_kills_foreground_and_sets_timeout_message() {
         // Non-interactive timeout: kill the foreground process group, return
         // captured output plus a timeout_message. exit_code is None because no
         // sentinel was emitted before the kill.
-        let tool = TypeTool::new();
+        let tool = TypeTool::spawn().await.unwrap();
         let result = tool
             .call(TypeArgs {
                 keys: "sleep 9999\n".into(),
@@ -1102,11 +1183,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "PTY session not implemented — these tests define the target behavior"]
     async fn interactive_timeout_returns_partial_output_without_killing_process() {
         // Interactive timeout: return partial output so the model can decide
         // what to type next. The process must remain alive.
-        let tool = TypeTool::new();
+        let tool = TypeTool::spawn().await.unwrap();
         // `cat` with no args blocks on stdin — ideal for testing interactive mode.
         let partial = tool
             .call(TypeArgs {
@@ -1137,11 +1217,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "PTY session not implemented — these tests define the target behavior"]
     async fn ctrl_c_sends_sigint_terminating_foreground_process_group() {
         // Ctrl-C (\x03) must terminate the foreground process so the shell
         // returns to the prompt and emits an OSC sentinel.
-        let tool = TypeTool::new();
+        let tool = TypeTool::spawn().await.unwrap();
         // Start a long-running process in interactive mode, let it time out so
         // we get partial output quickly.
         let _ = tool
@@ -1167,14 +1246,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "PTY session not implemented — these tests define the target behavior"]
     async fn is_running_flag_is_true_during_call_and_false_after() {
         // Concurrency contract (design §"Background job notification flow"):
         // is_running is true while call() is executing so the pipe-reader task
         // knows to ignore SIGCHLD signals; it clears to false afterwards.
         use std::time::Duration;
 
-        let tool = Arc::new(TypeTool::new());
+        let tool = Arc::new(TypeTool::spawn().await.unwrap());
         let is_running = tool.is_running();
 
         assert!(!is_running.load(Ordering::SeqCst), "must start false");
@@ -1197,7 +1275,7 @@ mod tests {
             "is_running must be true while call() is executing"
         );
 
-        handle.await.unwrap().ok(); // ignore result — PTY not implemented yet
+        handle.await.unwrap().unwrap();
         assert!(
             !is_running.load(Ordering::SeqCst),
             "is_running must be false after call() returns"
