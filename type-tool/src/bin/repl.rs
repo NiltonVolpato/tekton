@@ -93,6 +93,7 @@ async fn main() {
                         }
                     }
                     Outcome::Killed {
+                        exit_code,
                         working_directory,
                         timeout_secs,
                     } => {
@@ -100,6 +101,7 @@ async fn main() {
                             "[timeout: Command timed out after {timeout_secs:.1}s and was terminated.]"
                         );
                         eprintln!("[cwd: {working_directory}]");
+                        eprintln!("[exit: {exit_code}]");
                     }
                     Outcome::Waiting => {
                         eprintln!("[waiting]");

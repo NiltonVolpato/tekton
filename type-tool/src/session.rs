@@ -215,11 +215,11 @@ pub(crate) fn kill_foreground(shell_pid: u32, background_pids: &HashSet<u32>) {
 
 /// Drain the PTY after `kill_foreground` to return bash to a clean prompt.
 ///
-/// Returns the `$PWD` reported in the post-kill sentinel, or `None` on timeout.
-pub(crate) fn drain_after_kill(session: &mut OsSession) -> Option<String> {
+/// Returns `(exit_code, cwd)` from the post-kill sentinel, or `None` on timeout.
+pub(crate) fn drain_after_kill(session: &mut OsSession) -> Option<(i32, String)> {
     wait_for_sentinel(session, DRAIN_TIMEOUT)
         .ok()
-        .map(|c| parse_sentinel(&c).1)
+        .map(|c| parse_sentinel(&c))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -656,14 +656,16 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(
-            cwd.is_some(),
-            "drain_after_kill must return Some(cwd) after a successful kill"
-        );
+        let (exit_code, working_directory) = cwd
+            .expect("drain_after_kill must return Some after a successful kill");
         assert_eq!(
-            cwd.unwrap(),
-            "/",
+            working_directory, "/",
             "drained CWD must match the directory set before the kill"
+        );
+        // SIGTERM → 128+15=143, SIGKILL → 128+9=137
+        assert!(
+            exit_code == 143 || exit_code == 137,
+            "killed process exit code must be 143 (SIGTERM) or 137 (SIGKILL); got: {exit_code}"
         );
     }
 }

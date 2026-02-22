@@ -137,6 +137,7 @@ pub enum Outcome {
     /// The command timed out (non-interactive) and was killed.
     /// The shell is back at a prompt and ready for the next command.
     Killed {
+        exit_code: i32,
         working_directory: String,
         timeout_secs: f64,
     },
@@ -563,12 +564,13 @@ impl Tool for TypeTool {
                     // Kill the foreground process (SIGTERM → SIGKILL).
                     session::kill_foreground(shell_pid, &background_pids);
 
-                    // Drain PTY to restore a clean prompt; extract post-kill $PWD.
-                    let cwd = session::drain_after_kill(s)
+                    // Drain PTY to restore a clean prompt; extract post-kill exit code and $PWD.
+                    let (exit_code, cwd) = session::drain_after_kill(s)
                         .unwrap_or_default();
 
                     let active_pids = session::run_jobs_p_sync(s);
                     let outcome = Outcome::Killed {
+                        exit_code,
                         working_directory: cwd,
                         timeout_secs,
                     };
@@ -1361,19 +1363,11 @@ mod tests {
         );
     }
 
-    #[ignore = "BUG: Outcome::Killed discards post-kill exit code from drain_after_kill"]
     #[tokio::test]
     async fn non_interactive_timeout_killed_outcome_includes_exit_code() {
         // After kill_foreground sends SIGTERM/SIGKILL, bash regains control and
         // emits a sentinel whose exit code reflects the killed process (typically
-        // 143 for SIGTERM or 137 for SIGKILL). drain_after_kill reads that
-        // sentinel but currently discards the exit code, returning only the cwd.
-        //
-        // Correct behavior: Outcome::Killed should include the post-kill exit
-        // code so the model can distinguish "timed out and killed" from other
-        // failure modes. The exit code is already available in the sentinel —
-        // drain_after_kill just needs to return it, and Outcome::Killed needs
-        // an exit_code field.
+        // 143 for SIGTERM or 137 for SIGKILL).
         let (tool, _cwd) = TypeTool::spawn().await.unwrap();
         let result = tool
             .call(TypeArgs {
@@ -1384,16 +1378,11 @@ mod tests {
             .await
             .unwrap();
         match result.outcome {
-            // TODO: Change to `Outcome::Killed { exit_code, .. }` once the field exists.
-            Outcome::Killed { .. } => {
-                // SIGTERM = 143, SIGKILL = 137. Either is acceptable.
-                // assert!(
-                //     exit_code == 143 || exit_code == 137,
-                //     "killed process exit code must be 143 (SIGTERM) or 137 (SIGKILL); got: {exit_code}"
-                // );
-                panic!(
-                    "Outcome::Killed does not yet have an exit_code field. \
-                     Add it, then uncomment the assertion above."
+            Outcome::Killed { exit_code, .. } => {
+                // SIGTERM = 128+15=143, SIGKILL = 128+9=137. Either is acceptable.
+                assert!(
+                    exit_code == 143 || exit_code == 137,
+                    "killed process exit code must be 143 (SIGTERM) or 137 (SIGKILL); got: {exit_code}"
                 );
             }
             other => panic!("expected Outcome::Killed; got: {other:?}"),
