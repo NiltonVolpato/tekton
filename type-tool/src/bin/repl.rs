@@ -77,6 +77,7 @@ async fn main() {
             keys,
             interactive,
             timeout: Some(timeout),
+            reset: false,
         };
 
         match tool.call(args).await {
@@ -110,6 +111,10 @@ async fn main() {
                     }
                     Outcome::ShellExited { working_directory } => {
                         eprintln!("[shell exited, respawned]");
+                        eprintln!("[cwd: {working_directory}]");
+                    }
+                    Outcome::Reset { working_directory } => {
+                        eprintln!("[session reset]");
                         eprintln!("[cwd: {working_directory}]");
                     }
                 }
