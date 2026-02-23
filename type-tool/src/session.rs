@@ -5,7 +5,7 @@
 
 use std::{collections::HashSet, process::Command, time::Duration};
 
-use sysinfo::{Pid as SysPid, ProcessesToUpdate, System};
+use sysinfo::{Pid as SysPid, ProcessesToUpdate, Signal, System};
 
 use expectrl::{Expect, process::Termios, session::OsSession};
 
@@ -62,7 +62,7 @@ impl PtySession {
         //    Without this, send_line can race with bash's startup and the
         //    init commands may arrive before bash is fully initialized —
         //    breaking foreground process group management.
-        use expectrl::Expect;
+
         session.set_expect_timeout(Some(Duration::from_secs(1)));
         let _ = session.expect(expectrl::Regex(r"\$ "));
 
@@ -159,8 +159,19 @@ pub(crate) fn run_jobs_p_sync(session: &mut OsSession) -> Option<HashSet<u32>> {
 ///
 /// Returns `true` if all foreground children are confirmed dead after
 /// signalling, `false` if any survived SIGKILL (the shell is unrecoverable).
+///
+/// # TODO
+///
+/// - **Skip the 100ms sleep when SIGINT suffices.** If the caller's
+///   `drain_after_kill` sees a sentinel immediately after SIGINT, there is
+///   no need to enumerate survivors at all. This requires moving the drain
+///   attempt into (or interleaving with) the kill sequence rather than
+///   running it strictly after.
+///
+/// - **Drop SIGTERM, escalate straight to SIGKILL.** Now that SIGINT is
+///   the primary signal, anything that survives it is unlikely to respond
+///   to SIGTERM either — jumping directly to SIGKILL would save ~500ms.
 pub(crate) fn kill_foreground(shell_pid: u32, background_pids: &HashSet<u32>) -> bool {
-    use sysinfo::Signal;
 
     // SIGINT the entire process group atomically. Since we spawn bash with
     // `set +m` (job monitoring off), all children inherit the shell's
@@ -434,7 +445,7 @@ mod tests {
         let pty = PtySession::spawn().await.unwrap();
         let (exit_code, _) = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-            use expectrl::Expect;
+    
             pty.session.send_line("true").unwrap();
             let caps = wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             parse_sentinel(&caps)
@@ -449,7 +460,7 @@ mod tests {
         let pty = PtySession::spawn().await.unwrap();
         let (exit_code, _) = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-            use expectrl::Expect;
+    
             pty.session.send_line("false").unwrap();
             let caps = wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             parse_sentinel(&caps)
@@ -465,7 +476,7 @@ mod tests {
         let pty = PtySession::spawn().await.unwrap();
         let (exit_code, _) = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-            use expectrl::Expect;
+    
             pty.session.send_line("sh -c 'exit 99'").unwrap();
             let caps = wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             parse_sentinel(&caps)
@@ -482,7 +493,7 @@ mod tests {
         let pty = PtySession::spawn().await.unwrap();
         let (_, cwd) = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-            use expectrl::Expect;
+    
             pty.session.send_line("cd /").unwrap();
             let caps = wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             parse_sentinel(&caps)
@@ -504,7 +515,7 @@ mod tests {
         let pty = PtySession::spawn().await.unwrap();
         let exit_code = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-            use expectrl::Expect;
+    
             // Override PROMPT_COMMAND to emit an exit-code field that overflows i32.
             pty.session
                 .send_line("PROMPT_COMMAND='printf \"\\033]999;9999999999;$PWD\\007\"'")
@@ -591,7 +602,7 @@ mod tests {
         let pty = PtySession::spawn().await.unwrap();
         let pids = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-            use expectrl::Expect;
+    
             // Start a long-running background job.
             pty.session.send_line("sleep 9999 &").unwrap();
             // Shell returns to prompt after backgrounding; wait for sentinel.
@@ -620,7 +631,7 @@ mod tests {
         let pty = PtySession::spawn().await.unwrap();
         let pids = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-            use expectrl::Expect;
+    
             pty.session.send_line("sleep 0.1 &").unwrap();
             wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             // Wait for the background job to finish, then force a full prompt
@@ -647,7 +658,7 @@ mod tests {
         let shell_pid = pty.shell_pid;
         let result = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-            use expectrl::Expect;
+    
             // Start a foreground process that would run indefinitely.
             pty.session.send_line("sleep 9999").unwrap();
             // Read from the PTY so bash can make progress forking the child.
@@ -678,7 +689,7 @@ mod tests {
         let shell_pid = pty.shell_pid;
         let bg_survived = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-            use expectrl::Expect;
+    
 
             // Start a background job and record its PID.
             pty.session.send_line("sleep 9999 &").unwrap();
@@ -716,7 +727,7 @@ mod tests {
         let shell_pid = pty.shell_pid;
         let cwd = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-            use expectrl::Expect;
+    
 
             // Navigate to a known directory first.
             pty.session.send_line("cd /").unwrap();

@@ -661,7 +661,7 @@ impl Tool for TypeTool {
             let shell_pid = pty.shell_pid;
 
             // 1. Send keystrokes to the PTY.
-            use expectrl::Expect;
+            use expectrl::Expect; // trait needed for .send(); inline to avoid unused-import warning
             pty.session.send(keys.as_bytes())
                 .map_err(|e| TypeError::PtyWrite(e.to_string()))?;
 
