@@ -2,8 +2,9 @@ use std::io::{self, BufRead, Write};
 
 use anyhow::Result;
 use rig::{
+    agent::{PromptHook, ToolCallHookAction},
     client::ProviderClient,
-    completion::Prompt,
+    completion::{CompletionModel, Prompt},
     prelude::*,
     providers::openai,
 };
@@ -11,6 +12,22 @@ use tekton_type_tool::TypeTool;
 use tracing::Level;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+#[derive(Clone)]
+struct LogToolCalls;
+
+impl<M: CompletionModel> PromptHook<M> for LogToolCalls {
+    fn on_tool_call(
+        &self,
+        tool_name: &str,
+        _tool_call_id: Option<String>,
+        _internal_call_id: &str,
+        args: &str,
+    ) -> impl Future<Output = ToolCallHookAction> + Send {
+        eprintln!("[tool call] {tool_name}({args})");
+        async { ToolCallHookAction::cont() }
+    }
+}
 
 const DEFAULT_MODEL: &str = "gpt-4o";
 const DEFAULT_MAX_TURNS: usize = 20;
@@ -30,7 +47,11 @@ fn init_tracing() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
 
     let provider = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
-        .with_resource(Resource::builder().with_service_name("tekton-agent").build())
+        .with_resource(
+            Resource::builder()
+                .with_service_name("tekton-agent")
+                .build(),
+        )
         .build();
 
     let tracer = provider.tracer("tekton-agent");
@@ -67,8 +88,7 @@ fn init_tracing() -> Option<()> {
 async fn main() -> Result<()> {
     let _otel_provider = init_tracing();
 
-    let model_name =
-        std::env::var("TEKTON_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let model_name = std::env::var("TEKTON_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
 
     // Use the Completions API (Chat Completions) for maximum compatibility
     // with local model servers (ollama, vLLM, LM Studio, etc.).
@@ -86,19 +106,30 @@ async fn main() -> Result<()> {
         .spawn()
         .await?;
 
-    let cwd = tool.working_directory().await;
     let watcher = tool.spawn_watcher();
 
     let agent = client
         .agent(&model_name)
-        .preamble(&format!(
-            "You're looking at a terminal. The only tool you have is `type`, \
-             which sends keystrokes to the terminal.\n\n\
-             The terminal says:\n\n\
-             $?=0 agent:{cwd} $ ",
-        ))
+        .preamble("\
+You're a helpful assistant. You can chat with the user and you have access to \
+a terminal from which you can execute linux commands on bash.
+The tool `type` gives you access to this terminal, by sending keystrokes.
+
+The terminal is interactive, so remember to press Enter (represented by `\\n` at the end of keys) to execute commands.
+
+Examples:
+- Run a command (including the Enter key \\n)
+  `{\"keys\": \"ls -la\\n\"}`
+- Send Ctrl-C (no \\n):
+  `{\"keys\": \"\\u0003\"}`
+
+Incorrect: `{\"keys\": \"ls -la\"}` as it's missing the Enter key `\\n`
+
+",
+        )
         .max_tokens(4096)
         .default_max_turns(DEFAULT_MAX_TURNS)
+        .hook(LogToolCalls)
         .tool(tool)
         .build();
 
@@ -107,6 +138,7 @@ async fn main() -> Result<()> {
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
+    let mut chat_history: Vec<rig::message::Message> = Vec::new();
 
     loop {
         print!("> ");
@@ -122,7 +154,7 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        match agent.prompt(prompt).await {
+        match agent.prompt(prompt).with_history(&mut chat_history).await {
             Ok(response) => {
                 println!("\n{response}\n");
             }
