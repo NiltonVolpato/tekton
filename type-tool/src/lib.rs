@@ -2759,9 +2759,6 @@ mod tests {
         }
     }
 
-    #[ignore = "BUG: flaky under concurrency — passes in isolation but the \
-                SIGINT-to-children race with SIGTERM is timing-sensitive; under \
-                load the 100ms window may not suffice and bash continues the loop"]
     #[tokio::test]
     async fn session_recovers_after_killing_long_running_loop() {
         // After kill_foreground terminates a compound loop command, the session

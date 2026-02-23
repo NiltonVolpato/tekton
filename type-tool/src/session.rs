@@ -145,17 +145,46 @@ pub(crate) fn run_jobs_p_sync(session: &mut OsSession) -> Option<HashSet<u32>> {
     Some(parse_jobs_p(&String::from_utf8_lossy(captures.before())))
 }
 
-/// Send SIGTERM then SIGKILL to foreground children of `shell_pid`,
-/// skipping known background PIDs. Also sends SIGINT to the shell itself
-/// to interrupt any blocking syscall (e.g., `open()` on a FIFO).
+/// Send SIGINT to the shell's process group, then SIGTERM/SIGKILL to any
+/// foreground children that survive, skipping known background PIDs.
 ///
-/// Uses `sysinfo` to enumerate and signal child processes, avoiding both
-/// the fragility of spawning an external `pgrep` and raw `libc::kill` calls.
+/// The process-group SIGINT is atomic (`kill(-pgid, SIGINT)`) — it hits
+/// bash and all its children in one syscall, exactly like Ctrl-C. This
+/// avoids the TOCTOU race of enumerating PIDs then signalling them
+/// individually (by which time a short-lived child like `sleep 1` in a
+/// loop may have already exited and been replaced).
+///
+/// Uses `sysinfo` to enumerate surviving child processes for the
+/// SIGTERM/SIGKILL escalation path.
 ///
 /// Returns `true` if all foreground children are confirmed dead after
 /// signalling, `false` if any survived SIGKILL (the shell is unrecoverable).
 pub(crate) fn kill_foreground(shell_pid: u32, background_pids: &HashSet<u32>) -> bool {
     use sysinfo::Signal;
+
+    // SIGINT the entire process group atomically. Since we spawn bash with
+    // `set +m` (job monitoring off), all children inherit the shell's
+    // process group. This serves two purposes:
+    //
+    // 1. If bash itself is blocked in a syscall with no child process (e.g.,
+    //    `open()` on a FIFO, `read` builtin), SIGINT interrupts the syscall
+    //    and returns bash to its prompt.
+    //
+    // 2. If bash is running a compound command (for loop, pipeline), SIGINT
+    //    to the children makes them exit with SIGINT status. Bash's
+    //    cooperative SIGINT handling only aborts loops when the child dies
+    //    from SIGINT — if the child dies from SIGTERM instead, bash
+    //    continues the loop.
+    //
+    // Safety: shell_pid is always non-zero (it's a real PID from fork),
+    // so negating it will never produce 0 or -1.
+    unsafe {
+        libc::kill(-(shell_pid as i32), libc::SIGINT);
+    }
+
+    // Give SIGINT a moment to be delivered and processed before enumerating
+    // survivors for SIGTERM/SIGKILL escalation.
+    std::thread::sleep(Duration::from_millis(100));
 
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::All, false);
@@ -173,37 +202,9 @@ pub(crate) fn kill_foreground(shell_pid: u32, background_pids: &HashSet<u32>) ->
         .filter(|&pid| pid.as_u32() != 0)
         .collect();
 
-    // SIGINT the shell and all foreground children. This serves two purposes:
-    //
-    // 1. If bash itself is blocked in a syscall with no child process (e.g.,
-    //    `open()` on a FIFO, `read` builtin), SIGINT interrupts the syscall
-    //    and returns bash to its prompt.
-    //
-    // 2. If bash is running a compound command (for loop, pipeline), SIGINT
-    //    to the children makes them exit with SIGINT status. Bash's cooperative
-    //    SIGINT handling only aborts loops when the child dies from SIGINT —
-    //    if the child dies from SIGTERM instead, bash continues the loop.
-    //    This mimics what a real Ctrl-C does (SIGINT to the entire process
-    //    group).
-    if let Some(shell) = sys.process(parent) {
-        let _ = shell.kill_with(Signal::Interrupt);
-    }
-    for &pid in &foreground_pids {
-        if let Some(process) = sys.process(pid) {
-            let _ = process.kill_with(Signal::Interrupt);
-        }
-    }
-
     if foreground_pids.is_empty() {
         return true;
     }
-
-    // Give SIGINT a moment to be delivered and processed before escalating.
-    // Without this, SIGTERM arrives almost simultaneously and the child may
-    // die from SIGTERM instead of SIGINT — defeating bash's cooperative
-    // SIGINT handling.
-    std::thread::sleep(Duration::from_millis(100));
-    sys.refresh_processes(ProcessesToUpdate::Some(&foreground_pids), true);
 
     // SIGTERM: escalate for processes that ignore or mask SIGINT.
     for &pid in &foreground_pids {
@@ -213,7 +214,7 @@ pub(crate) fn kill_foreground(shell_pid: u32, background_pids: &HashSet<u32>) ->
     }
 
     // Give processes a moment to exit gracefully, then refresh to check survivors.
-    std::thread::sleep(Duration::from_millis(400));
+    std::thread::sleep(Duration::from_millis(500));
     sys.refresh_processes(ProcessesToUpdate::Some(&foreground_pids), true);
 
     // SIGKILL any survivors.
@@ -547,7 +548,6 @@ mod tests {
         );
     }
 
-    #[ignore = "expectrl's expect() overshoots short timeouts by ~670ms"]
     #[tokio::test]
     async fn wait_for_sentinel_does_not_dramatically_overshoot_timeout() {
         // Guards against an implementation that loops with a fixed sleep much
