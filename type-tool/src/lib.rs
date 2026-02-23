@@ -30,23 +30,27 @@
 //!     let anthropic = anthropic::Client::from_env();
 //!     let model = anthropic.completion_model(CLAUDE_4_SONNET);
 //!
-//!     let (tool, _cwd) = TypeTool::spawn().await.unwrap();
-//!     let tool = tool.with_job_callback(|notif| {
-//!         // Queue a proactive message to the agent, wake it up if idle, etc.
-//!         eprintln!("job {} done (exit {:?})", notif.pid, notif.exit_code);
-//!     });
+//!     let tool = TypeTool::new()
+//!         .with_name("claude")
+//!         .with_job_callback(|notif| {
+//!             // Queue a proactive message to the agent, wake it up if idle, etc.
+//!             eprintln!("job {} done (exit {:?})", notif.pid, notif.exit_code);
+//!         })
+//!         .spawn()
+//!         .await
+//!         .unwrap();
+//!     let cwd = tool.working_directory().await;
 //!
 //!     // Start the sysinfo watcher before moving `tool` into the agent builder.
 //!     let watcher = tool.spawn_watcher();
 //!
 //!     let agent = AgentBuilder::new(model)
-//!         .preamble(
+//!         .preamble(&format!(
 //!             "You're looking at a terminal. The only tool you have is `type`, \
 //!              which sends keystrokes to the terminal.\n\n\
 //!              The terminal says:\n\n\
-//!              Welcome back Claude! For help run the command `help`.\n\
-//!              [0] claude@alpha:/Users/nilton/src/tekton $",
-//!         )
+//!              $?=0 claude:{cwd} $ ",
+//!         ))
 //!         .tool(tool)
 //!         .build();
 //!
@@ -352,31 +356,56 @@ pub struct TypeTool {
 
     /// Shared with the watcher task for background job lifecycle tracking.
     job_manager: Arc<Mutex<JobManager>>,
+
+    /// Agent name shown in the prompt (e.g. "claude"). Empty = no name prefix.
+    agent_name: String,
 }
 
 impl TypeTool {
     /// Create a new `TypeTool` with no session, an empty [`JobManager`], and no callback.
     ///
-    /// Calling `call()` on a tool created this way returns
-    /// [`TypeError::SessionNotInitialized`]. Use [`TypeTool::spawn`] to get a
-    /// fully initialized tool with an active PTY session.
+    /// Use the builder methods [`with_name`](Self::with_name) and
+    /// [`with_job_callback`](Self::with_job_callback) to configure the tool,
+    /// then call [`spawn`](Self::spawn) to start the PTY session.
     pub fn new() -> Self {
         Self {
             session: Arc::new(tokio::sync::Mutex::new(None)),
             job_manager: Arc::new(Mutex::new(JobManager::new())),
+            agent_name: String::new(),
         }
     }
 
-    /// Spawn a bash PTY session and return a fully initialized `TypeTool`
-    /// along with the shell's initial working directory.
-    pub async fn spawn() -> Result<(Self, String), TypeError> {
-        let session = session::PtySession::spawn().await?;
-        let working_directory = session.working_directory.clone();
-        let tool = Self {
-            session: Arc::new(tokio::sync::Mutex::new(Some(session))),
-            job_manager: Arc::new(Mutex::new(JobManager::new())),
-        };
-        Ok((tool, working_directory))
+    /// Set the agent name shown in the terminal prompt (e.g. "claude").
+    ///
+    /// When set, prompts look like `$?=0 claude:/Users/nilton/src $ `.
+    /// When empty (the default), the name prefix is omitted: `$?=0 /Users/nilton/src $ `.
+    pub fn with_name(mut self, name: impl AsRef<str>) -> Self {
+        self.agent_name = name.as_ref().to_string();
+        self
+    }
+
+    /// Spawn a bash PTY session and return a fully initialized `TypeTool`.
+    ///
+    /// Consumes `self` (from the builder chain) and returns an initialized tool.
+    /// Use [`working_directory`](Self::working_directory) to read the initial `$PWD`.
+    pub async fn spawn(self) -> Result<Self, TypeError> {
+        let pty_session = session::PtySession::spawn().await?;
+        Ok(Self {
+            session: Arc::new(tokio::sync::Mutex::new(Some(pty_session))),
+            job_manager: self.job_manager,
+            agent_name: self.agent_name,
+        })
+    }
+
+    /// Return the current working directory from the most recent sentinel.
+    ///
+    /// Returns an empty string if no session is active.
+    pub async fn working_directory(&self) -> String {
+        let guard = self.session.lock().await;
+        guard
+            .as_ref()
+            .map(|pty| pty.working_directory.clone())
+            .unwrap_or_default()
     }
 
     /// Register a callback invoked whenever a background job completes.
@@ -396,6 +425,7 @@ impl TypeTool {
         Self {
             session: self.session,
             job_manager: Arc::new(Mutex::new(manager)),
+            agent_name: self.agent_name,
         }
     }
 
@@ -487,6 +517,20 @@ impl TypeTool {
     }
 }
 
+impl TypeTool {
+    /// Build the prompt string appended to every command's output.
+    ///
+    /// Format with agent name: `$?=0 claude:/Users/nilton/src $ `
+    /// Format without name:    `$?=0 /Users/nilton/src $ `
+    fn format_prompt(&self, exit_code: i32, cwd: &str) -> String {
+        if self.agent_name.is_empty() {
+            format!("$?={exit_code} {cwd} $ ")
+        } else {
+            format!("$?={} {}:{} $ ", exit_code, self.agent_name, cwd)
+        }
+    }
+}
+
 impl Default for TypeTool {
     fn default() -> Self {
         Self::new()
@@ -501,13 +545,17 @@ impl Tool for TypeTool {
     type Output = TypeOutput;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
+        let cwd = self.working_directory().await;
+        let initial_prompt = self.format_prompt(0, &cwd);
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description:
+            description: format!(
                 "Send keystrokes to the terminal. Supports escape sequences: \\n for Enter, \
                  \\u0003 for Ctrl-C, \\u0004 for Ctrl-D, etc. Returns the terminal output \
-                 captured until the next shell prompt or timeout."
-                    .to_string(),
+                 captured until the next shell prompt or timeout.\n\n\
+                 The terminal says:\n\n\
+                 {initial_prompt}"
+            ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -658,10 +706,28 @@ impl Tool for TypeTool {
             self.job_manager.lock().unwrap().sync(&active_pids);
         }
 
-        Ok(TypeOutput {
-            output: String::from_utf8_lossy(&output_bytes).into_owned(),
-            outcome,
-        })
+        let mut output = String::from_utf8_lossy(&output_bytes).into_owned();
+
+        // Append the harness-built prompt so the model sees exit code, identity,
+        // and location context at the end of every command's output.
+        match &outcome {
+            Outcome::Completed { exit_code, working_directory } => {
+                output.push_str(&self.format_prompt(*exit_code, working_directory));
+            }
+            Outcome::Killed { exit_code, working_directory, .. } => {
+                output.push_str("Killed\n");
+                output.push_str(&self.format_prompt(*exit_code, working_directory));
+            }
+            Outcome::ShellExited { working_directory } => {
+                output.push_str("Shell exited, respawned\n");
+                output.push_str(&self.format_prompt(0, working_directory));
+            }
+            Outcome::Waiting => {
+                // Process still running — no prompt to append.
+            }
+        }
+
+        Ok(TypeOutput { output, outcome })
     }
 }
 
@@ -1175,7 +1241,8 @@ mod tests {
     async fn env_var_exported_in_one_call_is_visible_in_next_call() {
         // Core persistence contract: exported env vars must survive across tool
         // calls. A stateless fresh-shell implementation would fail this test.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
+        let cwd = tool.working_directory().await;
         tool.call(TypeArgs {
             keys: "export TEKTON_PERSIST_TEST=hello\n".into(),
             interactive: false,
@@ -1191,17 +1258,14 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(
-            result.output.contains("hello"),
-            "exported env var must persist across calls; got: {:?}", result.output
-        );
+        assert_eq!(result.output, format!("hello\r\n{}", expected_prompt("", 0, &cwd)));
     }
 
     #[tokio::test]
     async fn working_directory_persists_after_cd() {
         // `cd` must permanently change $PWD for all subsequent calls.
         // Regression guard: fresh-shell execution resets $PWD on every call.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
         tool.call(TypeArgs {
             keys: "cd /tmp\n".into(),
             interactive: false,
@@ -1217,10 +1281,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(
-            result.output.contains("/tmp"),
-            "$PWD must persist across calls; got: {:?}", result.output
-        );
+        assert_eq!(result.output, format!("/tmp\r\n{}", expected_prompt("", 0, "/tmp")));
         assert!(
             matches!(result.outcome, Outcome::Completed { ref working_directory, .. } if working_directory == "/tmp"),
             "working directory must be /tmp; got: {:?}", result.outcome
@@ -1231,7 +1292,8 @@ mod tests {
     async fn shell_function_defined_in_one_call_is_callable_in_next() {
         // Shell functions live in the session's environment. A function defined
         // in call N must be invocable in call N+1.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
+        let cwd = tool.working_directory().await;
         tool.call(TypeArgs {
             keys: "tekton_greet() { echo \"greetings $1\"; }\n".into(),
             interactive: false,
@@ -1247,9 +1309,9 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(
-            result.output.contains("greetings world"),
-            "shell function must persist across calls; got: {:?}", result.output
+        assert_eq!(
+            result.output,
+            format!("greetings world\r\n{}", expected_prompt("", 0, &cwd)),
         );
     }
 
@@ -1257,7 +1319,8 @@ mod tests {
     async fn non_exported_shell_variable_does_not_leak_to_subprocesses() {
         // Standard bash scoping: non-exported variables must not be visible to
         // child processes, even across calls within the same session.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
+        let cwd = tool.working_directory().await;
         tool.call(TypeArgs {
             keys: "TEKTON_LOCAL=secret\n".into(),
             interactive: false,
@@ -1273,9 +1336,9 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(
-            result.output.contains("UNSET"),
-            "non-exported var must not be visible to subprocesses; got: {:?}", result.output
+        assert_eq!(
+            result.output,
+            format!("UNSET\r\n{}", expected_prompt("", 0, &cwd)),
         );
     }
 
@@ -1284,7 +1347,7 @@ mod tests {
     #[tokio::test]
     async fn exit_code_zero_for_successful_command() {
         // `true` always exits 0. The OSC sentinel must carry that value.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
         let result = tool
             .call(TypeArgs { keys: "true\n".into(), interactive: false, timeout: None })
             .await
@@ -1295,7 +1358,7 @@ mod tests {
     #[tokio::test]
     async fn exit_code_one_for_failing_command() {
         // `false` always exits 1. Tests that non-zero codes are relayed.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
         let result = tool
             .call(TypeArgs { keys: "false\n".into(), interactive: false, timeout: None })
             .await
@@ -1307,7 +1370,7 @@ mod tests {
     async fn exit_code_arbitrary_value_faithfully_captured_from_sentinel() {
         // The OSC sentinel must relay any exit code, not just 0/1.
         // A bug might mask the code by always returning 0 or 1.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
         let result = tool
             .call(TypeArgs {
                 keys: "sh -c 'exit 42'\n".into(),
@@ -1323,7 +1386,7 @@ mod tests {
     async fn exit_code_127_for_unknown_command() {
         // Bash exits 127 on "command not found". Verifies the sentinel works
         // for error paths that never reach the program's own exit() call.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
         let result = tool
             .call(TypeArgs {
                 keys: "tekton_nonexistent_command_xyz_abc\n".into(),
@@ -1339,15 +1402,13 @@ mod tests {
     async fn osc_sentinel_bytes_are_stripped_from_output() {
         // The sentinel `\e]999;EXIT\a` is machine metadata. It must not appear
         // in the output string returned to the model — only clean terminal text.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
+        let cwd = tool.working_directory().await;
         let result = tool
             .call(TypeArgs { keys: "echo hello\n".into(), interactive: false, timeout: None })
             .await
             .unwrap();
-        assert!(
-            !result.output.contains("\x1b]999;"),
-            "OSC sentinel bytes must be stripped from output; got: {:?}", result.output
-        );
+        assert_eq!(result.output, format!("hello\r\n{}", expected_prompt("", 0, &cwd)));
     }
 
     #[tokio::test]
@@ -1358,7 +1419,8 @@ mod tests {
         // If echo is ON, the input "echo marker_xyz\n" appears in the output
         // stream, making "marker_xyz" occur twice (once as echoed input, once
         // as command output). With echo OFF it occurs exactly once.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
+        let cwd = tool.working_directory().await;
         let result = tool
             .call(TypeArgs {
                 keys: "echo tekton_echo_marker_xyz\n".into(),
@@ -1367,124 +1429,209 @@ mod tests {
             })
             .await
             .unwrap();
-        let count = result.output.matches("tekton_echo_marker_xyz").count();
         assert_eq!(
-            count, 1,
-            "marker must appear exactly once (command output only, not echoed input); got: {:?}",
-            result.output
+            result.output,
+            format!("tekton_echo_marker_xyz\r\n{}", expected_prompt("", 0, &cwd)),
         );
     }
 
-    // ── PTY integration: prompt visibility in output ───────────────────────
+    // ── PTY integration: harness-built prompt in output ─────────────────────
     //
-    // Per the design doc, the model should see a prompt like:
-    //   [0] claude@alpha:/Users/nilton/src/tekton $
-    // at the end of each command's output. This tells the model the exit code,
-    // who it is, and where it is — essential context for deciding what to type next.
-    //
-    // Currently, PS1 is rendered AFTER PROMPT_COMMAND. The sentinel is emitted
-    // by PROMPT_COMMAND, so captures.before() only contains text BEFORE the
-    // sentinel. PS1 appears after the sentinel and is only captured as a prefix
-    // of the NEXT command's output — the model never sees the prompt from the
-    // command it just ran.
+    // The harness appends a prompt to every command's output from sentinel
+    // data. Format: `$?=EXIT_CODE [NAME:]CWD $ `
+
+    /// Build the expected prompt string for test assertions.
+    fn expected_prompt(name: &str, exit_code: i32, cwd: &str) -> String {
+        if name.is_empty() {
+            format!("$?={exit_code} {cwd} $ ")
+        } else {
+            format!("$?={exit_code} {name}:{cwd} $ ")
+        }
+    }
 
     #[tokio::test]
-    #[ignore = "BUG: PS1 prompt is emitted after the sentinel, so it's not included in the command's output"]
-    async fn output_ends_with_prompt_showing_exit_code_and_cwd() {
-        // The model must see a prompt at the end of every Completed output.
-        // This is how it knows: (1) the exit code, (2) who it is, (3) where
-        // it is — without having to parse the Outcome struct.
-        //
-        // Expected format: [EXIT_CODE] NAME@HOST:CWD $
-        // Example: [0] claude@alpha:/tmp $
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+    async fn true_exact_output() {
+        // `true` produces no output — just the prompt with exit code 0.
+        let tool = TypeTool::new().spawn().await.unwrap();
+        let cwd = tool.working_directory().await;
+        let result = tool
+            .call(TypeArgs { keys: "true\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+        assert_eq!(result.output, expected_prompt("", 0, &cwd));
+    }
+
+    #[tokio::test]
+    async fn false_exact_output() {
+        // `false` produces no output — just the prompt with exit code 1.
+        let tool = TypeTool::new().spawn().await.unwrap();
+        let cwd = tool.working_directory().await;
+        let result = tool
+            .call(TypeArgs { keys: "false\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+        assert_eq!(result.output, expected_prompt("", 1, &cwd));
+    }
+
+    #[tokio::test]
+    async fn echo_hello_exact_output() {
+        // `echo hello` outputs "hello\r\n" (PTY translates \n → \r\n) then prompt.
+        let tool = TypeTool::new().spawn().await.unwrap();
+        let cwd = tool.working_directory().await;
         let result = tool
             .call(TypeArgs { keys: "echo hello\n".into(), interactive: false, timeout: None })
             .await
             .unwrap();
-
-        // The output must end with something that looks like a prompt.
-        // We check for the [EXIT_CODE] prefix pattern at minimum.
-        let trimmed = result.output.trim_end();
-        assert!(
-            trimmed.ends_with("$ ") || trimmed.ends_with("$"),
-            "output must end with a shell prompt so the model sees where it is; \
-             got: {:?}",
-            result.output
-        );
+        let expected = format!("hello\r\n{}", expected_prompt("", 0, &cwd));
+        assert_eq!(result.output, expected);
     }
 
     #[tokio::test]
-    #[ignore = "BUG: PS1 prompt is emitted after the sentinel, so it's not included in the command's output"]
-    async fn prompt_in_output_reflects_exit_code_of_completed_command() {
-        // After `false` (exit code 1), the prompt must show [1].
-        // After `true` (exit code 0), the prompt must show [0].
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
-
-        let fail_result = tool
-            .call(TypeArgs { keys: "false\n".into(), interactive: false, timeout: None })
-            .await
-            .unwrap();
-        assert!(
-            fail_result.output.contains("[1]"),
-            "prompt after `false` must contain [1]; got: {:?}", fail_result.output
-        );
-
-        let ok_result = tool
-            .call(TypeArgs { keys: "true\n".into(), interactive: false, timeout: None })
-            .await
-            .unwrap();
-        assert!(
-            ok_result.output.contains("[0]"),
-            "prompt after `true` must contain [0]; got: {:?}", ok_result.output
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "BUG: PS1 prompt is emitted after the sentinel, so it's not included in the command's output"]
-    async fn prompt_in_output_reflects_cwd_after_cd() {
-        // After `cd /tmp`, the prompt embedded in the output must show /tmp.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+    async fn echo_n_no_trailing_newline() {
+        // `echo -n foo` outputs "foo" with no newline. The prompt appears on
+        // the same line, just like a real terminal.
+        let tool = TypeTool::new().spawn().await.unwrap();
+        let cwd = tool.working_directory().await;
         let result = tool
+            .call(TypeArgs { keys: "echo -n foo\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+        let expected = format!("foo{}", expected_prompt("", 0, &cwd));
+        assert_eq!(result.output, expected);
+    }
+
+    #[tokio::test]
+    async fn cd_then_echo_no_stale_prompt_leakage() {
+        // Two calls: cd /tmp, then echo marker. The second call's output must
+        // start clean — no leftover prompt from the first call leaking in.
+        let tool = TypeTool::new().spawn().await.unwrap();
+
+        let cd_result = tool
             .call(TypeArgs { keys: "cd /tmp\n".into(), interactive: false, timeout: None })
             .await
             .unwrap();
+        // cd produces no output, just the prompt showing the new cwd.
+        assert_eq!(cd_result.output, expected_prompt("", 0, "/tmp"));
 
-        // The prompt should contain the new cwd.
-        assert!(
-            result.output.contains("/tmp"),
-            "prompt after `cd /tmp` must contain /tmp; got: {:?}", result.output
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "BUG: PS1 prompt is emitted after the sentinel, so it's not included in the command's output"]
-    async fn second_command_output_does_not_start_with_stale_prompt_from_previous_command() {
-        // Currently PS1 from command N leaks into the output of command N+1
-        // as a prefix of captures.before(). If the prompt is properly appended
-        // to command N's output, command N+1's output should start clean.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
-
-        // Command 1: cd /tmp
-        tool.call(TypeArgs { keys: "cd /tmp\n".into(), interactive: false, timeout: None })
-            .await
-            .unwrap();
-
-        // Command 2: echo marker
-        let result = tool
+        let echo_result = tool
             .call(TypeArgs { keys: "echo output_marker\n".into(), interactive: false, timeout: None })
             .await
             .unwrap();
+        let expected = format!("output_marker\r\n{}", expected_prompt("", 0, "/tmp"));
+        assert_eq!(echo_result.output, expected);
+    }
 
-        // The output should start with the command's actual output, not a
-        // leftover prompt from the previous command.
-        let trimmed = result.output.trim_start();
-        assert!(
-            trimmed.starts_with("output_marker"),
-            "output of command N+1 must not start with leftover prompt from command N; \
-             got: {:?}",
-            result.output
-        );
+    #[tokio::test]
+    async fn multi_command_session_exact_outputs() {
+        // A multi-step session: export, cd, echo, false — verifying exact output
+        // for each call and no cross-call leakage.
+        let tool = TypeTool::new().spawn().await.unwrap();
+        let initial_cwd = tool.working_directory().await;
+
+        // 1. export — no visible output
+        let r1 = tool
+            .call(TypeArgs { keys: "export TEKTON_X=42\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+        assert_eq!(r1.output, expected_prompt("", 0, &initial_cwd));
+
+        // 2. cd /
+        let r2 = tool
+            .call(TypeArgs { keys: "cd /\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+        assert_eq!(r2.output, expected_prompt("", 0, "/"));
+
+        // 3. echo $TEKTON_X — verifies persistence of env var and cwd
+        let r3 = tool
+            .call(TypeArgs { keys: "echo $TEKTON_X\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+        assert_eq!(r3.output, format!("42\r\n{}", expected_prompt("", 0, "/")));
+
+        // 4. false — exit code 1
+        let r4 = tool
+            .call(TypeArgs { keys: "false\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+        assert_eq!(r4.output, expected_prompt("", 1, "/"));
+    }
+
+    #[tokio::test]
+    async fn prompt_with_agent_name() {
+        // When agent name is set, prompts include `name:cwd`.
+        let tool = TypeTool::new()
+            .with_name("claude")
+            .spawn()
+            .await
+            .unwrap();
+        let cwd = tool.working_directory().await;
+        let result = tool
+            .call(TypeArgs { keys: "true\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+        assert_eq!(result.output, expected_prompt("claude", 0, &cwd));
+    }
+
+    #[tokio::test]
+    async fn prompt_with_empty_agent_name() {
+        // Default (no name) omits the name prefix from the prompt.
+        let tool = TypeTool::new().spawn().await.unwrap();
+        let cwd = tool.working_directory().await;
+        let result = tool
+            .call(TypeArgs { keys: "true\n".into(), interactive: false, timeout: None })
+            .await
+            .unwrap();
+        // Must NOT contain a colon before the cwd (no name prefix).
+        assert_eq!(result.output, format!("$?=0 {cwd} $ "));
+    }
+
+    #[tokio::test]
+    async fn killed_output_includes_killed_message() {
+        // Non-interactive timeout kill appends "Killed\n" then the prompt.
+        let tool = TypeTool::new().spawn().await.unwrap();
+        let result = tool
+            .call(TypeArgs {
+                keys: "sleep 9999\n".into(),
+                interactive: false,
+                timeout: Some(0.1),
+            })
+            .await
+            .unwrap();
+        match &result.outcome {
+            Outcome::Killed { exit_code, working_directory, .. } => {
+                let expected = format!(
+                    "Killed\n{}",
+                    expected_prompt("", *exit_code, working_directory),
+                );
+                assert_eq!(result.output, expected);
+            }
+            other => panic!("expected Outcome::Killed; got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_exited_output_includes_respawned_message() {
+        // When the shell exits, output includes "Shell exited, respawned\n" + prompt.
+        let tool = TypeTool::new().spawn().await.unwrap();
+        let result = tool
+            .call(TypeArgs {
+                keys: "exec command true\n".into(),
+                interactive: false,
+                timeout: Some(2.0),
+            })
+            .await
+            .unwrap();
+        match &result.outcome {
+            Outcome::ShellExited { working_directory } => {
+                let expected = format!(
+                    "Shell exited, respawned\n{}",
+                    expected_prompt("", 0, working_directory),
+                );
+                assert_eq!(result.output, expected);
+            }
+            other => panic!("expected Outcome::ShellExited; got: {other:?}"),
+        }
     }
 
     // ── PTY integration: timeout and process-control tests ─────────────────
@@ -1493,7 +1640,7 @@ mod tests {
     async fn non_interactive_timeout_kills_foreground_and_sets_timeout_message() {
         // Non-interactive timeout: kill the foreground process group, return
         // captured output. The outcome is Killed.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
         let result = tool
             .call(TypeArgs {
                 keys: "sleep 9999\n".into(),
@@ -1513,7 +1660,7 @@ mod tests {
         // After kill_foreground sends SIGTERM/SIGKILL, bash regains control and
         // emits a sentinel whose exit code reflects the killed process (typically
         // 143 for SIGTERM or 137 for SIGKILL).
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
         let result = tool
             .call(TypeArgs {
                 keys: "sleep 9999\n".into(),
@@ -1538,7 +1685,7 @@ mod tests {
     async fn interactive_timeout_returns_partial_output_without_killing_process() {
         // Interactive timeout: return partial output so the model can decide
         // what to type next. The process must remain alive.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
         // `cat` with no args blocks on stdin — ideal for testing interactive mode.
         let partial = tool
             .call(TypeArgs {
@@ -1572,7 +1719,7 @@ mod tests {
     async fn ctrl_c_sends_sigint_terminating_foreground_process_group() {
         // Ctrl-C (\x03) must terminate the foreground process so the shell
         // returns to the prompt and emits an OSC sentinel.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
         // Start a long-running process in interactive mode, let it time out so
         // we get partial output quickly.
         let _ = tool
@@ -1659,7 +1806,7 @@ mod tests {
     async fn ctrl_c_via_json_u0003_terminates_foreground_process() {
         // End-to-end: the LLM sends \u0003 (the only correct JSON encoding
         // of Ctrl-C). Verify it actually delivers SIGINT to the foreground.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
 
         // Start a long-running foreground process.
         let _ = tool
@@ -1765,7 +1912,7 @@ mod tests {
 
     #[tokio::test]
     async fn interactive_timeout_returns_buffered_partial_output_not_empty() {
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
 
         // `printf` flushes immediately (unlike `echo` which may buffer).
         // The marker appears in the PTY stream before `cat` blocks on stdin,
@@ -1837,7 +1984,7 @@ mod tests {
         // Start a short-lived background job, discover it via call(), then let
         // the watcher detect its completion via sysinfo polling.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
         let tool = tool.with_job_callback(move |notif| {
             let _ = tx.send(notif.pid);
         });
@@ -1888,7 +2035,7 @@ mod tests {
     async fn watcher_backfills_command_field_for_tracked_job() {
         // After call() discovers a background PID with an empty command,
         // the watcher's next sysinfo poll must backfill the command field.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
         let watcher = tool.spawn_watcher();
 
         // Launch a background job with a recognizable command.
@@ -1940,7 +2087,7 @@ mod tests {
         // End-to-end: the completion notification must carry the command string
         // that was backfilled by sysinfo, not the empty string from sync().
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
         let tool = tool.with_job_callback(move |notif| {
             let _ = tx.send(notif.command);
         });
@@ -1974,7 +2121,7 @@ mod tests {
     async fn watcher_does_not_overwrite_already_populated_command() {
         // If the command was already populated (e.g. by the harness), the
         // watcher must not overwrite it with sysinfo data.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
         let watcher = tool.spawn_watcher();
 
         tool.call(TypeArgs {
@@ -2015,7 +2162,7 @@ mod tests {
         // Correct behavior: the output printed before EOF ("Hello Mom!") must
         // be returned to the caller. The shell is dead so there's no sentinel
         // — the outcome should be ShellExited.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
 
         let result = tool
             .call(TypeArgs {
@@ -2026,15 +2173,16 @@ mod tests {
             .await
             .expect("call must return Ok with buffered output on shell exit");
 
-        assert!(
-            result.output.contains("Hello Mom!"),
-            "output printed before EOF must be returned to the caller; got: {:?}",
-            result.output
-        );
-        assert!(
-            matches!(result.outcome, Outcome::ShellExited { .. }),
-            "shell is dead, so outcome must be ShellExited; got: {:?}", result.outcome
-        );
+        match &result.outcome {
+            Outcome::ShellExited { working_directory } => {
+                let expected = format!(
+                    "Hello Mom!\r\nShell exited, respawned\n{}",
+                    expected_prompt("", 0, working_directory),
+                );
+                assert_eq!(result.output, expected);
+            }
+            other => panic!("expected Outcome::ShellExited; got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2044,7 +2192,7 @@ mod tests {
         // Correct behavior: When the shell dies, call() detects EOF and
         // respawns a new bash session transparently. The first call returns
         // ShellExited, and the second call should work normally.
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
 
         // Kill the shell.
         let first_result = tool
@@ -2056,7 +2204,6 @@ mod tests {
             .await
             .expect("call must return Ok with ShellExited on exec");
 
-        // First call should result in ShellExited.
         assert!(
             matches!(first_result.outcome, Outcome::ShellExited { .. }),
             "exec must kill the shell, resulting in ShellExited; got: {:?}", first_result.outcome
@@ -2072,12 +2219,15 @@ mod tests {
             .await
             .expect("call on a respawned session must work normally");
 
-        assert!(
-            result.output.contains("still alive!"),
-            "respawned shell must execute the command; got: {:?}",
-            result.output
-        );
-        assert!(matches!(result.outcome, Outcome::Completed { exit_code: 0, .. }));
+        match &result.outcome {
+            Outcome::Completed { working_directory, .. } => {
+                assert_eq!(
+                    result.output,
+                    format!("still alive!\r\n{}", expected_prompt("", 0, working_directory)),
+                );
+            }
+            other => panic!("expected Outcome::Completed; got: {other:?}"),
+        }
     }
 
     // ── Bug exposure: silently swallowed errors ─────────────────────────
@@ -2132,7 +2282,7 @@ mod tests {
         //
         // This test checks the contract: Killed outcome must always have
         // a non-empty working_directory (fall back to last-known cwd).
-        let (tool, initial_cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
 
         // Navigate somewhere specific so we have a known cwd.
         tool.call(TypeArgs {
@@ -2158,9 +2308,7 @@ mod tests {
                 assert!(
                     !working_directory.is_empty(),
                     "Killed outcome must report a non-empty working_directory; \
-                     if drain_after_kill fails, fall back to the last-known cwd. \
-                     initial_cwd was: {:?}",
-                    initial_cwd
+                     if drain_after_kill fails, fall back to the last-known cwd."
                 );
             }
             other => panic!("expected Outcome::Killed; got: {other:?}"),
@@ -2172,7 +2320,7 @@ mod tests {
         // The watcher must not panic or fire callbacks when no jobs are tracked.
         let fired = Arc::new(Mutex::new(false));
         let fc = Arc::clone(&fired);
-        let (tool, _cwd) = TypeTool::spawn().await.unwrap();
+        let tool = TypeTool::new().spawn().await.unwrap();
         let tool = tool.with_job_callback(move |_| {
             *fc.lock().unwrap() = true;
         });

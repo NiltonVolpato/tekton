@@ -8,9 +8,11 @@ const DEFAULT_TIMEOUT: f64 = 30.0;
 
 #[tokio::main]
 async fn main() {
-    let (tool, cwd) = TypeTool::spawn()
+    let tool = TypeTool::new()
+        .spawn()
         .await
         .expect("failed to spawn PTY session");
+    let cwd = tool.working_directory().await;
     eprintln!("[cwd: {cwd}]");
 
     let stdin = io::stdin();

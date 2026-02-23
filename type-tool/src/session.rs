@@ -3,12 +3,7 @@
 //! [`PtySession`] wraps an `expectrl::OsSession` (a persistent bash PTY)
 //! and provides the sentinel-aware helpers used by [`crate::TypeTool::call`].
 
-use std::{
-    collections::HashSet,
-    process::Command,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-};
+use std::{collections::HashSet, process::Command, time::Duration};
 
 use sysinfo::{Pid as SysPid, ProcessesToUpdate, System};
 
@@ -48,54 +43,42 @@ impl PtySession {
     }
 
     pub(crate) fn spawn_blocking_inner() -> Result<Self, TypeError> {
-        // 1. Write the init script to a temp file.
-        // Use PID + atomic counter for a collision-proof filename.
-        // PID alone isn't unique when multiple threads spawn concurrently
-        // (e.g. cargo test), and subsec_nanos can collide.
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let init_path = format!("/tmp/tekton-init-{pid}-{seq}.sh");
-
-        // The PROMPT_COMMAND sentinel format: ESC]999;EXIT_CODE;$PWD BEL
-        //
-        // TODO: PS1 uses \u (system username) but the design doc says the LLM's
-        // name should appear (e.g. "claude@alpha" not "nilton@alpha"). The name
-        // needs to be configurable and injected into the init script.
-        //
-        // TODO: Bracketed paste mode (\e[?2004h / \e[?2004l) leaks into the
-        // output stream. Disable it in the init script:
-        //   bind 'set enable-bracketed-paste off' 2>/dev/null
-        let init_content = concat!(
-            "PROMPT_COMMAND='printf \"\\033]999;%d;%s\\007\" $? \"$PWD\"'\n",
-            "set +m\n",
-            "PS1='[$?] \\u@\\h:\\w \\$ '\n",
-        );
-
-        std::fs::write(&init_path, init_content).map_err(|e| TypeError::PtySpawn(e.to_string()))?;
-
-        // 2. Spawn bash with the init file.
+        // 1. Spawn bash with no startup files.
         let mut cmd = Command::new("bash");
-        cmd.arg("--init-file").arg(&init_path);
+        cmd.args(["--norc", "--noprofile", "--noediting"]);
 
         let mut session =
             expectrl::Session::spawn(cmd).map_err(|e| TypeError::PtySpawn(e.to_string()))?;
 
-        // 3. Disable echo so typed input doesn't appear in the output stream.
+        // 2. Disable echo so typed input doesn't appear in the output stream.
         session
             .set_echo(false)
             .map_err(|e| TypeError::PtySpawn(format!("set_echo failed: {e}")))?;
 
-        // 4. Get the shell PID.
+        // 3. Get the shell PID.
         let shell_pid = session.get_process().pid().as_raw() as u32;
 
-        // 5. Wait up to 15 s for the first sentinel (shell ready).
+        // 4. Wait for bash's default prompt so the shell is ready for input.
+        //    Without this, send_line can race with bash's startup and the
+        //    init commands may arrive before bash is fully initialized —
+        //    breaking foreground process group management.
+        use expectrl::Expect;
+        session.set_expect_timeout(Some(Duration::from_secs(1)));
+        let _ = session.expect(expectrl::Regex(r"\$ "));
+
+        // 5. Send the init commands inline. PS1='' ensures no shell prompt
+        //    leaks into the output stream — the harness builds and appends its
+        //    own prompt from sentinel data.
+        session
+            .send_line(
+                "PROMPT_COMMAND='printf \"\\033]999;%d;%s\\007\" $? \"$PWD\"'; PS1=''; set +m; bind 'set enable-bracketed-paste off' 2>/dev/null",
+            )
+            .map_err(|e| TypeError::PtySpawn(format!("send init line failed: {e}")))?;
+
+        // 6. Wait up to 15 s for the first sentinel (shell ready).
         let captures = wait_for_sentinel(&mut session, Duration::from_secs(15))
             .map_err(|e| TypeError::PtySpawn(format!("waiting for initial prompt: {e}")))?;
         let (_, working_directory) = parse_sentinel(&captures);
-
-        // 6. Clean up the temp init file.
-        let _ = std::fs::remove_file(&init_path);
 
         Ok(Self {
             session,
@@ -214,7 +197,9 @@ pub(crate) fn kill_foreground(shell_pid: u32, background_pids: &HashSet<u32>) ->
     // Final check: verify all foreground processes are dead.
     std::thread::sleep(Duration::from_millis(100));
     sys.refresh_processes(ProcessesToUpdate::Some(&foreground_pids), true);
-    foreground_pids.iter().all(|pid| sys.process(*pid).is_none())
+    foreground_pids
+        .iter()
+        .all(|pid| sys.process(*pid).is_none())
 }
 
 /// Kill the shell process itself via SIGKILL.
@@ -239,17 +224,36 @@ pub(crate) fn drain_after_kill(session: &mut OsSession) -> Option<(i32, String)>
         .map(|c| parse_sentinel(&c))
 }
 
-/// Drain the internal buffer of an expectrl session.
+/// Drain the internal buffer of an expectrl session (non-blocking).
 ///
-/// After `expect()` times out or hits EOF, data it read is sitting in the
-/// session's internal buffer. This helper extracts it via `BufRead`.
+/// After `expect()` times out or hits EOF, data it read is sitting in
+/// expectrl's internal buffer (via `keep_in_buffer`). This helper extracts
+/// it without blocking.
+///
+/// We use `check()` (single non-blocking read + pattern match) instead of
+/// `fill_buf()`. The latter delegates to `BufReader::fill_buf()` which
+/// does a blocking `read()` when the BufReader layer is empty — even if
+/// expectrl's own buffer has data. With PS1='', a command that produces
+/// no output (e.g. `sleep`) leaves both the OS fd and BufReader empty,
+/// so `fill_buf()` blocks forever. `check()` correctly consults both
+/// the OS fd (via `read_available`) and expectrl's internal buffer (via
+/// `get_available`), returning immediately in either case.
 pub(crate) fn drain_buf(session: &mut OsSession) -> Result<Vec<u8>, crate::TypeError> {
-    use std::io::BufRead;
-    let buf = session.fill_buf()
-        .map_err(|e| crate::TypeError::PtyRead(e.to_string()))?;
-    let output = buf.to_vec();
-    session.consume(output.len());
-    Ok(output)
+    use expectrl::Expect;
+    // check() does: read_available() (non-blocking OS read into internal
+    // buffer) + get_available() (inspect internal buffer) + needle.check().
+    // The (?s).+ pattern matches any non-empty content across newlines.
+    match session.check(expectrl::Regex(r"(?s).+")) {
+        Ok(captures) => {
+            let mut data = captures.before().to_vec();
+            if let Some(matched) = captures.get(0) {
+                data.extend_from_slice(matched);
+            }
+            Ok(data)
+        }
+        // No data available — return empty without blocking.
+        Err(_) => Ok(vec![]),
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -547,7 +551,10 @@ mod tests {
         .await
         .unwrap();
         let pids = pids.expect("run_jobs_p_sync must succeed on a healthy session");
-        assert!(pids.is_empty(), "freshly spawned shell must report no background jobs");
+        assert!(
+            pids.is_empty(),
+            "freshly spawned shell must report no background jobs"
+        );
     }
 
     #[tokio::test]
@@ -597,7 +604,10 @@ mod tests {
         .await
         .unwrap();
         let pids = pids.expect("run_jobs_p_sync must succeed");
-        assert!(pids.is_empty(), "completed background job must not appear in jobs -p");
+        assert!(
+            pids.is_empty(),
+            "completed background job must not appear in jobs -p"
+        );
     }
 
     // ── kill_foreground ───────────────────────────────────────────────────
@@ -644,8 +654,7 @@ mod tests {
             // Start a background job and record its PID.
             pty.session.send_line("sleep 9999 &").unwrap();
             wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
-            let bg_pids = run_jobs_p_sync(&mut pty.session)
-                .expect("run_jobs_p_sync must succeed");
+            let bg_pids = run_jobs_p_sync(&mut pty.session).expect("run_jobs_p_sync must succeed");
             assert_eq!(bg_pids.len(), 1, "expected exactly one background job");
             let bg_pid = *bg_pids.iter().next().unwrap();
 
@@ -659,8 +668,8 @@ mod tests {
             wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
 
             // The background job must still be running.
-            let remaining = run_jobs_p_sync(&mut pty.session)
-                .expect("run_jobs_p_sync must succeed");
+            let remaining =
+                run_jobs_p_sync(&mut pty.session).expect("run_jobs_p_sync must succeed");
             remaining.contains(&bg_pid)
         })
         .await
@@ -694,8 +703,8 @@ mod tests {
         })
         .await
         .unwrap();
-        let (exit_code, working_directory) = cwd
-            .expect("drain_after_kill must return Some after a successful kill");
+        let (exit_code, working_directory) =
+            cwd.expect("drain_after_kill must return Some after a successful kill");
         assert_eq!(
             working_directory, "/",
             "drained CWD must match the directory set before the kill"
