@@ -90,6 +90,12 @@ const DRAIN_FAILURE_EXIT_CODE: i32 = -1;
 /// values (e.g., `f64::MAX` ≈ 1.8e308 overflows `Duration`'s internal `u64`).
 const MAX_TIMEOUT_SECS: f64 = 86_400.0;
 
+/// Maximum number of characters in the output body (before the prompt suffix).
+///
+/// Outputs exceeding this limit are truncated using head+tail with a marker in
+/// the middle, so the model sees how the output started and ended.
+const MAX_OUTPUT_CHARS: usize = 32_000;
+
 // ── Arguments & output ──────────────────────────────────────────────────────
 
 /// Arguments for the `terminal` tool.
@@ -139,11 +145,51 @@ impl TerminalArgs {
     }
 }
 
+/// Truncate `output` if it exceeds `max_chars` using head+tail with a marker.
+///
+/// Returns `(possibly_truncated_string, was_truncated)`. When truncation
+/// occurs, the first 60% and last 40% of the budget (minus marker) are kept.
+fn truncate_output(output: String, max_chars: usize) -> (String, bool) {
+    let char_count = output.chars().count();
+    if char_count <= max_chars {
+        return (output, false);
+    }
+
+    let omitted = char_count - max_chars;
+    // Build the marker first so we know its length.
+    let marker = format!(
+        "\n\n--- OUTPUT TRUNCATED ({omitted} characters omitted) ---\n\n"
+    );
+    let marker_chars = marker.chars().count();
+
+    // Budget available for head + tail after subtracting the marker.
+    let budget = max_chars.saturating_sub(marker_chars);
+    let head_chars = budget * 3 / 5; // 60 %
+    let tail_chars = budget - head_chars; // 40 %
+
+    // Find byte offsets on char boundaries.
+    let head_end: usize = output.char_indices().nth(head_chars).map_or(output.len(), |(i, _)| i);
+    let tail_start: usize = output
+        .char_indices()
+        .nth(char_count - tail_chars)
+        .map_or(output.len(), |(i, _)| i);
+
+    let mut result = String::with_capacity(head_end + marker.len() + (output.len() - tail_start));
+    result.push_str(&output[..head_end]);
+    result.push_str(&marker);
+    result.push_str(&output[tail_start..]);
+
+    (result, true)
+}
+
 /// Output returned to the model after a `terminal` call.
 #[derive(Debug, Serialize)]
 pub struct TerminalOutput {
     /// Terminal output captured between the keystroke and the next prompt (or timeout).
     pub output: String,
+
+    /// `true` when the output exceeded [`MAX_OUTPUT_CHARS`] and was truncated.
+    pub output_truncated: bool,
 
     /// What happened after the keystrokes were sent.
     pub outcome: Outcome,
@@ -671,6 +717,7 @@ impl Tool for TerminalTool {
 
             return Ok(TerminalOutput {
                 output,
+                output_truncated: false,
                 outcome: Outcome::Reset { working_directory },
             });
         }
@@ -831,7 +878,8 @@ impl Tool for TerminalTool {
             self.job_manager.lock().unwrap().sync(&active_pids);
         }
 
-        let mut output = String::from_utf8_lossy(&output_bytes).into_owned();
+        let output = String::from_utf8_lossy(&output_bytes).into_owned();
+        let (mut output, output_truncated) = truncate_output(output, MAX_OUTPUT_CHARS);
 
         // Append the harness-built prompt so the model sees exit code, identity,
         // and location context at the end of every command's output.
@@ -863,7 +911,11 @@ impl Tool for TerminalTool {
             }
         }
 
-        Ok(TerminalOutput { output, outcome })
+        Ok(TerminalOutput {
+            output,
+            output_truncated,
+            outcome,
+        })
     }
 }
 
@@ -977,6 +1029,76 @@ mod tests {
         manager.sync(&HashSet::from([42])); // still running
 
         assert!(!*fired.lock().unwrap());
+    }
+
+    // truncate_output
+
+    #[test]
+    fn truncate_output_noop_under_limit() {
+        let input = "hello world".to_string();
+        let (result, truncated) = truncate_output(input.clone(), 100);
+        assert_eq!(result, input);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn truncate_output_noop_at_exact_limit() {
+        let input = "a".repeat(50);
+        let (result, truncated) = truncate_output(input.clone(), 50);
+        assert_eq!(result, input);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn truncate_output_truncates_over_limit() {
+        // 1000 chars, limit 200 → must truncate
+        let input: String = (0..1000u16).map(|i| (b'A' + (i % 26) as u8) as char).collect();
+        let (result, truncated) = truncate_output(input.clone(), 200);
+        assert!(truncated);
+        // Result must start with head of input and end with tail of input
+        assert!(result.starts_with(&input[..10]));
+        assert!(result.ends_with(&input[input.len() - 10..]));
+        assert!(result.contains("OUTPUT TRUNCATED"));
+        assert!(result.contains("800 characters omitted"));
+    }
+
+    #[test]
+    fn truncate_output_marker_shows_correct_omitted_count() {
+        let input = "x".repeat(1000);
+        let (result, truncated) = truncate_output(input, 200);
+        assert!(truncated);
+        assert!(result.contains("800 characters omitted"));
+    }
+
+    #[test]
+    fn truncate_output_respects_char_boundaries() {
+        // Multi-byte UTF-8: each char is 4 bytes (emoji)
+        let input: String = std::iter::repeat('🦀').take(100).collect();
+        let (result, truncated) = truncate_output(input, 50);
+        assert!(truncated);
+        // Must not panic and must be valid UTF-8
+        assert!(result.is_char_boundary(0));
+        assert!(result.contains("OUTPUT TRUNCATED"));
+    }
+
+    #[test]
+    fn truncate_output_head_tail_ratio() {
+        // With a large enough input, head should be ~60% and tail ~40% of budget.
+        let input: String = (0..10_000).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        let (result, truncated) = truncate_output(input.clone(), 1000);
+        assert!(truncated);
+
+        let marker_pos = result.find("\n\n--- OUTPUT TRUNCATED").unwrap();
+        let marker_end = result.find("---\n\n").unwrap() + "---\n\n".len();
+        let head_len = result[..marker_pos].chars().count();
+        let tail_len = result[marker_end..].chars().count();
+
+        // Head should be roughly 60% of (1000 - marker_chars).
+        // Just verify head > tail (60/40 split).
+        assert!(
+            head_len > tail_len,
+            "head ({head_len}) should be larger than tail ({tail_len})"
+        );
     }
 
     // Tool definition
