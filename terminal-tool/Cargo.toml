@@ -9,8 +9,18 @@ otel = ["agent", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetr
 
 [dev-dependencies]
 regex = "1"
+tempfile = "3.26.0"
 
 [dependencies]
+# Agent binary dependencies (optional)
+anyhow = { version = "1", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+opentelemetry = { version = "0.30", optional = true }
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.30", optional = true }
+tracing-opentelemetry = { version = "0.31", optional = true }
+
 # Key encoding pipeline: crokey (parse notation) → terminput (encode to xterm bytes).
 # These versions are coupled via crossterm 0.29. When upgrading, find a set of
 # versions where crokey's re-exported crossterm matches terminput-crossterm's
@@ -27,15 +37,7 @@ serde_json = "1"
 sysinfo = "0.38.2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-
-# Agent binary dependencies (optional)
-anyhow = { version = "1", optional = true }
-tracing = { version = "0.1", optional = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
-opentelemetry = { version = "0.30", optional = true }
-opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.30", optional = true }
-tracing-opentelemetry = { version = "0.31", optional = true }
+shell-escape = "0.1.5"
 
 [[bin]]
 name = "agent"

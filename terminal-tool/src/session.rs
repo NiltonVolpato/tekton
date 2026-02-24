@@ -3,7 +3,7 @@
 //! [`PtySession`] wraps an `expectrl::OsSession` (a persistent bash PTY)
 //! and provides the sentinel-aware helpers used by [`crate::TerminalTool::call`].
 
-use std::{collections::HashSet, process::Command, time::Duration};
+use std::{collections::HashSet, path::Path, process::Command, time::Duration};
 
 use sysinfo::{Pid as SysPid, ProcessesToUpdate, Signal, System};
 
@@ -21,6 +21,24 @@ pub(crate) const SENTINEL_REGEX: &str = r"\x1b\]999;(\d+);([^\x07]*)\x07";
 /// Drain timeout after killing the foreground process.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Environment variables inherited from the parent process (if set).
+///
+/// Everything else is cleared via `env_clear()` to prevent credential
+/// exfiltration (e.g. `OPENAI_API_KEY`) and unexpected behavior from
+/// IDE-specific or locale variables.
+const INHERITED_VARS: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "DISPLAY",
+    "SSH_AUTH_SOCK",
+    "XDG_DATA_DIRS",
+];
+
 /// A persistent bash PTY session.
 pub(crate) struct PtySession {
     /// The underlying expectrl session.
@@ -34,18 +52,58 @@ pub(crate) struct PtySession {
 impl PtySession {
     /// Spawn a new bash PTY session and wait for the initial prompt sentinel.
     ///
+    /// If `init_file` is provided, it is sourced inline before the harness
+    /// init commands, so user customizations (env vars, aliases, functions)
+    /// load but prompt control remains with the harness.
+    ///
     /// All blocking PTY I/O runs inside `spawn_blocking` so it does not starve
     /// the async executor when multiple sessions are created concurrently.
-    pub(crate) async fn spawn() -> Result<Self, TerminalError> {
-        tokio::task::spawn_blocking(Self::spawn_blocking_inner)
+    pub(crate) async fn spawn(
+        init_file: Option<std::path::PathBuf>,
+    ) -> Result<Self, TerminalError> {
+        tokio::task::spawn_blocking(move || Self::spawn_blocking_inner(init_file.as_deref()))
             .await
             .map_err(|e| TerminalError::PtySpawn(format!("spawn_blocking panicked: {e}")))?
     }
 
-    pub(crate) fn spawn_blocking_inner() -> Result<Self, TerminalError> {
-        // 1. Spawn bash with no startup files.
+    pub(crate) fn spawn_blocking_inner(
+        init_file: Option<&Path>,
+    ) -> Result<Self, TerminalError> {
+        // 1. Build the bash command with a sanitized environment.
         let mut cmd = Command::new("bash");
+        // --norc: we source the user's init file inline (step 5) so bash must
+        //         not source any rc files on its own.
+        // --noediting: disables readline, which also prevents it from enabling
+        //              bracketed paste mode (ESC[?2004h). Without readline,
+        //              the terminal never wraps pasted text in ESC[200~/ESC[201~
+        //              sequences that would pollute our output stream.
         cmd.args(["--norc", "--noprofile", "--noediting"]);
+
+        // Clear the inherited environment and selectively re-add safe variables.
+        cmd.env_clear();
+        for &var in INHERITED_VARS {
+            if let Ok(value) = std::env::var(var) {
+                cmd.env(var, value);
+            }
+        }
+        // Pass through all TEKTON_* env vars for framework-level configuration.
+        for (key, value) in std::env::vars() {
+            if key.starts_with("TEKTON_") {
+                cmd.env(key, value);
+            }
+        }
+
+        // Override with fixed values to ensure predictable behavior.
+        cmd.env("LANG", "C.UTF-8");
+        cmd.env("LC_ALL", "C.UTF-8");
+        cmd.env("EDITOR", "false");
+        cmd.env("VISUAL", "false");
+        cmd.env("GIT_EDITOR", "false");
+        cmd.env("PAGER", "cat");
+        // Set a known PS1 so the prompt-wait in step 4 has a reliable needle.
+        // The init file is sourced inline (step 5), so nothing can override
+        // this before the first prompt appears.
+        cmd.env("PS1", "$ ");
 
         let mut session =
             expectrl::Session::spawn(cmd).map_err(|e| TerminalError::PtySpawn(e.to_string()))?;
@@ -58,13 +116,10 @@ impl PtySession {
         // 3. Get the shell PID.
         let shell_pid = session.get_process().pid().as_raw() as u32;
 
-        // 4. Wait for bash's default prompt so the shell is ready for input.
+        // 4. Wait for the known PS1 prompt so the shell is ready for input.
         //    Without this, send_line can race with bash's startup and the
         //    init commands may arrive before bash is fully initialized —
         //    breaking foreground process group management.
-
-        // Wait for bash's default prompt using the same check-sleep loop
-        // to avoid the CPU-spinning expect() method.
         {
             let deadline = std::time::Instant::now() + Duration::from_secs(1);
             let needle = expectrl::Regex(r"\$ ");
@@ -73,7 +128,7 @@ impl PtySession {
                     Ok(captures) if !captures.is_empty() => break,
                     Ok(_) => {
                         if std::time::Instant::now() >= deadline {
-                            break; // Best-effort, like the original code.
+                            break; // Best-effort.
                         }
                         std::thread::sleep(POLL_INTERVAL);
                     }
@@ -82,13 +137,20 @@ impl PtySession {
             }
         }
 
-        // 5. Send the init commands inline. PS1='' ensures no shell prompt
-        //    leaks into the output stream — the harness builds and appends its
-        //    own prompt from sentinel data.
+        // 5. Source the user's init file (if any) and send harness init commands
+        //    in a single line. The init file loads first (env vars, aliases,
+        //    functions), then we overwrite PS1 and PROMPT_COMMAND so the harness
+        //    has full prompt control regardless of what the init file set.
+        const HARNESS_INIT: &str =
+            "PROMPT_COMMAND='printf \"\\033]999;%d;%s\\007\" $? \"$PWD\"'; PS1=''; set +m";
+        let init_line = if let Some(path) = init_file {
+            let escaped = shell_escape::escape(path.display().to_string().into());
+            format!("source {escaped}; {HARNESS_INIT}")
+        } else {
+            HARNESS_INIT.to_string()
+        };
         session
-            .send_line(
-                "PROMPT_COMMAND='printf \"\\033]999;%d;%s\\007\" $? \"$PWD\"'; PS1=''; set +m; bind 'set enable-bracketed-paste off' 2>/dev/null",
-            )
+            .send_line(&init_line)
             .map_err(|e| TerminalError::PtySpawn(format!("send init line failed: {e}")))?;
 
         // 6. Wait up to 15 s for the first sentinel (shell ready).
@@ -472,7 +534,7 @@ mod tests {
 
     #[tokio::test]
     async fn parse_sentinel_exit_code_zero_for_true() {
-        let pty = PtySession::spawn().await.unwrap();
+        let pty = PtySession::spawn(None).await.unwrap();
         let (exit_code, _) = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
     
@@ -487,7 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn parse_sentinel_exit_code_one_for_false() {
-        let pty = PtySession::spawn().await.unwrap();
+        let pty = PtySession::spawn(None).await.unwrap();
         let (exit_code, _) = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
     
@@ -503,7 +565,7 @@ mod tests {
     #[tokio::test]
     async fn parse_sentinel_arbitrary_exit_code() {
         // Verifies that exit codes other than 0 and 1 are faithfully relayed.
-        let pty = PtySession::spawn().await.unwrap();
+        let pty = PtySession::spawn(None).await.unwrap();
         let (exit_code, _) = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
     
@@ -520,7 +582,7 @@ mod tests {
     async fn parse_sentinel_cwd_is_root_after_cd_slash() {
         // The sentinel's CWD field must reflect the real working directory.
         // Using "/" avoids the macOS /tmp → /private/tmp symlink ambiguity.
-        let pty = PtySession::spawn().await.unwrap();
+        let pty = PtySession::spawn(None).await.unwrap();
         let (_, cwd) = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
     
@@ -542,7 +604,7 @@ mod tests {
         //
         // This test was previously a known-failing bug-documentation test.
         // The fix — changing .unwrap_or(0) to .unwrap_or(-1) — has been applied.
-        let pty = PtySession::spawn().await.unwrap();
+        let pty = PtySession::spawn(None).await.unwrap();
         let exit_code = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
     
@@ -573,7 +635,7 @@ mod tests {
     async fn wait_for_sentinel_times_out_when_no_new_sentinel_emitted() {
         // After spawn the initial sentinel is consumed. With no command sent,
         // no new sentinel arrives and wait_for_sentinel must return ExpectTimeout.
-        let pty = PtySession::spawn().await.unwrap();
+        let pty = PtySession::spawn(None).await.unwrap();
         let result = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
             // No command sent — no sentinel will arrive.
@@ -593,7 +655,7 @@ mod tests {
     async fn wait_for_sentinel_does_not_dramatically_overshoot_timeout() {
         // Guards against an implementation that loops with a fixed sleep much
         // larger than POLL_INTERVAL, making the effective timeout 10× the request.
-        let pty = PtySession::spawn().await.unwrap();
+        let pty = PtySession::spawn(None).await.unwrap();
         let start = std::time::Instant::now();
         let _result = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
@@ -613,7 +675,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_jobs_p_sync_empty_when_no_background_jobs() {
-        let pty = PtySession::spawn().await.unwrap();
+        let pty = PtySession::spawn(None).await.unwrap();
         let pids = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
             run_jobs_p_sync(&mut pty.session)
@@ -629,7 +691,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_jobs_p_sync_returns_pid_of_running_background_job() {
-        let pty = PtySession::spawn().await.unwrap();
+        let pty = PtySession::spawn(None).await.unwrap();
         let pids = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
     
@@ -658,7 +720,7 @@ mod tests {
         //
         // Note: run_jobs_p_sync itself now runs `true` first, plus the explicit
         // one below — two reap cycles, ensuring robustness.
-        let pty = PtySession::spawn().await.unwrap();
+        let pty = PtySession::spawn(None).await.unwrap();
         let pids = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
     
@@ -684,7 +746,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_foreground_terminates_running_foreground_process() {
-        let pty = PtySession::spawn().await.unwrap();
+        let pty = PtySession::spawn(None).await.unwrap();
         let shell_pid = pty.shell_pid;
         let result = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
@@ -715,7 +777,7 @@ mod tests {
         // A PID listed in `background_pids` must survive kill_foreground.
         // This is the mechanism that prevents the harness from accidentally
         // killing long-running background tasks when a foreground command times out.
-        let pty = PtySession::spawn().await.unwrap();
+        let pty = PtySession::spawn(None).await.unwrap();
         let shell_pid = pty.shell_pid;
         let bg_survived = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
@@ -753,7 +815,7 @@ mod tests {
     async fn drain_after_kill_returns_cwd_from_post_kill_sentinel() {
         // After kill_foreground, bash runs PROMPT_COMMAND and emits a new sentinel.
         // drain_after_kill must extract the CWD from that sentinel and return it.
-        let pty = PtySession::spawn().await.unwrap();
+        let pty = PtySession::spawn(None).await.unwrap();
         let shell_pid = pty.shell_pid;
         let cwd = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
@@ -784,5 +846,136 @@ mod tests {
             exit_code == 130 || exit_code == 143 || exit_code == 137,
             "killed process exit code must be 130 (SIGINT), 143 (SIGTERM), or 137 (SIGKILL); got: {exit_code}"
         );
+    }
+
+    // ── Environment sanitization ────────────────────────────────────────
+
+    /// Helper: run `echo $VAR` in a PTY session and return the trimmed output.
+    async fn env_var_in_pty(var: &str) -> String {
+        let pty = PtySession::spawn(None).await.unwrap();
+        let var = var.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut pty = pty;
+            // Use printf to avoid a trailing newline from echo.
+            pty.session
+                .send_line(&format!("printf '%s' \"${var}\"", var = var))
+                .unwrap();
+            let caps = wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
+            String::from_utf8_lossy(caps.before()).to_string()
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn env_sanitized_api_keys_not_inherited() {
+        // Set a fake API key in the parent process and verify the child doesn't see it.
+        // Safety: env::set_var is fine in tests — each PTY is a separate process.
+        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-secret-key") };
+        let value = env_var_in_pty("OPENAI_API_KEY").await;
+        assert_eq!(value, "", "OPENAI_API_KEY must not be inherited by the PTY shell");
+    }
+
+    #[tokio::test]
+    async fn env_sanitized_tekton_vars_passed_through() {
+        unsafe { std::env::set_var("TEKTON_TEST_VAR", "hello_from_tekton") };
+        let value = env_var_in_pty("TEKTON_TEST_VAR").await;
+        assert_eq!(value, "hello_from_tekton", "TEKTON_* vars must be passed through");
+    }
+
+    #[tokio::test]
+    async fn env_sanitized_path_inherited() {
+        let value = env_var_in_pty("PATH").await;
+        assert!(
+            !value.is_empty(),
+            "PATH must be inherited from the parent process"
+        );
+        assert_eq!(
+            value,
+            std::env::var("PATH").unwrap(),
+            "PATH in child must match parent PATH"
+        );
+    }
+
+    #[tokio::test]
+    async fn env_sanitized_home_inherited() {
+        let value = env_var_in_pty("HOME").await;
+        assert_eq!(
+            value,
+            std::env::var("HOME").unwrap(),
+            "HOME in child must match parent HOME"
+        );
+    }
+
+    #[tokio::test]
+    async fn env_sanitized_term_inherited() {
+        let value = env_var_in_pty("TERM").await;
+        // TERM may differ from parent (expectrl may set its own), but it must be non-empty.
+        assert!(
+            !value.is_empty(),
+            "TERM must be set in the PTY shell"
+        );
+    }
+
+    #[tokio::test]
+    async fn env_sanitized_lang_overridden() {
+        let value = env_var_in_pty("LANG").await;
+        assert_eq!(value, "C.UTF-8", "LANG must be overridden to C.UTF-8");
+    }
+
+    #[tokio::test]
+    async fn env_sanitized_lc_all_overridden() {
+        let value = env_var_in_pty("LC_ALL").await;
+        assert_eq!(value, "C.UTF-8", "LC_ALL must be overridden to C.UTF-8");
+    }
+
+    #[tokio::test]
+    async fn env_sanitized_editor_overridden() {
+        let value = env_var_in_pty("EDITOR").await;
+        assert_eq!(value, "false", "EDITOR must be overridden to 'false'");
+    }
+
+    #[tokio::test]
+    async fn env_sanitized_pager_overridden() {
+        let value = env_var_in_pty("PAGER").await;
+        assert_eq!(value, "cat", "PAGER must be overridden to 'cat'");
+    }
+
+    // ── Init file ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn init_file_exports_are_available() {
+        // Create a temp init file that exports FOO=bar.
+        let dir = tempfile::tempdir().unwrap();
+        let init_path = dir.path().join("init.sh");
+        std::fs::write(&init_path, "export FOO=bar\n").unwrap();
+
+        let pty = PtySession::spawn(Some(init_path)).await.unwrap();
+        let value = tokio::task::spawn_blocking(move || {
+            let mut pty = pty;
+            pty.session
+                .send_line("printf '%s' \"$FOO\"")
+                .unwrap();
+            let caps = wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
+            String::from_utf8_lossy(caps.before()).to_string()
+        })
+        .await
+        .unwrap();
+        assert_eq!(value, "bar", "init file export must be available in the shell");
+    }
+
+    #[tokio::test]
+    async fn init_file_none_works_normally() {
+        // Passing None for init_file must not cause any errors.
+        let pty = PtySession::spawn(None).await.unwrap();
+        let exit_code = tokio::task::spawn_blocking(move || {
+            let mut pty = pty;
+            pty.session.send_line("true").unwrap();
+            let caps = wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
+            parse_sentinel(&caps).0
+        })
+        .await
+        .unwrap();
+        assert_eq!(exit_code, 0);
     }
 }

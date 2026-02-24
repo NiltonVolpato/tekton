@@ -465,6 +465,13 @@ pub struct TerminalTool {
 
     /// Agent name shown in the prompt (e.g. "claude"). Empty = no name prefix.
     agent_name: String,
+
+    /// Optional bash init file sourced via `--init-file` on shell startup.
+    ///
+    /// When set, bash sources this file instead of `--norc`, allowing user
+    /// customizations (env vars, aliases, functions) to load before the
+    /// harness takes over with its own `PROMPT_COMMAND` and `PS1`.
+    init_file: Option<std::path::PathBuf>,
 }
 
 impl TerminalTool {
@@ -478,6 +485,7 @@ impl TerminalTool {
             session: Arc::new(tokio::sync::Mutex::new(None)),
             job_manager: Arc::new(Mutex::new(JobManager::new())),
             agent_name: String::new(),
+            init_file: None,
         }
     }
 
@@ -490,16 +498,27 @@ impl TerminalTool {
         self
     }
 
+    /// Set a bash init file sourced via `--init-file` on shell startup.
+    ///
+    /// The file is sourced before the harness injects its own `PROMPT_COMMAND`
+    /// and `PS1`, so user customizations (env vars, aliases, functions) are
+    /// available but prompt control remains with the harness.
+    pub fn with_init_file(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.init_file = Some(path.into());
+        self
+    }
+
     /// Spawn a bash PTY session and return a fully initialized `TerminalTool`.
     ///
     /// Consumes `self` (from the builder chain) and returns an initialized tool.
     /// Use [`working_directory`](Self::working_directory) to read the initial `$PWD`.
     pub async fn spawn(self) -> Result<Self, TerminalError> {
-        let pty_session = session::PtySession::spawn().await?;
+        let pty_session = session::PtySession::spawn(self.init_file.clone()).await?;
         Ok(Self {
             session: Arc::new(tokio::sync::Mutex::new(Some(pty_session))),
             job_manager: self.job_manager,
             agent_name: self.agent_name,
+            init_file: self.init_file,
         })
     }
 
@@ -536,6 +555,7 @@ impl TerminalTool {
             session: self.session,
             job_manager: Arc::new(Mutex::new(manager)),
             agent_name: self.agent_name,
+            init_file: self.init_file,
         }
     }
 
@@ -704,8 +724,8 @@ impl Tool for TerminalTool {
                 session::kill_shell(pty.shell_pid);
             }
 
-            // Spawn a fresh session.
-            let new_pty = session::PtySession::spawn().await?;
+            // Spawn a fresh session (re-applying init file if configured).
+            let new_pty = session::PtySession::spawn(self.init_file.clone()).await?;
             let working_directory = new_pty.working_directory.clone();
             *guard = Some(new_pty);
 
@@ -776,6 +796,7 @@ impl Tool for TerminalTool {
         //     still alive (Waiting) or gone (ShellExited), so we have no fresh `jobs -p`
         //     snapshot.
         let timeout_secs = timeout.as_secs_f64();
+        let init_file = self.init_file.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<_, TerminalError> {
             let mut guard = guard;
             let pty = guard.as_mut().ok_or(TerminalError::SessionNotInitialized)?;
@@ -816,7 +837,7 @@ impl Tool for TerminalTool {
                         // Foreground processes survived SIGKILL — the shell is
                         // unrecoverable. Kill it entirely and respawn.
                         session::kill_shell(shell_pid);
-                        let new_pty = session::PtySession::spawn_blocking_inner()?;
+                        let new_pty = session::PtySession::spawn_blocking_inner(init_file.as_deref())?;
                         let cwd = new_pty.working_directory.clone();
                         *guard = Some(new_pty);
                         let outcome = Outcome::ShellExited {
@@ -856,7 +877,7 @@ impl Tool for TerminalTool {
                     let output = session::drain_buf(&mut pty.session)?;
 
                     // Respawn a fresh session so the next call() works.
-                    let new_pty = session::PtySession::spawn_blocking_inner()?;
+                    let new_pty = session::PtySession::spawn_blocking_inner(init_file.as_deref())?;
                     let cwd = new_pty.working_directory.clone();
                     *guard = Some(new_pty);
 
