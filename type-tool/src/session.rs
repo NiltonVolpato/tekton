@@ -63,8 +63,24 @@ impl PtySession {
         //    init commands may arrive before bash is fully initialized —
         //    breaking foreground process group management.
 
-        session.set_expect_timeout(Some(Duration::from_secs(1)));
-        let _ = session.expect(expectrl::Regex(r"\$ "));
+        // Wait for bash's default prompt using the same check-sleep loop
+        // to avoid the CPU-spinning expect() method.
+        {
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let needle = expectrl::Regex(r"\$ ");
+            loop {
+                match session.check(&needle) {
+                    Ok(captures) if !captures.is_empty() => break,
+                    Ok(_) => {
+                        if std::time::Instant::now() >= deadline {
+                            break; // Best-effort, like the original code.
+                        }
+                        std::thread::sleep(POLL_INTERVAL);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
 
         // 5. Send the init commands inline. PS1='' ensures no shell prompt
         //    leaks into the output stream — the harness builds and appends its
@@ -88,13 +104,14 @@ impl PtySession {
     }
 }
 
+/// Poll interval for [`wait_for_sentinel`]'s check-sleep loop.
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// Wait for the next OSC 999 prompt sentinel.
 ///
-/// Uses expectrl's built-in `expect()` with its timeout mechanism.
-///
-/// TODO: Verify that `expect()` does not cause high CPU usage under concurrent
-/// load. The old polling implementation assumed it did, but that was never
-/// confirmed.
+/// Polls with [`expectrl::Session::check`] in a loop, sleeping
+/// [`POLL_INTERVAL`] between attempts to avoid busy-waiting. The built-in
+/// `expect()` method uses a tight busy-wait loop that burns CPU.
 ///
 /// Returns the [`expectrl::Captures`] on success, or
 /// [`expectrl::Error::ExpectTimeout`] if `timeout` elapses first.
@@ -102,8 +119,21 @@ pub(crate) fn wait_for_sentinel(
     session: &mut OsSession,
     timeout: Duration,
 ) -> Result<expectrl::Captures, expectrl::Error> {
-    session.set_expect_timeout(Some(timeout));
-    session.expect(expectrl::Regex(SENTINEL_REGEX))
+    let deadline = std::time::Instant::now() + timeout;
+    let needle = expectrl::Regex(SENTINEL_REGEX);
+    loop {
+        match session.check(&needle) {
+            Ok(captures) if !captures.is_empty() => return Ok(captures),
+            Ok(_) => {
+                // No match yet — data (if any) stays in the internal buffer.
+                if std::time::Instant::now() >= deadline {
+                    return Err(expectrl::Error::ExpectTimeout);
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Extract `(exit_code, cwd)` from OSC sentinel regex captures.
