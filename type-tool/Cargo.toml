@@ -1,5 +1,5 @@
 [package]
-name = "tekton-type-tool"
+name = "tekton-terminal-tool"
 version = "0.0.0"
 edition = "2024"
 
@@ -11,6 +11,14 @@ otel = ["agent", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetr
 regex = "1"
 
 [dependencies]
+# Key encoding pipeline: crokey (parse notation) → terminput (encode to xterm bytes).
+# These versions are coupled via crossterm 0.29. When upgrading, find a set of
+# versions where crokey's re-exported crossterm matches terminput-crossterm's
+# supported crossterm version.
+crokey = "1.4.0"
+terminput = "0.5"
+terminput-crossterm = "0.4"
+
 expectrl = "0.8"
 libc = "0.2"
 rig-core = "0.31.0"

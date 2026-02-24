@@ -8,7 +8,7 @@ use rig::{
     prelude::*,
     providers::openai,
 };
-use tekton_type_tool::TypeTool;
+use tekton_terminal_tool::TerminalTool;
 use tracing::Level;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
     // Set OPENAI_BASE_URL to point at a local server.
     let client = openai::CompletionsClient::from_env();
 
-    let tool = TypeTool::new()
+    let tool = TerminalTool::new()
         .with_name("agent")
         .with_job_callback(|notification| {
             eprintln!(
@@ -113,17 +113,16 @@ async fn main() -> Result<()> {
         .preamble("\
 You're a helpful assistant. You can chat with the user and you have access to \
 a terminal from which you can execute linux commands on bash.
-The tool `type` gives you access to this terminal, by sending keystrokes.
+The tool `terminal` gives you access to this terminal.
 
-The terminal is interactive, so remember to press Enter (represented by `\\n` at the end of keys) to execute commands.
+Use `command` to run shell commands (Enter is sent automatically):
+  `{\"command\": \"ls -la\"}`
 
-Examples:
-- Run a command (including the Enter key \\n)
-  `{\"keys\": \"ls -la\\n\"}`
-- Send Ctrl-C (no \\n):
-  `{\"keys\": \"\\u0003\"}`
+Use `control` for special/control keys (in key notation):
+  `{\"control\": \"ctrl-c\"}`
 
-Incorrect: `{\"keys\": \"ls -la\"}` as it's missing the Enter key `\\n`
+Multiple control keys can be space-separated:
+  `{\"control\": \"ctrl-c ctrl-d\"}`
 
 ",
         )

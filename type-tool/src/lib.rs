@@ -1,24 +1,26 @@
-//! The Tekton `type` tool — sends keystrokes to a persistent PTY session.
+//! The Tekton `terminal` tool — sends commands and control keys to a persistent PTY session.
 //!
-//! This is the single LLM-facing tool in the Tekton framework. The model sends
-//! keystrokes to a terminal the same way a human would: by typing. Everything
-//! else — file I/O, web search, code execution, sub-agents — is a shell command.
+//! This is the single LLM-facing tool in the Tekton framework. The model
+//! interacts with a terminal by sending shell commands (with implicit Enter)
+//! or control/special keys (in human-readable notation like `ctrl-c`).
+//! Everything else — file I/O, web search, code execution, sub-agents — is
+//! a shell command.
 //!
 //! # Harness wiring
 //!
 //! After constructing the tool and before passing it to the agent builder,
-//! the harness calls [`TypeTool::spawn_watcher`] to start a background task
+//! the harness calls [`TerminalTool::spawn_watcher`] to start a background task
 //! that polls `sysinfo` for tracked PIDs. When a PID disappears from the
 //! process table, [`JobManager::retain`] fires the completion callback.
 //!
-//! [`TypeTool::call`] handles **discovery** of new background jobs (via
+//! [`TerminalTool::call`] handles **discovery** of new background jobs (via
 //! `jobs -p`) and also detects completions. The watcher handles completions
 //! while the tool is idle. Both paths are safe to run concurrently: `retain()`
 //! never adds PIDs, so there is no risk of re-introducing a reaped PID.
 //!
 //! ```no_run
 //! use std::sync::{Arc, Mutex};
-//! use tekton_type_tool::TypeTool;
+//! use tekton_terminal_tool::TerminalTool;
 //! use rig::{
 //!     agent::AgentBuilder,
 //!     client::{CompletionClient, ProviderClient},
@@ -30,7 +32,7 @@
 //!     let anthropic = anthropic::Client::from_env();
 //!     let model = anthropic.completion_model(CLAUDE_4_SONNET);
 //!
-//!     let tool = TypeTool::new()
+//!     let tool = TerminalTool::new()
 //!         .with_name("claude")
 //!         .with_job_callback(|notif| {
 //!             // Queue a proactive message to the agent, wake it up if idle, etc.
@@ -46,8 +48,8 @@
 //!
 //!     let agent = AgentBuilder::new(model)
 //!         .preamble(&format!(
-//!             "You're looking at a terminal. The only tool you have is `type`, \
-//!              which sends keystrokes to the terminal.\n\n\
+//!             "You're looking at a terminal. The only tool you have is `terminal`, \
+//!              which sends commands and control keys to the terminal.\n\n\
 //!              The terminal says:\n\n\
 //!              $?=0 claude:{cwd} $ ",
 //!         ))
@@ -83,20 +85,25 @@ const DRAIN_FAILURE_EXIT_CODE: i32 = -1;
 
 /// Maximum allowed timeout in seconds (~24 hours).
 ///
-/// Values above this are rejected with [`TypeError::InvalidTimeout`].
+/// Values above this are rejected with [`TerminalError::InvalidTimeout`].
 /// This prevents panics in [`Duration::from_secs_f64`] for very large finite
 /// values (e.g., `f64::MAX` ≈ 1.8e308 overflows `Duration`'s internal `u64`).
 const MAX_TIMEOUT_SECS: f64 = 86_400.0;
 
 // ── Arguments & output ──────────────────────────────────────────────────────
 
-/// Arguments for the `type` tool.
+/// Arguments for the `terminal` tool.
 #[derive(Debug, Deserialize)]
-pub struct TypeArgs {
-    /// Keystrokes to send to the terminal.
-    ///
-    /// Supports JSON escape sequences: `\n` for Enter, `\u0003` for Ctrl-C, etc.
-    pub keys: String,
+pub struct TerminalArgs {
+    /// Shell command to execute. Enter is sent automatically.
+    /// Mutually exclusive with `control`.
+    pub command: Option<String>,
+
+    /// Control/special keys to send, in crokey notation.
+    /// Examples: `"ctrl-c"`, `"alt-f"`, `"shift-Up"`, `"ctrl-alt-w"`.
+    /// Space-separated for sequences: `"ctrl-c ctrl-d"`.
+    /// Mutually exclusive with `command`.
+    pub control: Option<String>,
 
     /// Timeout behavior on expiry.
     ///
@@ -121,7 +128,7 @@ pub struct TypeArgs {
     pub reset: bool,
 }
 
-impl TypeArgs {
+impl TerminalArgs {
     /// Resolved timeout: caller's value, or the mode-appropriate default.
     pub fn resolved_timeout(&self) -> f64 {
         self.timeout.unwrap_or(if self.interactive {
@@ -132,9 +139,9 @@ impl TypeArgs {
     }
 }
 
-/// Output returned to the model after a `type` call.
+/// Output returned to the model after a `terminal` call.
 #[derive(Debug, Serialize)]
-pub struct TypeOutput {
+pub struct TerminalOutput {
     /// Terminal output captured between the keystroke and the next prompt (or timeout).
     pub output: String,
 
@@ -142,7 +149,7 @@ pub struct TypeOutput {
     pub outcome: Outcome,
 }
 
-/// Describes how a `type` call concluded.
+/// Describes how a `terminal` call concluded.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 pub enum Outcome {
@@ -166,15 +173,11 @@ pub enum Outcome {
 
     /// The shell process exited (e.g. `exec`, `exit`, crash).
     /// A new session has been spawned and is ready.
-    ShellExited {
-        working_directory: String,
-    },
+    ShellExited { working_directory: String },
 
     /// The session was explicitly reset by the caller (`reset: true`).
     /// The old shell was killed and a fresh one has been spawned.
-    Reset {
-        working_directory: String,
-    },
+    Reset { working_directory: String },
 }
 
 // ── Job tracking ─────────────────────────────────────────────────────────────
@@ -204,7 +207,7 @@ pub struct JobNotification {
 ///
 /// Two update paths exist:
 ///
-/// - [`JobManager::sync`] — called by [`TypeTool::call`] after each command.
+/// - [`JobManager::sync`] — called by [`TerminalTool::call`] after each command.
 ///   Discovers new PIDs (from `jobs -p`) and removes completed ones.
 /// - [`JobManager::retain`] — called by the sysinfo watcher task. Only removes
 ///   completed PIDs; never adds new ones. Safe to call concurrently with `sync`
@@ -239,7 +242,7 @@ impl JobManager {
     /// - **PIDs tracked but absent from `active_pids`**: they have completed;
     ///   the callback is fired for each one and they are removed.
     ///
-    /// This is the **discovery** path: use it from [`TypeTool::call`] where
+    /// This is the **discovery** path: use it from [`TerminalTool::call`] where
     /// `jobs -p` provides the authoritative set of background PIDs, including
     /// newly started ones.
     ///
@@ -336,11 +339,49 @@ pub fn parse_jobs_p(output: &str) -> HashSet<u32> {
         .collect()
 }
 
+// ── Key encoding ─────────────────────────────────────────────────────────────
+
+/// Parse a space-separated string of key names (crokey notation) and encode
+/// each key to terminal bytes using the xterm encoding.
+///
+/// Examples: `"ctrl-c"` → `[0x03]`, `"ctrl-c ctrl-d"` → `[0x03, 0x04]`,
+/// `"Up"` → `ESC [ A`.
+///
+/// Each token is parsed by [`crokey::parse`], converted to a
+/// [`terminput::KeyEvent`] via [`terminput_crossterm::to_terminput_key`],
+/// and encoded with [`terminput::Event::encode`] using xterm encoding.
+pub fn encode_control_keys(input: &str) -> Result<Vec<u8>, TerminalError> {
+    let mut bytes = Vec::new();
+    let mut encode_buf = [0u8; 32];
+
+    for token in input.split_whitespace() {
+        let combination = crokey::parse(token)
+            .map_err(|e| TerminalError::InvalidInput(format!("cannot parse key {token:?}: {e}")))?;
+
+        // KeyCombination → crossterm KeyEvent → terminput KeyEvent → bytes.
+        let crossterm_event: crokey::crossterm::event::KeyEvent = combination.into();
+        let terminput_event =
+            terminput_crossterm::to_terminput_key(crossterm_event).map_err(|e| {
+                TerminalError::InvalidInput(format!("cannot convert key {token:?}: {e}"))
+            })?;
+        let event = terminput::Event::Key(terminput_event);
+
+        let n = event
+            .encode(&mut encode_buf, terminput::Encoding::Xterm)
+            .map_err(|e| {
+                TerminalError::InvalidInput(format!("cannot encode key {token:?}: {e}"))
+            })?;
+        bytes.extend_from_slice(&encode_buf[..n]);
+    }
+
+    Ok(bytes)
+}
+
 // ── Tool ─────────────────────────────────────────────────────────────────────
 
-/// Error type for `TypeTool` failures.
+/// Error type for `TerminalTool` failures.
 #[derive(Debug, thiserror::Error)]
-pub enum TypeError {
+pub enum TerminalError {
     #[error("PTY write failed: {0}")]
     PtyWrite(String),
 
@@ -355,19 +396,22 @@ pub enum TypeError {
 
     #[error("Invalid timeout: {0}")]
     InvalidTimeout(f64),
+
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
 }
 
-/// The Tekton `type` tool.
+/// The Tekton `terminal` tool.
 ///
-/// Wraps a persistent PTY session. The model calls this tool to send keystrokes
-/// to the terminal; the harness captures output until the shell emits a sentinel
-/// (command complete) or the timeout fires.
+/// Wraps a persistent PTY session. The model calls this tool to send commands
+/// or control keys to the terminal; the harness captures output until the shell
+/// emits a sentinel (command complete) or the timeout fires.
 ///
 /// After each command, `call` runs `jobs -p` internally and syncs the
-/// [`JobManager`]. The sysinfo watcher task (see [`TypeTool::spawn_watcher`])
+/// [`JobManager`]. The sysinfo watcher task (see [`TerminalTool::spawn_watcher`])
 /// detects completions while the tool is idle using [`JobManager::retain`].
-pub struct TypeTool {
-    /// The persistent PTY session. `None` when constructed via [`TypeTool::new`].
+pub struct TerminalTool {
+    /// The persistent PTY session. `None` when constructed via [`TerminalTool::new`].
     session: Arc<tokio::sync::Mutex<Option<session::PtySession>>>,
 
     /// Shared with the watcher task for background job lifecycle tracking.
@@ -377,8 +421,8 @@ pub struct TypeTool {
     agent_name: String,
 }
 
-impl TypeTool {
-    /// Create a new `TypeTool` with no session, an empty [`JobManager`], and no callback.
+impl TerminalTool {
+    /// Create a new `TerminalTool` with no session, an empty [`JobManager`], and no callback.
     ///
     /// Use the builder methods [`with_name`](Self::with_name) and
     /// [`with_job_callback`](Self::with_job_callback) to configure the tool,
@@ -400,11 +444,11 @@ impl TypeTool {
         self
     }
 
-    /// Spawn a bash PTY session and return a fully initialized `TypeTool`.
+    /// Spawn a bash PTY session and return a fully initialized `TerminalTool`.
     ///
     /// Consumes `self` (from the builder chain) and returns an initialized tool.
     /// Use [`working_directory`](Self::working_directory) to read the initial `$PWD`.
-    pub async fn spawn(self) -> Result<Self, TypeError> {
+    pub async fn spawn(self) -> Result<Self, TerminalError> {
         let pty_session = session::PtySession::spawn().await?;
         Ok(Self {
             session: Arc::new(tokio::sync::Mutex::new(Some(pty_session))),
@@ -426,7 +470,7 @@ impl TypeTool {
 
     /// Register a callback invoked whenever a background job completes.
     ///
-    /// Must be called **before** [`TypeTool::job_manager`] is cloned.
+    /// Must be called **before** [`TerminalTool::job_manager`] is cloned.
     ///
     /// Delegates to [`JobManager::with_callback`].
     pub fn with_job_callback(
@@ -434,9 +478,13 @@ impl TypeTool {
         callback: impl Fn(JobNotification) + Send + Sync + 'static,
     ) -> Self {
         let manager = Arc::try_unwrap(self.job_manager)
-            .unwrap_or_else(|_| panic!("job_manager Arc should have exactly one owner at construction time"))
+            .unwrap_or_else(|_| {
+                panic!("job_manager Arc should have exactly one owner at construction time")
+            })
             .into_inner()
-            .unwrap_or_else(|_| panic!("job_manager Mutex should not be poisoned at construction time"))
+            .unwrap_or_else(|_| {
+                panic!("job_manager Mutex should not be poisoned at construction time")
+            })
             .with_callback(callback);
         Self {
             session: self.session,
@@ -473,10 +521,7 @@ impl TypeTool {
                     if jm.jobs.is_empty() {
                         continue;
                     }
-                    jm.jobs
-                        .keys()
-                        .map(|&p| sysinfo::Pid::from_u32(p))
-                        .collect()
+                    jm.jobs.keys().map(|&p| sysinfo::Pid::from_u32(p)).collect()
                 };
 
                 // Refresh only the specific PIDs — no full system scan.
@@ -533,7 +578,7 @@ impl TypeTool {
     }
 }
 
-impl TypeTool {
+impl TerminalTool {
     /// Build the prompt string appended to every command's output.
     ///
     /// Format with agent name: `$?=0 claude:/Users/nilton/src $ `
@@ -547,18 +592,18 @@ impl TypeTool {
     }
 }
 
-impl Default for TypeTool {
+impl Default for TerminalTool {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Tool for TypeTool {
-    const NAME: &'static str = "type";
+impl Tool for TerminalTool {
+    const NAME: &'static str = "terminal";
 
-    type Error = TypeError;
-    type Args = TypeArgs;
-    type Output = TypeOutput;
+    type Error = TerminalError;
+    type Args = TerminalArgs;
+    type Output = TerminalOutput;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         let cwd = self.working_directory().await;
@@ -566,18 +611,23 @@ impl Tool for TypeTool {
         ToolDefinition {
             name: Self::NAME.to_string(),
             description: format!(
-                "Send keystrokes to the terminal. Supports escape sequences: \\n for Enter, \
-                 \\u0003 for Ctrl-C, \\u0004 for Ctrl-D, etc. Returns the terminal output \
-                 captured until the next shell prompt or timeout.\n\n\
+                "Send commands or control keys to the terminal. Use `command` for shell \
+                 commands (Enter is sent automatically) or `control` for special keys \
+                 (e.g. \"ctrl-c\", \"alt-f\"). Returns the terminal output captured \
+                 until the next shell prompt or timeout.\n\n\
                  The terminal says:\n\n\
                  {initial_prompt}"
             ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "keys": {
+                    "command": {
                         "type": "string",
-                        "description": "Keystrokes to send. Supports escape sequences: \\n for Enter, \\u0003 for Ctrl-C, \\u0004 for Ctrl-D, etc."
+                        "description": "Shell command to execute. Enter is sent automatically."
+                    },
+                    "control": {
+                        "type": "string",
+                        "description": "Control/special keys in key notation. Examples: \"ctrl-c\", \"alt-f\", \"shift-Up\". Space-separated for sequences: \"ctrl-c ctrl-d\"."
                     },
                     "interactive": {
                         "type": "boolean",
@@ -587,9 +637,13 @@ impl Tool for TypeTool {
                     "timeout": {
                         "type": "number",
                         "description": "Seconds to wait before triggering the timeout behavior. Defaults to 300 when interactive=false, 5 when interactive=true."
+                    },
+                    "reset": {
+                        "type": "boolean",
+                        "description": "Kill the current shell and spawn a fresh one. All other arguments are ignored. Use as a last resort when the shell is in an unrecoverable state.",
+                        "default": false
                     }
-                },
-                "required": ["keys"]
+                }
             }),
         }
     }
@@ -615,20 +669,40 @@ impl Tool for TypeTool {
             let mut output = String::from("Session reset\n");
             output.push_str(&self.format_prompt(0, &working_directory));
 
-            return Ok(TypeOutput {
+            return Ok(TerminalOutput {
                 output,
                 outcome: Outcome::Reset { working_directory },
             });
         }
 
+        // Validate: exactly one of `command` or `control` must be provided.
+        if args.command.is_some() && args.control.is_some() {
+            return Err(TerminalError::InvalidInput(
+                "both `command` and `control` provided; use exactly one".into(),
+            ));
+        }
+        if args.command.is_none() && args.control.is_none() {
+            return Err(TerminalError::InvalidInput(
+                "neither `command` nor `control` provided; use exactly one".into(),
+            ));
+        }
+
         let raw_timeout = args.resolved_timeout();
-        if raw_timeout.is_nan() || raw_timeout.is_infinite() || raw_timeout < 0.0
+        if raw_timeout.is_nan()
+            || raw_timeout.is_infinite()
+            || raw_timeout < 0.0
             || raw_timeout > MAX_TIMEOUT_SECS
         {
-            return Err(TypeError::InvalidTimeout(raw_timeout));
+            return Err(TerminalError::InvalidTimeout(raw_timeout));
         }
         let timeout = Duration::from_secs_f64(raw_timeout);
-        let keys = args.keys.clone();
+        let command = args.command.clone();
+        let control = args.control.clone();
+        // Pre-encode control keys before entering spawn_blocking.
+        let control_bytes = match &control {
+            Some(ctrl) => Some(encode_control_keys(ctrl)?),
+            None => None,
+        };
         let interactive = args.interactive;
         let background_pids: HashSet<u32> = self
             .job_manager
@@ -644,7 +718,7 @@ impl Tool for TypeTool {
 
         // Fast-path: no session — return the error without spawning a thread.
         if guard.is_none() {
-            return Err(TypeError::SessionNotInitialized);
+            return Err(TerminalError::SessionNotInitialized);
         }
 
         // Run the blocking PTY I/O in a dedicated thread-pool thread.
@@ -655,15 +729,22 @@ impl Tool for TypeTool {
         //     still alive (Waiting) or gone (ShellExited), so we have no fresh `jobs -p`
         //     snapshot.
         let timeout_secs = timeout.as_secs_f64();
-        let result = tokio::task::spawn_blocking(move || -> Result<_, TypeError> {
+        let result = tokio::task::spawn_blocking(move || -> Result<_, TerminalError> {
             let mut guard = guard;
-            let pty = guard.as_mut().ok_or(TypeError::SessionNotInitialized)?;
+            let pty = guard.as_mut().ok_or(TerminalError::SessionNotInitialized)?;
             let shell_pid = pty.shell_pid;
 
-            // 1. Send keystrokes to the PTY.
-            use expectrl::Expect; // trait needed for .send(); inline to avoid unused-import warning
-            pty.session.send(keys.as_bytes())
-                .map_err(|e| TypeError::PtyWrite(e.to_string()))?;
+            // 1. Send command or control keys to the PTY.
+            use expectrl::Expect; // trait needed for .send()/.send_line()
+            if let Some(ref cmd) = command {
+                pty.session
+                    .send_line(cmd)
+                    .map_err(|e| TerminalError::PtyWrite(e.to_string()))?;
+            } else if let Some(ref bytes) = control_bytes {
+                pty.session
+                    .send(bytes)
+                    .map_err(|e| TerminalError::PtyWrite(e.to_string()))?;
+            }
 
             // 2. Wait for the prompt sentinel.
             match session::wait_for_sentinel(&mut pty.session, timeout) {
@@ -699,7 +780,9 @@ impl Tool for TypeTool {
 
                     // Drain PTY to restore a clean prompt; extract post-kill exit code and $PWD.
                     let (exit_code, cwd) = session::drain_after_kill(&mut pty.session)
-                        .unwrap_or_else(|| (DRAIN_FAILURE_EXIT_CODE, pty.working_directory.clone()));
+                        .unwrap_or_else(|| {
+                            (DRAIN_FAILURE_EXIT_CODE, pty.working_directory.clone())
+                        });
 
                     let active_pids = session::run_jobs_p_sync(&mut pty.session);
                     pty.working_directory = cwd.clone();
@@ -736,11 +819,11 @@ impl Tool for TypeTool {
                     Ok((output, outcome, None))
                 }
 
-                Err(e) => Err(TypeError::PtyRead(e.to_string())),
+                Err(e) => Err(TerminalError::PtyRead(e.to_string())),
             }
         })
         .await
-        .map_err(|e| TypeError::PtyRead(e.to_string()))?;
+        .map_err(|e| TerminalError::PtyRead(e.to_string()))?;
 
         let (output_bytes, outcome, active_pids) = result?;
 
@@ -753,10 +836,17 @@ impl Tool for TypeTool {
         // Append the harness-built prompt so the model sees exit code, identity,
         // and location context at the end of every command's output.
         match &outcome {
-            Outcome::Completed { exit_code, working_directory } => {
+            Outcome::Completed {
+                exit_code,
+                working_directory,
+            } => {
                 output.push_str(&self.format_prompt(*exit_code, working_directory));
             }
-            Outcome::Killed { exit_code, working_directory, .. } => {
+            Outcome::Killed {
+                exit_code,
+                working_directory,
+                ..
+            } => {
                 output.push_str("Killed\n");
                 output.push_str(&self.format_prompt(*exit_code, working_directory));
             }
@@ -773,7 +863,7 @@ impl Tool for TypeTool {
             }
         }
 
-        Ok(TypeOutput { output, outcome })
+        Ok(TerminalOutput { output, outcome })
     }
 }
 
@@ -783,12 +873,13 @@ impl Tool for TypeTool {
 mod tests {
     use super::*;
 
-    // TypeArgs / timeout resolution
+    // TerminalArgs / timeout resolution
 
     #[test]
     fn resolved_timeout_uses_default_for_non_interactive() {
-        let args = TypeArgs {
-            keys: "ls\n".to_string(),
+        let args = TerminalArgs {
+            command: Some("ls".into()),
+            control: None,
             interactive: false,
             timeout: None,
             reset: false,
@@ -798,8 +889,9 @@ mod tests {
 
     #[test]
     fn resolved_timeout_uses_default_for_interactive() {
-        let args = TypeArgs {
-            keys: "y\n".to_string(),
+        let args = TerminalArgs {
+            command: Some("y".into()),
+            control: None,
             interactive: true,
             timeout: None,
             reset: false,
@@ -809,8 +901,9 @@ mod tests {
 
     #[test]
     fn resolved_timeout_respects_caller_override() {
-        let args = TypeArgs {
-            keys: "analyze dataset.csv\n".to_string(),
+        let args = TerminalArgs {
+            command: Some("analyze dataset.csv".into()),
+            control: None,
             interactive: true,
             timeout: Some(30.0),
             reset: false,
@@ -890,49 +983,61 @@ mod tests {
 
     #[tokio::test]
     async fn tool_definition_has_correct_name() {
-        let tool = TypeTool::new();
-        assert_eq!(tool.definition(String::new()).await.name, "type");
+        let tool = TerminalTool::new();
+        assert_eq!(tool.definition(String::new()).await.name, "terminal");
     }
 
     #[tokio::test]
-    async fn tool_definition_requires_keys() {
-        let tool = TypeTool::new();
+    async fn tool_definition_has_no_required_fields() {
+        let tool = TerminalTool::new();
         let def = tool.definition(String::new()).await;
-        let required = def.parameters["required"]
-            .as_array()
-            .expect("required should be an array");
-        assert!(required.iter().any(|v| v == "keys"));
+        // If the required field exists and is an array, verify neither command nor control are required
+        if let Some(required_val) = def.parameters.get("required") {
+            if let Some(required) = required_val.as_array() {
+                // Neither command nor control should be in required (both are optional)
+                assert!(!required.iter().any(|v| v == "command"));
+                assert!(!required.iter().any(|v| v == "control"));
+            }
+        }
+        // If there's no required field, that's also acceptable (both fields are optional)
     }
 
     #[tokio::test]
     async fn call_returns_error_when_session_not_initialized() {
-        let tool = TypeTool::new();
+        let tool = TerminalTool::new();
         let result = tool
-            .call(TypeArgs {
-                keys: "ls\n".to_string(),
+            .call(TerminalArgs {
+                command: Some("ls".into()),
+                control: None,
                 interactive: false,
                 timeout: None,
                 reset: false,
             })
             .await;
-        assert!(matches!(result, Err(TypeError::SessionNotInitialized)));
+        assert!(matches!(result, Err(TerminalError::SessionNotInitialized)));
     }
 
     // Shared handles
 
     #[test]
     fn job_manager_arc_is_shared() {
-        let tool = TypeTool::new();
+        let tool = TerminalTool::new();
         assert!(Arc::ptr_eq(&tool.job_manager(), &tool.job_manager()));
     }
 
-    // ── TypeArgs: additional boundary-value tests ──────────────────────────
+    // ── TerminalArgs: additional boundary-value tests ──────────────────────────
 
     #[test]
     fn resolved_timeout_explicit_zero_is_honored() {
         // Zero is a valid (degenerate) timeout. The resolver must not substitute
         // the default — a bug might treat Some(0.0) like None via `unwrap_or`.
-        let args = TypeArgs { keys: "ls\n".into(), interactive: false, timeout: Some(0.0) , reset: false};
+        let args = TerminalArgs {
+            command: Some("ls".into()),
+            control: None,
+            interactive: false,
+            timeout: Some(0.0),
+            reset: false,
+        };
         assert_eq!(args.resolved_timeout(), 0.0);
     }
 
@@ -941,15 +1046,22 @@ mod tests {
         // Validation of the timeout range is the harness's job, not the resolver's.
         // The resolver must faithfully return whatever the caller supplied, even
         // nonsensical values like -1.
-        let args = TypeArgs { keys: "ls\n".into(), interactive: false, timeout: Some(-1.0) , reset: false};
+        let args = TerminalArgs {
+            command: Some("ls".into()),
+            control: None,
+            interactive: false,
+            timeout: Some(-1.0),
+            reset: false,
+        };
         assert_eq!(args.resolved_timeout(), -1.0);
     }
 
     #[test]
     fn resolved_timeout_infinity_passed_through() {
         // Infinite timeout is useful for commands with no known upper bound.
-        let args = TypeArgs {
-            keys: "ls\n".into(),
+        let args = TerminalArgs {
+            command: Some("ls".into()),
+            control: None,
             interactive: false,
             timeout: Some(f64::INFINITY),
             reset: false,
@@ -961,8 +1073,9 @@ mod tests {
     fn resolved_timeout_nan_is_passed_through_not_swapped_for_default() {
         // NaN is pathological. The resolver must not silently swap it for the
         // default — that would hide a caller bug. Validation is the harness's job.
-        let args = TypeArgs {
-            keys: "ls\n".into(),
+        let args = TerminalArgs {
+            command: Some("ls".into()),
+            control: None,
             interactive: false,
             timeout: Some(f64::NAN),
             reset: false,
@@ -974,8 +1087,20 @@ mod tests {
     fn resolved_timeout_override_applies_in_both_interactive_modes() {
         // The caller-supplied value wins regardless of the `interactive` flag.
         // A bug might only apply the override in one branch of the if/else.
-        let non_interactive = TypeArgs { keys: String::new(), interactive: false, timeout: Some(42.0) , reset: false};
-        let interactive = TypeArgs { keys: String::new(), interactive: true, timeout: Some(42.0) , reset: false};
+        let non_interactive = TerminalArgs {
+            command: Some("true".into()),
+            control: None,
+            interactive: false,
+            timeout: Some(42.0),
+            reset: false,
+        };
+        let interactive = TerminalArgs {
+            command: Some("true".into()),
+            control: None,
+            interactive: true,
+            timeout: Some(42.0),
+            reset: false,
+        };
         assert_eq!(non_interactive.resolved_timeout(), 42.0);
         assert_eq!(interactive.resolved_timeout(), 42.0);
     }
@@ -1015,7 +1140,11 @@ mod tests {
         // A bug might parse via f64 then truncate to u32.
         let pids = parse_jobs_p("123.45\n999\n");
         assert!(pids.contains(&999));
-        assert_eq!(pids.len(), 1, "floating-point string must be silently skipped");
+        assert_eq!(
+            pids.len(),
+            1,
+            "floating-point string must be silently skipped"
+        );
     }
 
     #[test]
@@ -1082,7 +1211,10 @@ mod tests {
             *fired_clone.lock().unwrap() = true;
         });
         manager.sync(&HashSet::new());
-        assert!(!*fired.lock().unwrap(), "no callback should fire for empty→empty transition");
+        assert!(
+            !*fired.lock().unwrap(),
+            "no callback should fire for empty→empty transition"
+        );
     }
 
     #[test]
@@ -1141,9 +1273,9 @@ mod tests {
             cc.lock().unwrap().push(n.pid);
         });
         manager.sync(&HashSet::from([42])); // first process with PID 42 starts
-        manager.sync(&HashSet::new());      // first process completes → callback
+        manager.sync(&HashSet::new()); // first process completes → callback
         manager.sync(&HashSet::from([42])); // PID 42 reused by a new process
-        manager.sync(&HashSet::new());      // second process completes → callback
+        manager.sync(&HashSet::new()); // second process completes → callback
         let fired = completed.lock().unwrap().clone();
         assert_eq!(
             fired,
@@ -1259,7 +1391,7 @@ mod tests {
         assert!(manager.jobs.is_empty());
     }
 
-    // ── TypeTool: construction and shared-handle contract ──────────────────
+    // ── TerminalTool: construction and shared-handle contract ──────────────────
 
     #[test]
     #[should_panic(expected = "job_manager Arc should have exactly one owner at construction time")]
@@ -1267,7 +1399,7 @@ mod tests {
         // API contract: register the callback BEFORE calling job_manager().
         // If the harness already holds a clone of the Arc, with_job_callback
         // cannot take exclusive ownership and must panic to surface the misuse.
-        let tool = TypeTool::new();
+        let tool = TerminalTool::new();
         let _shared = tool.job_manager(); // second owner created here
         let _tool = tool.with_job_callback(|_| {}); // must panic
     }
@@ -1278,7 +1410,7 @@ mod tests {
         // Completions detected via the shared handle must reach the callback.
         let fired = Arc::new(Mutex::new(false));
         let fired_clone = Arc::clone(&fired);
-        let tool = TypeTool::new().with_job_callback(move |_| {
+        let tool = TerminalTool::new().with_job_callback(move |_| {
             *fired_clone.lock().unwrap() = true;
         });
         let jm = tool.job_manager();
@@ -1293,10 +1425,11 @@ mod tests {
     async fn env_var_exported_in_one_call_is_visible_in_next_call() {
         // Core persistence contract: exported env vars must survive across tool
         // calls. A stateless fresh-shell implementation would fail this test.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let cwd = tool.working_directory().await;
-        tool.call(TypeArgs {
-            keys: "export TEKTON_PERSIST_TEST=hello\n".into(),
+        tool.call(TerminalArgs {
+            command: Some("export TEKTON_PERSIST_TEST=hello".into()),
+            control: None,
             interactive: false,
             timeout: None,
             reset: false,
@@ -1304,24 +1437,29 @@ mod tests {
         .await
         .unwrap();
         let result = tool
-            .call(TypeArgs {
-                keys: "echo $TEKTON_PERSIST_TEST\n".into(),
+            .call(TerminalArgs {
+                command: Some("echo $TEKTON_PERSIST_TEST".into()),
+                control: None,
                 interactive: false,
                 timeout: None,
                 reset: false,
             })
             .await
             .unwrap();
-        assert_eq!(result.output, format!("hello\r\n{}", expected_prompt("", 0, &cwd)));
+        assert_eq!(
+            result.output,
+            format!("hello\r\n{}", expected_prompt("", 0, &cwd))
+        );
     }
 
     #[tokio::test]
     async fn working_directory_persists_after_cd() {
         // `cd` must permanently change $PWD for all subsequent calls.
         // Regression guard: fresh-shell execution resets $PWD on every call.
-        let tool = TypeTool::new().spawn().await.unwrap();
-        tool.call(TypeArgs {
-            keys: "cd /tmp\n".into(),
+        let tool = TerminalTool::new().spawn().await.unwrap();
+        tool.call(TerminalArgs {
+            command: Some("cd /tmp".into()),
+            control: None,
             interactive: false,
             timeout: None,
             reset: false,
@@ -1329,18 +1467,23 @@ mod tests {
         .await
         .unwrap();
         let result = tool
-            .call(TypeArgs {
-                keys: "pwd\n".into(),
+            .call(TerminalArgs {
+                command: Some("pwd".into()),
+                control: None,
                 interactive: false,
                 timeout: None,
                 reset: false,
             })
             .await
             .unwrap();
-        assert_eq!(result.output, format!("/tmp\r\n{}", expected_prompt("", 0, "/tmp")));
+        assert_eq!(
+            result.output,
+            format!("/tmp\r\n{}", expected_prompt("", 0, "/tmp"))
+        );
         assert!(
             matches!(result.outcome, Outcome::Completed { ref working_directory, .. } if working_directory == "/tmp"),
-            "working directory must be /tmp; got: {:?}", result.outcome
+            "working directory must be /tmp; got: {:?}",
+            result.outcome
         );
     }
 
@@ -1348,10 +1491,11 @@ mod tests {
     async fn shell_function_defined_in_one_call_is_callable_in_next() {
         // Shell functions live in the session's environment. A function defined
         // in call N must be invocable in call N+1.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let cwd = tool.working_directory().await;
-        tool.call(TypeArgs {
-            keys: "tekton_greet() { echo \"greetings $1\"; }\n".into(),
+        tool.call(TerminalArgs {
+            command: Some("tekton_greet() { echo \"greetings $1\"; }".into()),
+            control: None,
             interactive: false,
             timeout: None,
             reset: false,
@@ -1359,8 +1503,9 @@ mod tests {
         .await
         .unwrap();
         let result = tool
-            .call(TypeArgs {
-                keys: "tekton_greet world\n".into(),
+            .call(TerminalArgs {
+                command: Some("tekton_greet world".into()),
+                control: None,
                 interactive: false,
                 timeout: None,
                 reset: false,
@@ -1377,10 +1522,11 @@ mod tests {
     async fn non_exported_shell_variable_does_not_leak_to_subprocesses() {
         // Standard bash scoping: non-exported variables must not be visible to
         // child processes, even across calls within the same session.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let cwd = tool.working_directory().await;
-        tool.call(TypeArgs {
-            keys: "TEKTON_LOCAL=secret\n".into(),
+        tool.call(TerminalArgs {
+            command: Some("TEKTON_LOCAL=secret".into()),
+            control: None,
             interactive: false,
             timeout: None,
             reset: false,
@@ -1388,8 +1534,9 @@ mod tests {
         .await
         .unwrap();
         let result = tool
-            .call(TypeArgs {
-                keys: "bash -c 'echo ${TEKTON_LOCAL:-UNSET}'\n".into(),
+            .call(TerminalArgs {
+                command: Some("bash -c 'echo ${TEKTON_LOCAL:-UNSET}'".into()),
+                control: None,
                 interactive: false,
                 timeout: None,
                 reset: false,
@@ -1407,70 +1554,105 @@ mod tests {
     #[tokio::test]
     async fn exit_code_zero_for_successful_command() {
         // `true` always exits 0. The OSC sentinel must carry that value.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let result = tool
-            .call(TypeArgs { keys: "true\n".into(), interactive: false, timeout: None , reset: false})
+            .call(TerminalArgs {
+                command: Some("true".into()),
+                control: None,
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
             .await
             .unwrap();
-        assert!(matches!(result.outcome, Outcome::Completed { exit_code: 0, .. }));
+        assert!(matches!(
+            result.outcome,
+            Outcome::Completed { exit_code: 0, .. }
+        ));
     }
 
     #[tokio::test]
     async fn exit_code_one_for_failing_command() {
         // `false` always exits 1. Tests that non-zero codes are relayed.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let result = tool
-            .call(TypeArgs { keys: "false\n".into(), interactive: false, timeout: None , reset: false})
+            .call(TerminalArgs {
+                command: Some("false".into()),
+                control: None,
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
             .await
             .unwrap();
-        assert!(matches!(result.outcome, Outcome::Completed { exit_code: 1, .. }));
+        assert!(matches!(
+            result.outcome,
+            Outcome::Completed { exit_code: 1, .. }
+        ));
     }
 
     #[tokio::test]
     async fn exit_code_arbitrary_value_faithfully_captured_from_sentinel() {
         // The OSC sentinel must relay any exit code, not just 0/1.
         // A bug might mask the code by always returning 0 or 1.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let result = tool
-            .call(TypeArgs {
-                keys: "sh -c 'exit 42'\n".into(),
+            .call(TerminalArgs {
+                command: Some("sh -c 'exit 42'".into()),
+                control: None,
                 interactive: false,
                 timeout: None,
                 reset: false,
             })
             .await
             .unwrap();
-        assert!(matches!(result.outcome, Outcome::Completed { exit_code: 42, .. }));
+        assert!(matches!(
+            result.outcome,
+            Outcome::Completed { exit_code: 42, .. }
+        ));
     }
 
     #[tokio::test]
     async fn exit_code_127_for_unknown_command() {
         // Bash exits 127 on "command not found". Verifies the sentinel works
         // for error paths that never reach the program's own exit() call.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let result = tool
-            .call(TypeArgs {
-                keys: "tekton_nonexistent_command_xyz_abc\n".into(),
+            .call(TerminalArgs {
+                command: Some("tekton_nonexistent_command_xyz_abc".into()),
+                control: None,
                 interactive: false,
                 timeout: None,
                 reset: false,
             })
             .await
             .unwrap();
-        assert!(matches!(result.outcome, Outcome::Completed { exit_code: 127, .. }));
+        assert!(matches!(
+            result.outcome,
+            Outcome::Completed { exit_code: 127, .. }
+        ));
     }
 
     #[tokio::test]
     async fn osc_sentinel_bytes_are_stripped_from_output() {
         // The sentinel `\e]999;EXIT\a` is machine metadata. It must not appear
         // in the output string returned to the model — only clean terminal text.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let cwd = tool.working_directory().await;
         let result = tool
-            .call(TypeArgs { keys: "echo hello\n".into(), interactive: false, timeout: None , reset: false})
+            .call(TerminalArgs {
+                command: Some("echo hello".into()),
+                control: None,
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
             .await
             .unwrap();
-        assert_eq!(result.output, format!("hello\r\n{}", expected_prompt("", 0, &cwd)));
+        assert_eq!(
+            result.output,
+            format!("hello\r\n{}", expected_prompt("", 0, &cwd))
+        );
     }
 
     #[tokio::test]
@@ -1481,11 +1663,12 @@ mod tests {
         // If echo is ON, the input "echo marker_xyz\n" appears in the output
         // stream, making "marker_xyz" occur twice (once as echoed input, once
         // as command output). With echo OFF it occurs exactly once.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let cwd = tool.working_directory().await;
         let result = tool
-            .call(TypeArgs {
-                keys: "echo tekton_echo_marker_xyz\n".into(),
+            .call(TerminalArgs {
+                command: Some("echo tekton_echo_marker_xyz".into()),
+                control: None,
                 interactive: false,
                 timeout: None,
                 reset: false,
@@ -1515,10 +1698,16 @@ mod tests {
     #[tokio::test]
     async fn true_exact_output() {
         // `true` produces no output — just the prompt with exit code 0.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let cwd = tool.working_directory().await;
         let result = tool
-            .call(TypeArgs { keys: "true\n".into(), interactive: false, timeout: None , reset: false})
+            .call(TerminalArgs {
+                command: Some("true".into()),
+                control: None,
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
             .await
             .unwrap();
         assert_eq!(result.output, expected_prompt("", 0, &cwd));
@@ -1527,10 +1716,16 @@ mod tests {
     #[tokio::test]
     async fn false_exact_output() {
         // `false` produces no output — just the prompt with exit code 1.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let cwd = tool.working_directory().await;
         let result = tool
-            .call(TypeArgs { keys: "false\n".into(), interactive: false, timeout: None , reset: false})
+            .call(TerminalArgs {
+                command: Some("false".into()),
+                control: None,
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
             .await
             .unwrap();
         assert_eq!(result.output, expected_prompt("", 1, &cwd));
@@ -1539,10 +1734,16 @@ mod tests {
     #[tokio::test]
     async fn echo_hello_exact_output() {
         // `echo hello` outputs "hello\r\n" (PTY translates \n → \r\n) then prompt.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let cwd = tool.working_directory().await;
         let result = tool
-            .call(TypeArgs { keys: "echo hello\n".into(), interactive: false, timeout: None , reset: false})
+            .call(TerminalArgs {
+                command: Some("echo hello".into()),
+                control: None,
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
             .await
             .unwrap();
         let expected = format!("hello\r\n{}", expected_prompt("", 0, &cwd));
@@ -1553,10 +1754,16 @@ mod tests {
     async fn echo_n_no_trailing_newline() {
         // `echo -n foo` outputs "foo" with no newline. The prompt appears on
         // the same line, just like a real terminal.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let cwd = tool.working_directory().await;
         let result = tool
-            .call(TypeArgs { keys: "echo -n foo\n".into(), interactive: false, timeout: None , reset: false})
+            .call(TerminalArgs {
+                command: Some("echo -n foo".into()),
+                control: None,
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
             .await
             .unwrap();
         let expected = format!("foo{}", expected_prompt("", 0, &cwd));
@@ -1567,17 +1774,29 @@ mod tests {
     async fn cd_then_echo_no_stale_prompt_leakage() {
         // Two calls: cd /tmp, then echo marker. The second call's output must
         // start clean — no leftover prompt from the first call leaking in.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
 
         let cd_result = tool
-            .call(TypeArgs { keys: "cd /tmp\n".into(), interactive: false, timeout: None , reset: false})
+            .call(TerminalArgs {
+                command: Some("cd /tmp".into()),
+                control: None,
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
             .await
             .unwrap();
         // cd produces no output, just the prompt showing the new cwd.
         assert_eq!(cd_result.output, expected_prompt("", 0, "/tmp"));
 
         let echo_result = tool
-            .call(TypeArgs { keys: "echo output_marker\n".into(), interactive: false, timeout: None , reset: false})
+            .call(TerminalArgs {
+                command: Some("echo output_marker".into()),
+                control: None,
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
             .await
             .unwrap();
         let expected = format!("output_marker\r\n{}", expected_prompt("", 0, "/tmp"));
@@ -1588,33 +1807,57 @@ mod tests {
     async fn multi_command_session_exact_outputs() {
         // A multi-step session: export, cd, echo, false — verifying exact output
         // for each call and no cross-call leakage.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let initial_cwd = tool.working_directory().await;
 
         // 1. export — no visible output
         let r1 = tool
-            .call(TypeArgs { keys: "export TEKTON_X=42\n".into(), interactive: false, timeout: None , reset: false})
+            .call(TerminalArgs {
+                command: Some("export TEKTON_X=42".into()),
+                control: None,
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
             .await
             .unwrap();
         assert_eq!(r1.output, expected_prompt("", 0, &initial_cwd));
 
         // 2. cd /
         let r2 = tool
-            .call(TypeArgs { keys: "cd /\n".into(), interactive: false, timeout: None , reset: false})
+            .call(TerminalArgs {
+                command: Some("cd /".into()),
+                control: None,
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
             .await
             .unwrap();
         assert_eq!(r2.output, expected_prompt("", 0, "/"));
 
         // 3. echo $TEKTON_X — verifies persistence of env var and cwd
         let r3 = tool
-            .call(TypeArgs { keys: "echo $TEKTON_X\n".into(), interactive: false, timeout: None , reset: false})
+            .call(TerminalArgs {
+                command: Some("echo $TEKTON_X".into()),
+                control: None,
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
             .await
             .unwrap();
         assert_eq!(r3.output, format!("42\r\n{}", expected_prompt("", 0, "/")));
 
         // 4. false — exit code 1
         let r4 = tool
-            .call(TypeArgs { keys: "false\n".into(), interactive: false, timeout: None , reset: false})
+            .call(TerminalArgs {
+                command: Some("false".into()),
+                control: None,
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
             .await
             .unwrap();
         assert_eq!(r4.output, expected_prompt("", 1, "/"));
@@ -1623,14 +1866,20 @@ mod tests {
     #[tokio::test]
     async fn prompt_with_agent_name() {
         // When agent name is set, prompts include `name:cwd`.
-        let tool = TypeTool::new()
+        let tool = TerminalTool::new()
             .with_name("claude")
             .spawn()
             .await
             .unwrap();
         let cwd = tool.working_directory().await;
         let result = tool
-            .call(TypeArgs { keys: "true\n".into(), interactive: false, timeout: None , reset: false})
+            .call(TerminalArgs {
+                command: Some("true".into()),
+                control: None,
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
             .await
             .unwrap();
         assert_eq!(result.output, expected_prompt("claude", 0, &cwd));
@@ -1639,10 +1888,16 @@ mod tests {
     #[tokio::test]
     async fn prompt_with_empty_agent_name() {
         // Default (no name) omits the name prefix from the prompt.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let cwd = tool.working_directory().await;
         let result = tool
-            .call(TypeArgs { keys: "true\n".into(), interactive: false, timeout: None , reset: false})
+            .call(TerminalArgs {
+                command: Some("true".into()),
+                control: None,
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
             .await
             .unwrap();
         // Must NOT contain a colon before the cwd (no name prefix).
@@ -1652,10 +1907,11 @@ mod tests {
     #[tokio::test]
     async fn killed_output_includes_killed_message() {
         // Non-interactive timeout kill appends "Killed\n" then the prompt.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let result = tool
-            .call(TypeArgs {
-                keys: "sleep 9999\n".into(),
+            .call(TerminalArgs {
+                command: Some("sleep 9999".into()),
+                control: None,
                 interactive: false,
                 timeout: Some(0.1),
                 reset: false,
@@ -1663,7 +1919,11 @@ mod tests {
             .await
             .unwrap();
         match &result.outcome {
-            Outcome::Killed { exit_code, working_directory, .. } => {
+            Outcome::Killed {
+                exit_code,
+                working_directory,
+                ..
+            } => {
                 let expected = format!(
                     "Killed\n{}",
                     expected_prompt("", *exit_code, working_directory),
@@ -1677,10 +1937,11 @@ mod tests {
     #[tokio::test]
     async fn shell_exited_output_includes_respawned_message() {
         // When the shell exits, output includes "Shell exited, respawned\n" + prompt.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let result = tool
-            .call(TypeArgs {
-                keys: "exec command true\n".into(),
+            .call(TerminalArgs {
+                command: Some("exec command true".into()),
+                control: None,
                 interactive: false,
                 timeout: Some(2.0),
                 reset: false,
@@ -1705,10 +1966,11 @@ mod tests {
     async fn non_interactive_timeout_kills_foreground_and_sets_timeout_message() {
         // Non-interactive timeout: kill the foreground process group, return
         // captured output. The outcome is Killed.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let result = tool
-            .call(TypeArgs {
-                keys: "sleep 9999\n".into(),
+            .call(TerminalArgs {
+                command: Some("sleep 9999".into()),
+                control: None,
                 interactive: false,
                 timeout: Some(0.1), // 100 ms — much shorter than sleep
                 reset: false,
@@ -1717,7 +1979,8 @@ mod tests {
             .unwrap();
         assert!(
             matches!(result.outcome, Outcome::Killed { .. }),
-            "non-interactive timeout must result in Outcome::Killed; got: {:?}", result.outcome
+            "non-interactive timeout must result in Outcome::Killed; got: {:?}",
+            result.outcome
         );
     }
 
@@ -1727,10 +1990,11 @@ mod tests {
         // regains control and emits a sentinel whose exit code reflects the
         // killed process. SIGINT arrives first (130 = 128+2), but SIGTERM
         // (143) or SIGKILL (137) are also possible if SIGINT didn't win the race.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let result = tool
-            .call(TypeArgs {
-                keys: "sleep 9999\n".into(),
+            .call(TerminalArgs {
+                command: Some("sleep 9999".into()),
+                control: None,
                 interactive: false,
                 timeout: Some(0.1),
                 reset: false,
@@ -1753,11 +2017,12 @@ mod tests {
     async fn interactive_timeout_returns_partial_output_without_killing_process() {
         // Interactive timeout: return partial output so the model can decide
         // what to type next. The process must remain alive.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         // `cat` with no args blocks on stdin — ideal for testing interactive mode.
         let partial = tool
-            .call(TypeArgs {
-                keys: "cat\n".into(),
+            .call(TerminalArgs {
+                command: Some("cat".into()),
+                control: None,
                 interactive: true,
                 timeout: Some(0.1),
                 reset: false,
@@ -1771,8 +2036,9 @@ mod tests {
         );
         // Clean up: Ctrl-D (EOF) so cat exits and the shell returns to prompt.
         let cleanup = tool
-            .call(TypeArgs {
-                keys: "\x04".into(), // Ctrl-D
+            .call(TerminalArgs {
+                command: None,
+                control: Some("ctrl-d".into()),
                 interactive: false,
                 timeout: Some(2.0),
                 reset: false,
@@ -1787,14 +2053,15 @@ mod tests {
 
     #[tokio::test]
     async fn ctrl_c_sends_sigint_terminating_foreground_process_group() {
-        // Ctrl-C (\x03) must terminate the foreground process so the shell
+        // Ctrl-C (ctrl-c) must terminate the foreground process so the shell
         // returns to the prompt and emits an OSC sentinel.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         // Start a long-running process in interactive mode, let it time out so
         // we get partial output quickly.
         let _ = tool
-            .call(TypeArgs {
-                keys: "sleep 9999\n".into(),
+            .call(TerminalArgs {
+                command: Some("sleep 9999".into()),
+                control: None,
                 interactive: true,
                 timeout: Some(0.1),
                 reset: false,
@@ -1802,8 +2069,9 @@ mod tests {
             .await;
         // Send Ctrl-C to kill the still-running sleep.
         let result = tool
-            .call(TypeArgs {
-                keys: "\x03".into(),
+            .call(TerminalArgs {
+                command: None,
+                control: Some("ctrl-c".into()),
                 interactive: false,
                 timeout: Some(2.0),
                 reset: false,
@@ -1812,91 +2080,84 @@ mod tests {
             .unwrap();
         assert!(
             matches!(result.outcome, Outcome::Completed { .. }),
-            "Ctrl-C must terminate the foreground process and produce a sentinel; got: {:?}", result.outcome
+            "Ctrl-C must terminate the foreground process and produce a sentinel; got: {:?}",
+            result.outcome
         );
     }
 
-    // ── Escape sequence handling: JSON → PTY byte path ────────────────────
+    // ── JSON deserialization tests for command/control fields ──────────────────
     //
-    // The LLM sends JSON like `{"keys": "ls\n"}`. The tool description
-    // advertises `\n`, `\x03`, `\x04` etc.  JSON only supports `\n`, `\t`,
-    // `\uXXXX`, and a few others — NOT `\xNN`.  These tests verify what
-    // actually arrives at the PTY after serde_json deserialization.
+    // The LLM sends JSON with either `command` or `control` field (not both, not neither).
+    // These tests verify serde_json correctly deserializes the new TerminalArgs structure.
 
     #[test]
-    fn json_backslash_n_deserializes_to_newline_byte() {
-        // JSON supports \n natively. This is the happy path for Enter.
-        let args: TypeArgs = serde_json::from_str(r#"{"keys": "ls\n"}"#).unwrap();
-        assert!(
-            args.keys.contains('\n'),
-            r#"JSON "ls\n" must deserialize to a string containing 0x0A; got bytes: {:?}"#,
-            args.keys.as_bytes()
-        );
+    fn json_deserializes_command_field() {
+        // Basic command deserialization: {"command": "ls"}
+        let args: TerminalArgs = serde_json::from_str(r#"{"command": "ls"}"#).unwrap();
+        assert_eq!(args.command, Some("ls".into()));
+        assert_eq!(args.control, None);
     }
 
     #[test]
-    fn json_backslash_x03_does_not_deserialize_to_ctrl_c_byte() {
-        // JSON does NOT support \xNN escape sequences.  serde_json rejects
-        // them outright.  If the LLM sends {"keys": "\x03"}, deserialization
-        // fails — the Ctrl-C never reaches the PTY.
-        //
-        // This documents the current behavior.  The tool description advertises
-        // \x03 for Ctrl-C, but it only works if the framework pre-processes
-        // escape sequences before calling serde, or if the LLM uses \u0003.
-        let result = serde_json::from_str::<TypeArgs>(r#"{"keys": "\x03"}"#);
-        assert!(
-            result.is_err(),
-            r#"JSON "\x03" is not a valid JSON escape; serde_json must reject it. \
-               If this passes, the LLM's \x03 silently becomes something other than Ctrl-C."#
-        );
+    fn json_deserializes_control_field() {
+        // Basic control deserialization: {"control": "ctrl-c"}
+        let args: TerminalArgs = serde_json::from_str(r#"{"control": "ctrl-c"}"#).unwrap();
+        assert_eq!(args.command, None);
+        assert_eq!(args.control, Some("ctrl-c".into()));
     }
 
     #[test]
-    fn json_backslash_u0003_deserializes_to_ctrl_c_byte() {
-        // \u0003 is JSON's way to encode Ctrl-C (ETX, byte 0x03).
-        // This is the correct escape for sending control characters via JSON.
-        let args: TypeArgs = serde_json::from_str(r#"{"keys": "\u0003"}"#).unwrap();
-        assert_eq!(
-            args.keys.as_bytes(),
-            &[0x03],
-            r#"JSON "\u0003" must deserialize to byte 0x03 (Ctrl-C)"#
-        );
+    fn json_deserializes_reset_flag() {
+        // Reset flag with empty command/control: {"reset": true}
+        let args: TerminalArgs = serde_json::from_str(r#"{"reset": true}"#).unwrap();
+        assert!(args.reset);
+        assert_eq!(args.command, None);
+        assert_eq!(args.control, None);
     }
 
     #[test]
-    fn json_backslash_u0004_deserializes_to_ctrl_d_byte() {
-        // \u0004 = Ctrl-D (EOT). Same pattern as Ctrl-C.
-        let args: TypeArgs = serde_json::from_str(r#"{"keys": "\u0004"}"#).unwrap();
-        assert_eq!(
-            args.keys.as_bytes(),
-            &[0x04],
-            r#"JSON "\u0004" must deserialize to byte 0x04 (Ctrl-D)"#
-        );
+    fn json_deserializes_command_with_other_fields() {
+        // Command with interactive and timeout: {"command": "sleep 5", "interactive": true, "timeout": 10.0}
+        let args: TerminalArgs =
+            serde_json::from_str(r#"{"command": "sleep 5", "interactive": true, "timeout": 10.0}"#)
+                .unwrap();
+        assert_eq!(args.command, Some("sleep 5".into()));
+        assert_eq!(args.control, None);
+        assert!(args.interactive);
+        assert_eq!(args.timeout, Some(10.0));
     }
 
     #[tokio::test]
-    async fn ctrl_c_via_json_u0003_terminates_foreground_process() {
-        // End-to-end: the LLM sends \u0003 (the only correct JSON encoding
-        // of Ctrl-C). Verify it actually delivers SIGINT to the foreground.
-        let tool = TypeTool::new().spawn().await.unwrap();
+    async fn ctrl_c_via_control_field_terminates_foreground_process() {
+        // End-to-end: sending Ctrl-C via the control field must deliver SIGINT to foreground.
+        let tool = TerminalTool::new().spawn().await.unwrap();
 
         // Start a long-running foreground process.
         let _ = tool
-            .call(TypeArgs {
-                keys: "sleep 9999\n".into(),
+            .call(TerminalArgs {
+                command: Some("sleep 9999".into()),
+                control: None,
                 interactive: true,
                 timeout: Some(0.1),
                 reset: false,
             })
             .await;
 
-        // Deserialize from JSON the way the framework would.
-        let args: TypeArgs = serde_json::from_str(r#"{"keys": "\u0003", "interactive": false, "timeout": 2.0}"#).unwrap();
-        let result = tool.call(args).await.unwrap();
+        // Send Ctrl-C via control field.
+        let result = tool
+            .call(TerminalArgs {
+                command: None,
+                control: Some("ctrl-c".into()),
+                interactive: false,
+                timeout: Some(2.0),
+                reset: false,
+            })
+            .await
+            .unwrap();
 
         assert!(
             matches!(result.outcome, Outcome::Completed { .. }),
-            r#"Ctrl-C via JSON \u0003 must terminate the foreground process; got: {:?}"#,
+            "Ctrl-C via control field must terminate the foreground process; got: {:?}",
             result.outcome
         );
     }
@@ -1905,76 +2166,92 @@ mod tests {
 
     #[tokio::test]
     async fn call_with_nan_timeout_returns_error() {
-        let tool = TypeTool::new();
+        let tool = TerminalTool::new();
         let result = tool
-            .call(TypeArgs { keys: "echo hi\n".into(), interactive: false, timeout: Some(f64::NAN) , reset: false})
+            .call(TerminalArgs {
+                command: Some("echo hi".into()),
+                control: None,
+                interactive: false,
+                timeout: Some(f64::NAN),
+                reset: false,
+            })
             .await;
-        assert!(matches!(result, Err(TypeError::InvalidTimeout(t)) if t.is_nan()));
+        assert!(matches!(result, Err(TerminalError::InvalidTimeout(t)) if t.is_nan()));
     }
 
     #[tokio::test]
     async fn call_with_negative_timeout_returns_error() {
-        let tool = TypeTool::new();
+        let tool = TerminalTool::new();
         let result = tool
-            .call(TypeArgs { keys: "echo hi\n".into(), interactive: false, timeout: Some(-1.0) , reset: false})
+            .call(TerminalArgs {
+                command: Some("echo hi".into()),
+                control: None,
+                interactive: false,
+                timeout: Some(-1.0),
+                reset: false,
+            })
             .await;
-        assert!(matches!(result, Err(TypeError::InvalidTimeout(t)) if t == -1.0));
+        assert!(matches!(result, Err(TerminalError::InvalidTimeout(t)) if t == -1.0));
     }
 
     #[tokio::test]
     async fn call_with_infinite_timeout_returns_error() {
-        let tool = TypeTool::new();
+        let tool = TerminalTool::new();
         let result = tool
-            .call(TypeArgs {
-                keys: "echo hi\n".into(),
+            .call(TerminalArgs {
+                command: Some("echo hi".into()),
+                control: None,
                 interactive: false,
                 timeout: Some(f64::INFINITY),
                 reset: false,
             })
             .await;
-        assert!(matches!(result, Err(TypeError::InvalidTimeout(t)) if t.is_infinite()));
+        assert!(matches!(result, Err(TerminalError::InvalidTimeout(t)) if t.is_infinite()));
     }
 
     #[tokio::test]
     async fn call_with_huge_finite_timeout_returns_error_instead_of_panicking() {
         // f64::MAX is finite but overflows Duration::from_secs_f64, which panics.
         // The validation must reject values above MAX_TIMEOUT_SECS.
-        let tool = TypeTool::new();
+        let tool = TerminalTool::new();
         let result = tool
-            .call(TypeArgs {
-                keys: "echo hi\n".into(),
+            .call(TerminalArgs {
+                command: Some("echo hi".into()),
+                control: None,
                 interactive: false,
                 timeout: Some(f64::MAX),
                 reset: false,
             })
             .await;
         assert!(
-            matches!(result, Err(TypeError::InvalidTimeout(_))),
+            matches!(result, Err(TerminalError::InvalidTimeout(_))),
             "f64::MAX must be rejected as InvalidTimeout, not panic; got: {result:?}"
         );
     }
 
     #[tokio::test]
     async fn call_with_timeout_just_above_max_returns_error() {
-        let tool = TypeTool::new();
+        let tool = TerminalTool::new();
         let result = tool
-            .call(TypeArgs {
-                keys: "echo hi\n".into(),
+            .call(TerminalArgs {
+                command: Some("echo hi".into()),
+                control: None,
                 interactive: false,
                 timeout: Some(MAX_TIMEOUT_SECS + 1.0),
                 reset: false,
             })
             .await;
-        assert!(matches!(result, Err(TypeError::InvalidTimeout(_))));
+        assert!(matches!(result, Err(TerminalError::InvalidTimeout(_))));
     }
 
     #[tokio::test]
     async fn call_with_timeout_at_max_is_accepted() {
         // Exactly MAX_TIMEOUT_SECS must be valid.
-        let tool = TypeTool::new();
+        let tool = TerminalTool::new();
         let result = tool
-            .call(TypeArgs {
-                keys: "echo hi\n".into(),
+            .call(TerminalArgs {
+                command: Some("echo hi".into()),
+                control: None,
                 interactive: false,
                 timeout: Some(MAX_TIMEOUT_SECS),
                 reset: false,
@@ -1982,21 +2259,22 @@ mod tests {
             .await;
         // Should fail with SessionNotInitialized (timeout is valid, no session).
         assert!(
-            matches!(result, Err(TypeError::SessionNotInitialized)),
+            matches!(result, Err(TerminalError::SessionNotInitialized)),
             "MAX_TIMEOUT_SECS must be accepted; got: {result:?}"
         );
     }
 
     #[tokio::test]
     async fn interactive_timeout_returns_buffered_partial_output_not_empty() {
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
 
         // `printf` flushes immediately (unlike `echo` which may buffer).
         // The marker appears in the PTY stream before `cat` blocks on stdin,
         // so it must be present in the partial output returned on timeout.
         let result = tool
-            .call(TypeArgs {
-                keys: "printf 'partial_output_marker'; cat\n".into(),
+            .call(TerminalArgs {
+                command: Some("printf 'partial_output_marker'; cat".into()),
+                control: None,
                 interactive: true,
                 timeout: Some(0.3),
                 reset: false,
@@ -2006,7 +2284,13 @@ mod tests {
 
         // Clean up: Ctrl-C kills the still-running cat.
         let _ = tool
-            .call(TypeArgs { keys: "\x03".into(), interactive: false, timeout: Some(2.0) , reset: false})
+            .call(TerminalArgs {
+                command: None,
+                control: Some("ctrl-c".into()),
+                interactive: false,
+                timeout: Some(2.0),
+                reset: false,
+            })
             .await;
 
         assert!(
@@ -2038,7 +2322,7 @@ mod tests {
             cc.lock().unwrap().push(n.pid);
         });
 
-        manager.sync(&HashSet::from([10]));     // T0: snapshot — tracked = {10}
+        manager.sync(&HashSet::from([10])); // T0: snapshot — tracked = {10}
         manager.sync(&HashSet::from([10, 20])); // T1: call() adds PID 20 mid-flight
 
         // T3: watcher calls retain with only the PIDs it actually asked sysinfo
@@ -2062,7 +2346,7 @@ mod tests {
         // Start a short-lived background job, discover it via call(), then let
         // the watcher detect its completion via sysinfo polling.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let tool = tool.with_job_callback(move |notif| {
             let _ = tx.send(notif.pid);
         });
@@ -2072,15 +2356,19 @@ mod tests {
 
         // Launch `sleep 2 &` and discover the background PID via call().
         let result = tool
-            .call(TypeArgs {
-                keys: "sleep 2 &\n".into(),
+            .call(TerminalArgs {
+                command: Some("sleep 2 &".into()),
+                control: None,
                 interactive: false,
                 timeout: None,
                 reset: false,
             })
             .await
             .unwrap();
-        assert!(matches!(result.outcome, Outcome::Completed { exit_code: 0, .. }));
+        assert!(matches!(
+            result.outcome,
+            Outcome::Completed { exit_code: 0, .. }
+        ));
 
         // Verify the job was discovered.
         let tracked: Vec<u32> = tool
@@ -2091,16 +2379,16 @@ mod tests {
             .keys()
             .copied()
             .collect();
-        assert!(!tracked.is_empty(), "background job must be tracked after call()");
+        assert!(
+            !tracked.is_empty(),
+            "background job must be tracked after call()"
+        );
 
         // Wait for the callback to fire (sleep 2 + up to 3s poll margin).
-        let completed_pid = tokio::time::timeout(
-            Duration::from_secs(8),
-            rx.recv(),
-        )
-        .await
-        .expect("watcher must detect background job completion within 8s")
-        .expect("channel must not be closed");
+        let completed_pid = tokio::time::timeout(Duration::from_secs(8), rx.recv())
+            .await
+            .expect("watcher must detect background job completion within 8s")
+            .expect("channel must not be closed");
 
         assert!(
             tracked.contains(&completed_pid),
@@ -2114,12 +2402,13 @@ mod tests {
     async fn watcher_backfills_command_field_for_tracked_job() {
         // After call() discovers a background PID with an empty command,
         // the watcher's next sysinfo poll must backfill the command field.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let watcher = tool.spawn_watcher();
 
         // Launch a background job with a recognizable command.
-        tool.call(TypeArgs {
-            keys: "sleep 30 &\n".into(),
+        tool.call(TerminalArgs {
+            command: Some("sleep 30 &".into()),
+            control: None,
             interactive: false,
             timeout: None,
             reset: false,
@@ -2132,7 +2421,10 @@ mod tests {
             let jm = tool.job_manager.lock().unwrap();
             assert!(!jm.jobs.is_empty(), "background job must be tracked");
             let (&pid, job) = jm.jobs.iter().next().unwrap();
-            assert!(job.command.is_empty(), "command must start empty after sync()");
+            assert!(
+                job.command.is_empty(),
+                "command must start empty after sync()"
+            );
             pid
         };
 
@@ -2167,15 +2459,16 @@ mod tests {
         // End-to-end: the completion notification must carry the command string
         // that was backfilled by sysinfo, not the empty string from sync().
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let tool = tool.with_job_callback(move |notif| {
             let _ = tx.send(notif.command);
         });
         let watcher = tool.spawn_watcher();
 
         // Launch a short-lived background job.
-        tool.call(TypeArgs {
-            keys: "sleep 2 &\n".into(),
+        tool.call(TerminalArgs {
+            command: Some("sleep 2 &".into()),
+            control: None,
             interactive: false,
             timeout: None,
             reset: false,
@@ -2202,11 +2495,12 @@ mod tests {
     async fn watcher_does_not_overwrite_already_populated_command() {
         // If the command was already populated (e.g. by the harness), the
         // watcher must not overwrite it with sysinfo data.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let watcher = tool.spawn_watcher();
 
-        tool.call(TypeArgs {
-            keys: "sleep 30 &\n".into(),
+        tool.call(TerminalArgs {
+            command: Some("sleep 30 &".into()),
+            control: None,
             interactive: false,
             timeout: None,
             reset: false,
@@ -2244,11 +2538,12 @@ mod tests {
         // Correct behavior: the output printed before EOF ("Hello Mom!") must
         // be returned to the caller. The shell is dead so there's no sentinel
         // — the outcome should be ShellExited.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
 
         let result = tool
-            .call(TypeArgs {
-                keys: "exec /bin/echo 'Hello Mom!'\n".into(),
+            .call(TerminalArgs {
+                command: Some("exec /bin/echo 'Hello Mom!'".into()),
+                control: None,
                 interactive: false,
                 timeout: Some(2.0),
                 reset: false,
@@ -2275,12 +2570,13 @@ mod tests {
         // Correct behavior: When the shell dies, call() detects EOF and
         // respawns a new bash session transparently. The first call returns
         // ShellExited, and the second call should work normally.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
 
         // Kill the shell.
         let first_result = tool
-            .call(TypeArgs {
-                keys: "exec /bin/echo 'Hello Mom!'\n".into(),
+            .call(TerminalArgs {
+                command: Some("exec /bin/echo 'Hello Mom!'".into()),
+                control: None,
                 interactive: false,
                 timeout: Some(2.0),
                 reset: false,
@@ -2290,13 +2586,15 @@ mod tests {
 
         assert!(
             matches!(first_result.outcome, Outcome::ShellExited { .. }),
-            "exec must kill the shell, resulting in ShellExited; got: {:?}", first_result.outcome
+            "exec must kill the shell, resulting in ShellExited; got: {:?}",
+            first_result.outcome
         );
 
         // Next call should work — the shell has been respawned.
         let result = tool
-            .call(TypeArgs {
-                keys: "echo 'still alive!'\n".into(),
+            .call(TerminalArgs {
+                command: Some("echo 'still alive!'".into()),
+                control: None,
                 interactive: false,
                 timeout: Some(5.0),
                 reset: false,
@@ -2305,10 +2603,15 @@ mod tests {
             .expect("call on a respawned session must work normally");
 
         match &result.outcome {
-            Outcome::Completed { working_directory, .. } => {
+            Outcome::Completed {
+                working_directory, ..
+            } => {
                 assert_eq!(
                     result.output,
-                    format!("still alive!\r\n{}", expected_prompt("", 0, working_directory)),
+                    format!(
+                        "still alive!\r\n{}",
+                        expected_prompt("", 0, working_directory)
+                    ),
                 );
             }
             other => panic!("expected Outcome::Completed; got: {other:?}"),
@@ -2367,11 +2670,12 @@ mod tests {
         //
         // This test checks the contract: Killed outcome must always have
         // a non-empty working_directory (fall back to last-known cwd).
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
 
         // Navigate somewhere specific so we have a known cwd.
-        tool.call(TypeArgs {
-            keys: "cd /tmp\n".into(),
+        tool.call(TerminalArgs {
+            command: Some("cd /tmp".into()),
+            control: None,
             interactive: false,
             timeout: None,
             reset: false,
@@ -2381,8 +2685,9 @@ mod tests {
 
         // Trigger a non-interactive timeout + kill.
         let result = tool
-            .call(TypeArgs {
-                keys: "sleep 9999\n".into(),
+            .call(TerminalArgs {
+                command: Some("sleep 9999".into()),
+                control: None,
                 interactive: false,
                 timeout: Some(0.1),
                 reset: false,
@@ -2391,7 +2696,9 @@ mod tests {
             .unwrap();
 
         match &result.outcome {
-            Outcome::Killed { working_directory, .. } => {
+            Outcome::Killed {
+                working_directory, ..
+            } => {
                 assert!(
                     !working_directory.is_empty(),
                     "Killed outcome must report a non-empty working_directory; \
@@ -2407,7 +2714,7 @@ mod tests {
         // The watcher must not panic or fire callbacks when no jobs are tracked.
         let fired = Arc::new(Mutex::new(false));
         let fc = Arc::clone(&fired);
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let tool = tool.with_job_callback(move |_| {
             *fc.lock().unwrap() = true;
         });
@@ -2417,7 +2724,10 @@ mod tests {
         // Let several poll cycles pass.
         tokio::time::sleep(Duration::from_millis(2500)).await;
 
-        assert!(!*fired.lock().unwrap(), "no callback should fire with no tracked jobs");
+        assert!(
+            !*fired.lock().unwrap(),
+            "no callback should fire with no tracked jobs"
+        );
         watcher.abort();
     }
 
@@ -2426,11 +2736,12 @@ mod tests {
     #[tokio::test]
     async fn reset_spawns_fresh_session() {
         // After reset, the tool must have a working session at a valid cwd.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
 
         let result = tool
-            .call(TypeArgs {
-                keys: String::new(),
+            .call(TerminalArgs {
+                command: None,
+                control: None,
                 interactive: false,
                 timeout: None,
                 reset: true,
@@ -2440,8 +2751,14 @@ mod tests {
 
         match &result.outcome {
             Outcome::Reset { working_directory } => {
-                assert!(!working_directory.is_empty(), "reset must report a non-empty cwd");
-                let expected = format!("Session reset\n{}", expected_prompt("", 0, working_directory));
+                assert!(
+                    !working_directory.is_empty(),
+                    "reset must report a non-empty cwd"
+                );
+                let expected = format!(
+                    "Session reset\n{}",
+                    expected_prompt("", 0, working_directory)
+                );
                 assert_eq!(result.output, expected);
             }
             other => panic!("expected Outcome::Reset; got: {other:?}"),
@@ -2450,14 +2767,15 @@ mod tests {
 
     #[tokio::test]
     async fn reset_ignores_keys_argument() {
-        // When reset=true, the keys field is ignored — no keystrokes are sent.
-        // Verify by sending a command that would set an env var, then checking
+        // When reset=true, the command/control fields are ignored — no input is sent.
+        // Verify by attempting to set an env var in reset, then checking
         // it doesn't exist after reset.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
 
-        // Reset with keys that would normally set a variable.
-        tool.call(TypeArgs {
-            keys: "export TEKTON_RESET_TEST=should_not_exist\n".into(),
+        // Reset with command that would normally set a variable (ignored).
+        tool.call(TerminalArgs {
+            command: Some("export TEKTON_RESET_TEST=should_not_exist".into()),
+            control: None,
             interactive: false,
             timeout: None,
             reset: true,
@@ -2467,8 +2785,9 @@ mod tests {
 
         // The variable must not exist in the fresh session.
         let result = tool
-            .call(TypeArgs {
-                keys: "echo ${TEKTON_RESET_TEST:-UNSET}\n".into(),
+            .call(TerminalArgs {
+                command: Some("echo ${TEKTON_RESET_TEST:-UNSET}".into()),
+                control: None,
                 interactive: false,
                 timeout: None,
                 reset: false,
@@ -2477,7 +2796,9 @@ mod tests {
             .unwrap();
 
         match &result.outcome {
-            Outcome::Completed { working_directory, .. } => {
+            Outcome::Completed {
+                working_directory, ..
+            } => {
                 assert_eq!(
                     result.output,
                     format!("UNSET\r\n{}", expected_prompt("", 0, working_directory)),
@@ -2490,11 +2811,12 @@ mod tests {
     #[tokio::test]
     async fn reset_clears_tracked_background_jobs() {
         // Background jobs from the old shell must not carry over after reset.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
 
         // Start a background job.
-        tool.call(TypeArgs {
-            keys: "sleep 60 &\n".into(),
+        tool.call(TerminalArgs {
+            command: Some("sleep 60 &".into()),
+            control: None,
             interactive: false,
             timeout: None,
             reset: false,
@@ -2508,8 +2830,9 @@ mod tests {
         );
 
         // Reset the session.
-        tool.call(TypeArgs {
-            keys: String::new(),
+        tool.call(TerminalArgs {
+            command: None,
+            control: None,
             interactive: false,
             timeout: None,
             reset: true,
@@ -2527,11 +2850,12 @@ mod tests {
     async fn reset_recovers_from_stuck_session() {
         // Simulate a stuck session: start an interactive process, then reset
         // instead of trying to clean it up manually.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
 
         // Start a blocking process (cat waits for input indefinitely).
-        tool.call(TypeArgs {
-            keys: "cat\n".into(),
+        tool.call(TerminalArgs {
+            command: Some("cat".into()),
+            control: None,
             interactive: true,
             timeout: Some(0.1),
             reset: false,
@@ -2541,8 +2865,9 @@ mod tests {
 
         // Reset instead of trying Ctrl-C/Ctrl-D.
         let reset_result = tool
-            .call(TypeArgs {
-                keys: String::new(),
+            .call(TerminalArgs {
+                command: None,
+                control: None,
                 interactive: false,
                 timeout: None,
                 reset: true,
@@ -2554,8 +2879,9 @@ mod tests {
 
         // The new session must work normally.
         let result = tool
-            .call(TypeArgs {
-                keys: "echo recovered\n".into(),
+            .call(TerminalArgs {
+                command: Some("echo recovered".into()),
+                control: None,
                 interactive: false,
                 timeout: None,
                 reset: false,
@@ -2564,7 +2890,9 @@ mod tests {
             .unwrap();
 
         match &result.outcome {
-            Outcome::Completed { working_directory, .. } => {
+            Outcome::Completed {
+                working_directory, ..
+            } => {
                 assert_eq!(
                     result.output,
                     format!("recovered\r\n{}", expected_prompt("", 0, working_directory)),
@@ -2578,11 +2906,12 @@ mod tests {
     async fn reset_discards_old_session_state() {
         // Environment variables, functions, and cwd from the old session
         // must not survive a reset.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
 
         // Set up state in the old session.
-        tool.call(TypeArgs {
-            keys: "export TEKTON_OLD=42; cd /tmp\n".into(),
+        tool.call(TerminalArgs {
+            command: Some("export TEKTON_OLD=42; cd /tmp".into()),
+            control: None,
             interactive: false,
             timeout: None,
             reset: false,
@@ -2591,8 +2920,9 @@ mod tests {
         .unwrap();
 
         // Reset.
-        tool.call(TypeArgs {
-            keys: String::new(),
+        tool.call(TerminalArgs {
+            command: None,
+            control: None,
             interactive: false,
             timeout: None,
             reset: true,
@@ -2602,8 +2932,9 @@ mod tests {
 
         // Verify the env var is gone.
         let result = tool
-            .call(TypeArgs {
-                keys: "echo ${TEKTON_OLD:-GONE}\n".into(),
+            .call(TerminalArgs {
+                command: Some("echo ${TEKTON_OLD:-GONE}".into()),
+                control: None,
                 interactive: false,
                 timeout: None,
                 reset: false,
@@ -2612,13 +2943,18 @@ mod tests {
             .unwrap();
 
         match &result.outcome {
-            Outcome::Completed { working_directory, .. } => {
+            Outcome::Completed {
+                working_directory, ..
+            } => {
                 assert_eq!(
                     result.output,
                     format!("GONE\r\n{}", expected_prompt("", 0, working_directory)),
                 );
                 // The cwd should be the fresh session's default, not /tmp.
-                assert_ne!(working_directory, "/tmp", "cwd must not carry over from old session");
+                assert_ne!(
+                    working_directory, "/tmp",
+                    "cwd must not carry over from old session"
+                );
             }
             other => panic!("expected Outcome::Completed; got: {other:?}"),
         }
@@ -2627,11 +2963,12 @@ mod tests {
     #[tokio::test]
     async fn reset_without_prior_session_spawns_new_one() {
         // If the session was never initialized, reset should spawn one.
-        let tool = TypeTool::new();
+        let tool = TerminalTool::new();
 
         let result = tool
-            .call(TypeArgs {
-                keys: String::new(),
+            .call(TerminalArgs {
+                command: None,
+                control: None,
                 interactive: false,
                 timeout: None,
                 reset: true,
@@ -2643,8 +2980,9 @@ mod tests {
 
         // Verify the new session works.
         let result = tool
-            .call(TypeArgs {
-                keys: "echo alive\n".into(),
+            .call(TerminalArgs {
+                command: Some("echo alive".into()),
+                control: None,
                 interactive: false,
                 timeout: None,
                 reset: false,
@@ -2653,7 +2991,9 @@ mod tests {
             .unwrap();
 
         match &result.outcome {
-            Outcome::Completed { working_directory, .. } => {
+            Outcome::Completed {
+                working_directory, ..
+            } => {
                 assert_eq!(
                     result.output,
                     format!("alive\r\n{}", expected_prompt("", 0, working_directory)),
@@ -2665,15 +3005,16 @@ mod tests {
 
     #[tokio::test]
     async fn reset_with_agent_name_includes_name_in_prompt() {
-        let tool = TypeTool::new()
+        let tool = TerminalTool::new()
             .with_name("claude")
             .spawn()
             .await
             .unwrap();
 
         let result = tool
-            .call(TypeArgs {
-                keys: String::new(),
+            .call(TerminalArgs {
+                command: None,
+                control: None,
                 interactive: false,
                 timeout: None,
                 reset: true,
@@ -2695,15 +3036,15 @@ mod tests {
 
     #[test]
     fn reset_true_deserializes_from_json() {
-        // The LLM sends {"keys": "", "reset": true}. Verify serde handles it.
-        let args: TypeArgs = serde_json::from_str(r#"{"keys": "", "reset": true}"#).unwrap();
+        // The LLM sends {"reset": true}. Verify serde handles it.
+        let args: TerminalArgs = serde_json::from_str(r#"{"reset": true}"#).unwrap();
         assert!(args.reset);
     }
 
     #[test]
     fn reset_defaults_to_false_in_json() {
         // When reset is omitted from JSON, it defaults to false.
-        let args: TypeArgs = serde_json::from_str(r#"{"keys": "ls\n"}"#).unwrap();
+        let args: TerminalArgs = serde_json::from_str(r#"{"command": "ls"}"#).unwrap();
         assert!(!args.reset);
     }
 
@@ -2720,10 +3061,11 @@ mod tests {
         // Bug this catches: kill_foreground only killing direct children that are
         // "obvious" long-running processes (like sleep), but missing compound
         // commands where the process tree looks different.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
         let result = tool
-            .call(TypeArgs {
-                keys: "for i in $(seq 1 20); do echo $i; sleep 1; done\n".into(),
+            .call(TerminalArgs {
+                command: Some("for i in $(seq 1 20); do echo $i; sleep 1; done".into()),
+                control: None,
                 interactive: false,
                 timeout: Some(2.0),
                 reset: false,
@@ -2732,7 +3074,11 @@ mod tests {
             .unwrap();
 
         match &result.outcome {
-            Outcome::Killed { exit_code, working_directory, .. } => {
+            Outcome::Killed {
+                exit_code,
+                working_directory,
+                ..
+            } => {
                 // The loop was killed mid-flight. We should see some early
                 // numbers in the partial output captured before the timeout.
                 assert!(
@@ -2765,9 +3111,10 @@ mod tests {
         // must be usable for subsequent calls. The SIGINT to the shell itself
         // ensures bash returns to its prompt even if the loop left the PTY in
         // a dirty state, so drain_after_kill can capture the sentinel.
-        let tool = TypeTool::new().spawn().await.unwrap();
-        tool.call(TypeArgs {
-            keys: "for i in $(seq 1 20); do echo $i; sleep 1; done\n".into(),
+        let tool = TerminalTool::new().spawn().await.unwrap();
+        tool.call(TerminalArgs {
+            command: Some("for i in $(seq 1 20); do echo $i; sleep 1; done".into()),
+            control: None,
             interactive: false,
             timeout: Some(2.0),
             reset: false,
@@ -2777,8 +3124,9 @@ mod tests {
 
         // This follow-up must complete, not time out again.
         let follow_up = tool
-            .call(TypeArgs {
-                keys: "echo recovered\n".into(),
+            .call(TerminalArgs {
+                command: Some("echo recovered".into()),
+                control: None,
                 interactive: false,
                 timeout: Some(3.0),
                 reset: false,
@@ -2786,7 +3134,9 @@ mod tests {
             .await
             .unwrap();
         match &follow_up.outcome {
-            Outcome::Completed { working_directory, .. } => {
+            Outcome::Completed {
+                working_directory, ..
+            } => {
                 assert_eq!(
                     follow_up.output,
                     format!("recovered\r\n{}", expected_prompt("", 0, working_directory)),
@@ -2803,12 +3153,13 @@ mod tests {
         // no child process — bash itself is the one stuck in open(2).
         // kill_foreground sends SIGINT to the shell, which interrupts the
         // open() syscall and returns bash to its prompt.
-        let tool = TypeTool::new().spawn().await.unwrap();
+        let tool = TerminalTool::new().spawn().await.unwrap();
 
         // Create a FIFO in a temp directory to avoid polluting the working dir.
         let setup = tool
-            .call(TypeArgs {
-                keys: "cd $(mktemp -d) && mkfifo test_fifo\n".into(),
+            .call(TerminalArgs {
+                command: Some("cd $(mktemp -d) && mkfifo test_fifo".into()),
+                control: None,
                 interactive: false,
                 timeout: Some(3.0),
                 reset: false,
@@ -2824,8 +3175,9 @@ mod tests {
         // `echo < test_fifo` will block because no process has the FIFO open
         // for writing. The timeout should kill the stuck process.
         let result = tool
-            .call(TypeArgs {
-                keys: "echo < test_fifo\n".into(),
+            .call(TerminalArgs {
+                command: Some("echo < test_fifo".into()),
+                control: None,
                 interactive: false,
                 timeout: Some(1.0),
                 reset: false,
@@ -2834,7 +3186,9 @@ mod tests {
             .unwrap();
 
         match &result.outcome {
-            Outcome::Killed { working_directory, .. } => {
+            Outcome::Killed {
+                working_directory, ..
+            } => {
                 assert!(
                     !working_directory.is_empty(),
                     "working_directory must not be empty after killing FIFO-blocked process"
@@ -2851,8 +3205,9 @@ mod tests {
 
         // Verify the session recovered and is usable.
         let follow_up = tool
-            .call(TypeArgs {
-                keys: "echo fifo_recovered\n".into(),
+            .call(TerminalArgs {
+                command: Some("echo fifo_recovered".into()),
+                control: None,
                 interactive: false,
                 timeout: Some(3.0),
                 reset: false,
@@ -2860,7 +3215,9 @@ mod tests {
             .await
             .unwrap();
         match &follow_up.outcome {
-            Outcome::Completed { working_directory, .. } => {
+            Outcome::Completed {
+                working_directory, ..
+            } => {
                 assert_eq!(
                     follow_up.output,
                     format!(
@@ -2871,5 +3228,130 @@ mod tests {
             }
             other => panic!("session must be usable after FIFO kill; got: {other:?}"),
         }
+    }
+
+    // ── encode_control_keys tests ───────────────────────────────────────────
+
+    #[test]
+    fn encode_ctrl_c_produces_etx_byte() {
+        let bytes = encode_control_keys("ctrl-c").unwrap();
+        assert_eq!(bytes, vec![0x03]);
+    }
+
+    #[test]
+    fn encode_ctrl_d_produces_eot_byte() {
+        let bytes = encode_control_keys("ctrl-d").unwrap();
+        assert_eq!(bytes, vec![0x04]);
+    }
+
+    #[test]
+    fn encode_multiple_keys_space_separated() {
+        let bytes = encode_control_keys("ctrl-c ctrl-d").unwrap();
+        assert_eq!(bytes, vec![0x03, 0x04]);
+    }
+
+    #[test]
+    fn encode_arrow_up_produces_escape_sequence() {
+        let bytes = encode_control_keys("Up").unwrap();
+        assert_eq!(bytes, vec![0x1b, b'[', b'A']);
+    }
+
+    #[test]
+    fn encode_shift_arrow_up_produces_modified_escape_sequence() {
+        let bytes = encode_control_keys("shift-Up").unwrap();
+        assert_eq!(bytes, vec![0x1b, b'[', b'1', b';', b'2', b'A']);
+    }
+
+    #[test]
+    fn encode_alt_f_produces_escape_f() {
+        let bytes = encode_control_keys("alt-f").unwrap();
+        assert_eq!(bytes, vec![0x1b, b'f']);
+    }
+
+    #[test]
+    fn encode_enter_produces_carriage_return() {
+        let bytes = encode_control_keys("enter").unwrap();
+        assert_eq!(bytes, vec![b'\r']);
+    }
+
+    #[test]
+    fn encode_tab_produces_tab_byte() {
+        let bytes = encode_control_keys("tab").unwrap();
+        assert_eq!(bytes, vec![b'\t']);
+    }
+
+    #[test]
+    fn encode_escape_key_produces_esc_byte() {
+        let bytes = encode_control_keys("esc").unwrap();
+        assert_eq!(bytes, vec![0x1b]);
+    }
+
+    #[test]
+    fn encode_invalid_key_returns_error() {
+        let result = encode_control_keys("not-a-real-key");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn encode_empty_string_returns_empty_bytes() {
+        // split_whitespace on empty string yields no tokens.
+        let bytes = encode_control_keys("").unwrap();
+        assert!(bytes.is_empty());
+    }
+
+    // ── Mutual exclusivity validation tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn call_rejects_both_command_and_control() {
+        let tool = TerminalTool::new();
+        let result = tool
+            .call(TerminalArgs {
+                command: Some("ls".into()),
+                control: Some("ctrl-c".into()),
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
+            .await;
+        assert!(
+            matches!(result, Err(TerminalError::InvalidInput(ref msg)) if msg.contains("both")),
+            "providing both command and control must be rejected; got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_rejects_neither_command_nor_control() {
+        let tool = TerminalTool::new();
+        let result = tool
+            .call(TerminalArgs {
+                command: None,
+                control: None,
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
+            .await;
+        assert!(
+            matches!(result, Err(TerminalError::InvalidInput(ref msg)) if msg.contains("neither")),
+            "providing neither command nor control must be rejected; got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_with_invalid_control_key_returns_error() {
+        let tool = TerminalTool::new().spawn().await.unwrap();
+        let result = tool
+            .call(TerminalArgs {
+                command: None,
+                control: Some("not-a-real-key".into()),
+                interactive: false,
+                timeout: None,
+                reset: false,
+            })
+            .await;
+        assert!(
+            matches!(result, Err(TerminalError::InvalidInput(_))),
+            "invalid control key must return InvalidInput error; got: {result:?}"
+        );
     }
 }

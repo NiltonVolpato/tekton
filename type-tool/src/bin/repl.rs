@@ -1,14 +1,14 @@
 use std::io::{self, BufRead, Write};
 
 use rig::tool::Tool;
-use tekton_type_tool::{Outcome, TypeArgs, TypeTool};
+use tekton_terminal_tool::{Outcome, TerminalArgs, TerminalTool};
 
 /// Default timeout in seconds for non-interactive commands.
 const DEFAULT_TIMEOUT: f64 = 30.0;
 
 #[tokio::main]
 async fn main() {
-    let tool = TypeTool::new()
+    let tool = TerminalTool::new()
         .spawn()
         .await
         .expect("failed to spawn PTY session");
@@ -52,11 +52,40 @@ async fn main() {
                         _ => eprintln!("[error: invalid timeout '{val}']"),
                     }
                 }
+                s if s.starts_with("/ctrl ") => {
+                    let keys = &s["/ctrl ".len()..];
+                    if keys.is_empty() {
+                        eprintln!("[error: /ctrl requires key notation, e.g. /ctrl ctrl-c]");
+                        continue;
+                    }
+                    let args = TerminalArgs {
+                        command: None,
+                        control: Some(keys.to_string()),
+                        interactive,
+                        timeout: Some(timeout),
+                        reset: false,
+                    };
+                    print_result(&tool, args).await;
+                    continue;
+                }
+                "/reset" => {
+                    let args = TerminalArgs {
+                        command: None,
+                        control: None,
+                        interactive: false,
+                        timeout: None,
+                        reset: true,
+                    };
+                    print_result(&tool, args).await;
+                    continue;
+                }
                 "/help" | "/h" => {
                     eprintln!("REPL commands:");
                     eprintln!("  /i, /interactive       Switch to interactive mode");
                     eprintln!("  /n, /non-interactive   Switch to non-interactive mode");
                     eprintln!("  /t <secs>, /timeout    Set timeout in seconds");
+                    eprintln!("  /ctrl <keys>           Send control keys (e.g. /ctrl ctrl-c)");
+                    eprintln!("  /reset                 Kill and respawn the shell session");
                     eprintln!("  /h, /help              Show this help");
                 }
                 _ => eprintln!("[error: unknown command '{trimmed}'; try /help]"),
@@ -64,64 +93,63 @@ async fn main() {
             continue;
         }
 
-        // Strip only the trailing newline from read_line, preserving all other
-        // whitespace (leading spaces, trailing spaces, tabs, etc.).
-        let keys = if line.ends_with('\n') {
-            line.clone()
-        } else {
-            // EOF without trailing newline — append one so it acts like Enter.
-            format!("{line}\n")
-        };
+        // Strip the trailing newline from read_line; send_line adds Enter.
+        let command = line.trim_end_matches('\n').trim_end_matches('\r');
 
-        let args = TypeArgs {
-            keys,
+        let args = TerminalArgs {
+            command: Some(command.to_string()),
+            control: None,
             interactive,
             timeout: Some(timeout),
             reset: false,
         };
 
-        match tool.call(args).await {
-            Ok(out) => {
-                if !out.output.is_empty() {
-                    print!("{}", out.output);
-                }
-                match &out.outcome {
-                    Outcome::Completed {
-                        exit_code,
-                        working_directory,
-                    } => {
-                        eprintln!("[cwd: {working_directory}]");
-                        if *exit_code != 0 {
-                            eprintln!("[exit: {exit_code}]");
-                        }
-                    }
-                    Outcome::Killed {
-                        exit_code,
-                        working_directory,
-                        timeout_secs,
-                    } => {
-                        eprintln!(
-                            "[timeout: Command timed out after {timeout_secs:.1}s and was terminated.]"
-                        );
-                        eprintln!("[cwd: {working_directory}]");
+        print_result(&tool, args).await;
+    }
+}
+
+async fn print_result(tool: &TerminalTool, args: TerminalArgs) {
+    match tool.call(args).await {
+        Ok(out) => {
+            if !out.output.is_empty() {
+                print!("{}", out.output);
+            }
+            match &out.outcome {
+                Outcome::Completed {
+                    exit_code,
+                    working_directory,
+                } => {
+                    eprintln!("[cwd: {working_directory}]");
+                    if *exit_code != 0 {
                         eprintln!("[exit: {exit_code}]");
                     }
-                    Outcome::Waiting => {
-                        eprintln!("[waiting]");
-                    }
-                    Outcome::ShellExited { working_directory } => {
-                        eprintln!("[shell exited, respawned]");
-                        eprintln!("[cwd: {working_directory}]");
-                    }
-                    Outcome::Reset { working_directory } => {
-                        eprintln!("[session reset]");
-                        eprintln!("[cwd: {working_directory}]");
-                    }
+                }
+                Outcome::Killed {
+                    exit_code,
+                    working_directory,
+                    timeout_secs,
+                } => {
+                    eprintln!(
+                        "[timeout: Command timed out after {timeout_secs:.1}s and was terminated.]"
+                    );
+                    eprintln!("[cwd: {working_directory}]");
+                    eprintln!("[exit: {exit_code}]");
+                }
+                Outcome::Waiting => {
+                    eprintln!("[waiting]");
+                }
+                Outcome::ShellExited { working_directory } => {
+                    eprintln!("[shell exited, respawned]");
+                    eprintln!("[cwd: {working_directory}]");
+                }
+                Outcome::Reset { working_directory } => {
+                    eprintln!("[session reset]");
+                    eprintln!("[cwd: {working_directory}]");
                 }
             }
-            Err(e) => {
-                eprintln!("[error: {e}]");
-            }
+        }
+        Err(e) => {
+            eprintln!("[error: {e}]");
         }
     }
 }

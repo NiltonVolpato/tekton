@@ -1,7 +1,7 @@
-//! PTY session management for the Tekton `type` tool.
+//! PTY session management for the Tekton `terminal` tool.
 //!
 //! [`PtySession`] wraps an `expectrl::OsSession` (a persistent bash PTY)
-//! and provides the sentinel-aware helpers used by [`crate::TypeTool::call`].
+//! and provides the sentinel-aware helpers used by [`crate::TerminalTool::call`].
 
 use std::{collections::HashSet, process::Command, time::Duration};
 
@@ -9,7 +9,7 @@ use sysinfo::{Pid as SysPid, ProcessesToUpdate, Signal, System};
 
 use expectrl::{Expect, process::Termios, session::OsSession};
 
-use crate::{TypeError, parse_jobs_p};
+use crate::{TerminalError, parse_jobs_p};
 
 /// Regex matching the OSC 999 sentinel emitted by `PROMPT_COMMAND`.
 ///
@@ -36,24 +36,24 @@ impl PtySession {
     ///
     /// All blocking PTY I/O runs inside `spawn_blocking` so it does not starve
     /// the async executor when multiple sessions are created concurrently.
-    pub(crate) async fn spawn() -> Result<Self, TypeError> {
+    pub(crate) async fn spawn() -> Result<Self, TerminalError> {
         tokio::task::spawn_blocking(Self::spawn_blocking_inner)
             .await
-            .map_err(|e| TypeError::PtySpawn(format!("spawn_blocking panicked: {e}")))?
+            .map_err(|e| TerminalError::PtySpawn(format!("spawn_blocking panicked: {e}")))?
     }
 
-    pub(crate) fn spawn_blocking_inner() -> Result<Self, TypeError> {
+    pub(crate) fn spawn_blocking_inner() -> Result<Self, TerminalError> {
         // 1. Spawn bash with no startup files.
         let mut cmd = Command::new("bash");
         cmd.args(["--norc", "--noprofile", "--noediting"]);
 
         let mut session =
-            expectrl::Session::spawn(cmd).map_err(|e| TypeError::PtySpawn(e.to_string()))?;
+            expectrl::Session::spawn(cmd).map_err(|e| TerminalError::PtySpawn(e.to_string()))?;
 
         // 2. Disable echo so typed input doesn't appear in the output stream.
         session
             .set_echo(false)
-            .map_err(|e| TypeError::PtySpawn(format!("set_echo failed: {e}")))?;
+            .map_err(|e| TerminalError::PtySpawn(format!("set_echo failed: {e}")))?;
 
         // 3. Get the shell PID.
         let shell_pid = session.get_process().pid().as_raw() as u32;
@@ -89,11 +89,11 @@ impl PtySession {
             .send_line(
                 "PROMPT_COMMAND='printf \"\\033]999;%d;%s\\007\" $? \"$PWD\"'; PS1=''; set +m; bind 'set enable-bracketed-paste off' 2>/dev/null",
             )
-            .map_err(|e| TypeError::PtySpawn(format!("send init line failed: {e}")))?;
+            .map_err(|e| TerminalError::PtySpawn(format!("send init line failed: {e}")))?;
 
         // 6. Wait up to 15 s for the first sentinel (shell ready).
         let captures = wait_for_sentinel(&mut session, Duration::from_secs(15))
-            .map_err(|e| TypeError::PtySpawn(format!("waiting for initial prompt: {e}")))?;
+            .map_err(|e| TerminalError::PtySpawn(format!("waiting for initial prompt: {e}")))?;
         let (_, working_directory) = parse_sentinel(&captures);
 
         Ok(Self {
@@ -309,7 +309,7 @@ pub(crate) fn drain_after_kill(session: &mut OsSession) -> Option<(i32, String)>
 /// so `fill_buf()` blocks forever. `check()` correctly consults both
 /// the OS fd (via `read_available`) and expectrl's internal buffer (via
 /// `get_available`), returning immediately in either case.
-pub(crate) fn drain_buf(session: &mut OsSession) -> Result<Vec<u8>, crate::TypeError> {
+pub(crate) fn drain_buf(session: &mut OsSession) -> Result<Vec<u8>, crate::TerminalError> {
     use expectrl::Expect;
     // check() does: read_available() (non-blocking OS read into internal
     // buffer) + get_available() (inspect internal buffer) + needle.check().
