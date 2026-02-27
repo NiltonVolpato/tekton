@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::error::ConfigError;
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub enum Provider {
     OpenAI,
     OpenAICompatible,
@@ -11,7 +11,7 @@ pub enum Provider {
     Gemini,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Model {
     pub provider: Provider,
     pub name: String,
@@ -27,6 +27,12 @@ pub struct AgentConfig {
     pub max_turns: usize,
 }
 
+/// Load an [`AgentConfig`] from a Pkl file.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::PklError`] if the file cannot be read, parsed, or
+/// deserialized into an `AgentConfig`.
 pub fn load_config(path: impl AsRef<Path>) -> Result<AgentConfig, ConfigError> {
     rpkl::from_config(path.as_ref()).map_err(ConfigError::from)
 }

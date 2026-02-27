@@ -16,7 +16,7 @@ model: Model
 system_prompt: String
 
 /// Sampling temperature (0.0 to 2.0). Provider default if omitted.
-temperature: Float?
+temperature: Float(isFinite)?
 
 /// Maximum tokens in the response.
 max_tokens: Int?

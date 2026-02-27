@@ -23,6 +23,11 @@ pub type TextStream =
     Pin<Box<dyn Stream<Item = Result<StreamEvent, StreamingError>> + Send>>;
 
 impl AgentHandle {
+    /// Send a single prompt and return the full response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptError`] if the provider request fails.
     pub async fn prompt(&self, prompt: &str) -> Result<String, PromptError> {
         use rig::completion::Prompt;
         match self {
@@ -33,6 +38,11 @@ impl AgentHandle {
         }
     }
 
+    /// Send a prompt with conversation history and return the full response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptError`] if the provider request fails.
     pub async fn chat(
         &self,
         prompt: &str,
