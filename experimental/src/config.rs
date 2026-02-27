@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::error::ConfigError;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub enum Provider {
     OpenAI,
     OpenAICompatible,
@@ -11,13 +11,13 @@ pub enum Provider {
     Gemini,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Model {
     pub provider: Provider,
     pub name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct AgentConfig {
     pub name: String,
     pub model: Model,

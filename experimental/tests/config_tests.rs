@@ -1,22 +1,8 @@
-use std::io::Write;
+mod common;
 
 use tekton_experimental::{Provider, load_config};
 
-fn write_pkl(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
-    let path = dir.join(name);
-    let mut f = std::fs::File::create(&path).unwrap();
-    f.write_all(content.as_bytes()).unwrap();
-    path
-}
-
-/// Helper: write the base schema into the temp dir so amending configs can reference it.
-fn write_base_schema(dir: &std::path::Path) -> std::path::PathBuf {
-    let schema = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pkl/AgentConfig.pkl"),
-    )
-    .unwrap();
-    write_pkl(dir, "AgentConfig.pkl", &schema)
-}
+use common::{write_base_schema, write_pkl};
 
 #[test]
 fn load_config_from_pkl_file() {
@@ -42,7 +28,7 @@ max_tokens = 4096
 
     let config = load_config(&pkl).unwrap();
     assert_eq!(config.name, "test-agent");
-    assert!(matches!(config.model.provider, Provider::Anthropic));
+    assert_eq!(config.model.provider, Provider::Anthropic);
     assert_eq!(config.model.name, "claude-sonnet-4-20250514");
     assert_eq!(config.system_prompt, "You are a test agent.");
     assert_eq!(config.temperature, Some(0.5));
@@ -71,7 +57,7 @@ system_prompt = "Hello."
     );
 
     let config = load_config(&pkl).unwrap();
-    assert!(matches!(config.model.provider, Provider::OpenAI));
+    assert_eq!(config.model.provider, Provider::OpenAI);
     assert_eq!(config.model.name, "gpt-4o");
     assert_eq!(config.temperature, None);
     assert_eq!(config.max_tokens, None);
@@ -99,7 +85,7 @@ max_turns = 5
     );
 
     let config = load_config(&pkl).unwrap();
-    assert!(matches!(config.model.provider, Provider::OpenAICompatible));
+    assert_eq!(config.model.provider, Provider::OpenAICompatible);
     assert_eq!(config.model.name, "llama-3.3-70b");
     assert_eq!(config.max_turns, 5);
 }
@@ -126,7 +112,7 @@ temperature = 1.0
     );
 
     let config = load_config(&pkl).unwrap();
-    assert!(matches!(config.model.provider, Provider::Gemini));
+    assert_eq!(config.model.provider, Provider::Gemini);
     assert_eq!(config.model.name, "gemini-2.0-flash");
     assert_eq!(config.temperature, Some(1.0));
 }
@@ -171,7 +157,7 @@ max_turns = 30
     let config = load_config(&pkl).unwrap();
     assert_eq!(config.name, "override-agent");
     // Inherited from base
-    assert!(matches!(config.model.provider, Provider::Anthropic));
+    assert_eq!(config.model.provider, Provider::Anthropic);
     assert_eq!(config.model.name, "claude-sonnet-4-20250514");
     assert_eq!(config.temperature, Some(0.7));
     assert_eq!(config.max_tokens, Some(2048));
@@ -247,15 +233,9 @@ fn load_example_coder_config() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pkl/examples/coder.pkl");
     let config = load_config(&path).unwrap();
     assert_eq!(config.name, "coder");
-    assert!(matches!(config.model.provider, Provider::Anthropic));
+    assert_eq!(config.model.provider, Provider::Anthropic);
     assert_eq!(config.model.name, "claude-sonnet-4-20250514");
     assert_eq!(config.temperature, Some(0.3));
     assert_eq!(config.max_tokens, Some(8192));
     assert_eq!(config.max_turns, 20);
-}
-
-#[test]
-fn error_display_config_error() {
-    let err = tekton_experimental::ConfigError::UnsupportedProvider("FooBar".to_string());
-    assert_eq!(err.to_string(), "unsupported provider 'FooBar'");
 }

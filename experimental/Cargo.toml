@@ -11,10 +11,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tekton-terminal-tool = { path = "../terminal-tool" }
 thiserror = "2"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [dev-dependencies]
 tempfile = "3"
-
-[[bin]]
-name = "tekton"

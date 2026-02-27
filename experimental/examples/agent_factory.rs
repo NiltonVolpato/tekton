@@ -7,7 +7,7 @@ use tekton_experimental::{build_agent, load_config, StreamEvent};
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
-        eprintln!("Usage: tekton <config.pkl>");
+        eprintln!("Usage: cargo run --example agent-factory -- <config.pkl>");
         std::process::exit(1);
     }
 
@@ -40,11 +40,13 @@ async fn main() {
         }
 
         let mut stream = agent.stream_chat(line, history.clone()).await;
+        let mut response = String::new();
         while let Some(event) = stream.next().await {
             match event {
                 Ok(StreamEvent::Text(text)) => {
                     print!("{text}");
                     io::stdout().flush().unwrap();
+                    response.push_str(&text);
                 }
                 Ok(StreamEvent::ToolCall { name, args }) => {
                     eprintln!("\n[tool: {name}({args})]");
@@ -57,8 +59,10 @@ async fn main() {
         }
         println!();
 
-        // Add user message to history for next turn
         history.push(rig::message::Message::user(line));
+        if !response.is_empty() {
+            history.push(rig::message::Message::assistant(&response));
+        }
     }
 
     eprintln!("\nGoodbye.");

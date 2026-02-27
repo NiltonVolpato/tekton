@@ -2,9 +2,6 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("unsupported provider '{0}'")]
-    UnsupportedProvider(String),
-
     #[error("failed to load config: {0}")]
     PklError(#[from] rpkl::Error),
 }

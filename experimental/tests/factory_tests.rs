@@ -1,21 +1,8 @@
-use std::io::Write;
+mod common;
 
 use tekton_experimental::{build_agent, load_config};
 
-fn write_pkl(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
-    let path = dir.join(name);
-    let mut f = std::fs::File::create(&path).unwrap();
-    f.write_all(content.as_bytes()).unwrap();
-    path
-}
-
-fn write_base_schema(dir: &std::path::Path) -> std::path::PathBuf {
-    let schema = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pkl/AgentConfig.pkl"),
-    )
-    .unwrap();
-    write_pkl(dir, "AgentConfig.pkl", &schema)
-}
+use common::{write_base_schema, write_pkl};
 
 fn make_config(dir: &std::path::Path, provider: &str, model: &str) -> std::path::PathBuf {
     write_base_schema(dir);

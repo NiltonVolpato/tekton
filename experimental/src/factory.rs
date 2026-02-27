@@ -1,4 +1,6 @@
+use rig::agent::{Agent, AgentBuilder, WithBuilderTools};
 use rig::client::{CompletionClient, ProviderClient};
+use rig::completion::CompletionModel;
 use rig::providers::{anthropic, gemini, openai};
 use tekton_terminal_tool::TerminalTool;
 
@@ -6,72 +8,50 @@ use crate::config::{AgentConfig, Provider};
 use crate::error::FactoryError;
 use crate::handle::AgentHandle;
 
+fn configure_agent<M: CompletionModel>(
+    builder: AgentBuilder<M, (), WithBuilderTools>,
+    config: &AgentConfig,
+) -> Agent<M> {
+    let mut builder = builder
+        .preamble(&config.system_prompt)
+        .default_max_turns(config.max_turns);
+    if let Some(t) = config.temperature {
+        builder = builder.temperature(t);
+    }
+    if let Some(m) = config.max_tokens {
+        builder = builder.max_tokens(m);
+    }
+    builder.build()
+}
+
 pub async fn build_agent(config: &AgentConfig) -> Result<AgentHandle, FactoryError> {
     let tool = TerminalTool::new()
         .with_name(&config.name)
         .spawn()
         .await?;
 
+    let model_name = &config.model.name;
+
     let handle = match config.model.provider {
         Provider::Anthropic => {
             let client = anthropic::Client::from_env();
-            let mut builder = client
-                .agent(&config.model.name)
-                .preamble(&config.system_prompt)
-                .default_max_turns(config.max_turns)
-                .tool(tool);
-            if let Some(t) = config.temperature {
-                builder = builder.temperature(t);
-            }
-            if let Some(m) = config.max_tokens {
-                builder = builder.max_tokens(m);
-            }
-            AgentHandle::Anthropic(builder.build())
+            let builder = client.agent(model_name).tool(tool);
+            AgentHandle::Anthropic(configure_agent(builder, config))
         }
         Provider::OpenAI => {
             let client = openai::Client::from_env();
-            let mut builder = client
-                .agent(&config.model.name)
-                .preamble(&config.system_prompt)
-                .default_max_turns(config.max_turns)
-                .tool(tool);
-            if let Some(t) = config.temperature {
-                builder = builder.temperature(t);
-            }
-            if let Some(m) = config.max_tokens {
-                builder = builder.max_tokens(m);
-            }
-            AgentHandle::OpenAI(builder.build())
+            let builder = client.agent(model_name).tool(tool);
+            AgentHandle::OpenAI(configure_agent(builder, config))
         }
         Provider::OpenAICompatible => {
             let client = openai::CompletionsClient::from_env();
-            let mut builder = client
-                .agent(&config.model.name)
-                .preamble(&config.system_prompt)
-                .default_max_turns(config.max_turns)
-                .tool(tool);
-            if let Some(t) = config.temperature {
-                builder = builder.temperature(t);
-            }
-            if let Some(m) = config.max_tokens {
-                builder = builder.max_tokens(m);
-            }
-            AgentHandle::OpenAICompatible(builder.build())
+            let builder = client.agent(model_name).tool(tool);
+            AgentHandle::OpenAICompatible(configure_agent(builder, config))
         }
         Provider::Gemini => {
             let client = gemini::Client::from_env();
-            let mut builder = client
-                .agent(&config.model.name)
-                .preamble(&config.system_prompt)
-                .default_max_turns(config.max_turns)
-                .tool(tool);
-            if let Some(t) = config.temperature {
-                builder = builder.temperature(t);
-            }
-            if let Some(m) = config.max_tokens {
-                builder = builder.max_tokens(m);
-            }
-            AgentHandle::Gemini(builder.build())
+            let builder = client.agent(model_name).tool(tool);
+            AgentHandle::Gemini(configure_agent(builder, config))
         }
     };
 
