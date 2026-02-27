@@ -2,4 +2,5 @@
 resolver = "3"
 members = [
     "terminal-tool",
+    "experimental",
 ]

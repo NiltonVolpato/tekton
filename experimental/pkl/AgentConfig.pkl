@@ -1,0 +1,25 @@
+open module AgentConfig
+
+class Model {
+  provider: "OpenAI" | "OpenAICompatible" | "Anthropic" | "Gemini"
+  name: String
+}
+
+/// The agent's display name.
+name: String
+
+/// Provider and model.
+model: Model
+
+/// System prompt — the agent's instructions.
+/// Supports Pkl string interpolation, e.g. "Your name is \(name)".
+system_prompt: String
+
+/// Sampling temperature (0.0 to 2.0). Provider default if omitted.
+temperature: Float?
+
+/// Maximum tokens in the response.
+max_tokens: Int?
+
+/// Maximum agentic turns (tool-call loops) per prompt.
+max_turns: Int = 20
