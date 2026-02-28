@@ -1,11 +1,14 @@
 [package]
 name = "tekton-terminal-tool"
+description = "Persistent PTY session tool for LLM agents"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 # license.workspace = true
 repository.workspace = true
 readme.workspace = true
+keywords = ["terminal", "pty", "llm", "agent"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lints]
 workspace = true
