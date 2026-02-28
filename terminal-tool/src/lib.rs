@@ -843,6 +843,8 @@ fn parse_args(args: TerminalArgs) -> Result<Action, TerminalError> {
     }
 }
 
+// ── Synchronous command execution ─────────────────────────────────────────────
+
 /// Return type for the sentinel-wait handlers inside `spawn_blocking`.
 ///
 /// - `Vec<u8>`: raw output bytes captured before the sentinel (or timeout).
@@ -851,81 +853,148 @@ fn parse_args(args: TerminalArgs) -> Result<Action, TerminalError> {
 ///   to suppress the post-call job sync.
 type CallResult = (Vec<u8>, Outcome, Option<HashSet<u32>>);
 
-/// Handle a successful sentinel match: extract output, exit code, cwd, and
-/// sync background jobs.
-fn handle_completed(
-    guard: &mut Option<session::PtySession>,
-    captures: &expectrl::Captures,
-) -> Result<CallResult, TerminalError> {
-    let pty = guard.as_mut().ok_or(TerminalError::SessionNotInitialized)?;
-    let output = captures.before().to_vec();
-    let (exit_code, cwd) = session::parse_sentinel(captures);
-    let active_pids = session::run_jobs_p_sync(&mut pty.session);
-    pty.working_directory.clone_from(&cwd);
-    Ok((
-        output,
-        Outcome::Completed {
-            exit_code,
-            working_directory: cwd,
-        },
-        active_pids,
-    ))
+/// Synchronous PTY command execution, run inside `spawn_blocking`.
+///
+/// Owns the session guard and all context needed to send keys, wait for the
+/// prompt sentinel, and handle each possible outcome (completion, timeout,
+/// shell exit). Constructed by [`TerminalTool::call`] and consumed by
+/// [`CommandRunner::run`].
+struct CommandRunner {
+    guard: tokio::sync::OwnedMutexGuard<Option<session::PtySession>>,
+    background_pids: HashSet<u32>,
+    init_file: Option<std::path::PathBuf>,
+    extra_env: Vec<(String, String)>,
+    interactive: bool,
+    timeout: Duration,
+    timeout_secs: f64,
 }
 
-/// Handle a non-interactive timeout: kill the foreground process, drain
-/// the PTY, and return the killed outcome. If the kill fails, respawn
-/// the shell entirely.
-fn handle_noninteractive_timeout(
-    guard: &mut Option<session::PtySession>,
-    background_pids: &HashSet<u32>,
-    init_file: Option<&std::path::Path>,
-    extra_env: &[(String, String)],
-    timeout_secs: f64,
-) -> Result<CallResult, TerminalError> {
-    let pty = guard.as_mut().ok_or(TerminalError::SessionNotInitialized)?;
-    let shell_pid = pty.shell_pid;
-    let output = session::drain_buf(&mut pty.session);
+impl CommandRunner {
+    /// Send `bytes` to the PTY, wait for the prompt sentinel, and handle the result.
+    fn run(mut self, bytes: Vec<u8>) -> Result<CallResult, TerminalError> {
+        // 1. Send keys to the PTY.
+        self.pty_mut()?
+            .session
+            .send(bytes)
+            .map_err(|e| TerminalError::PtyWrite(e.to_string()))?;
 
-    if !session::kill_foreground(shell_pid, background_pids) {
-        // Foreground processes survived SIGKILL — the shell is unrecoverable.
-        session::kill_shell(shell_pid);
-        let new_pty = session::PtySession::spawn_blocking_inner(init_file, extra_env)?;
-        let cwd = new_pty.working_directory.clone();
-        *guard = Some(new_pty);
-        return Ok((output, Outcome::ShellExited { working_directory: cwd }, None));
+        // 2. Wait for the prompt sentinel.
+        let timeout = self.timeout;
+        let sentinel = {
+            let pty = self.pty_mut()?;
+            session::wait_for_sentinel(&mut pty.session, timeout)
+        };
+
+        match sentinel {
+            Ok(captures) => self.handle_completed(&captures),
+            Err(expectrl::Error::ExpectTimeout) if !self.interactive => {
+                self.handle_noninteractive_timeout()
+            }
+            Err(expectrl::Error::ExpectTimeout) => {
+                // Interactive timeout: return partial output; process still alive.
+                let pty = self.pty_mut()?;
+                Ok((session::drain_buf(&mut pty.session), Outcome::Waiting, None))
+            }
+            Err(expectrl::Error::Eof) => self.handle_shell_exited(),
+            Err(e) => Err(TerminalError::PtyRead(e.to_string())),
+        }
     }
 
-    // Drain PTY to restore a clean prompt; extract post-kill exit code and $PWD.
-    let (exit_code, cwd) = session::drain_after_kill(&mut pty.session)
-        .unwrap_or_else(|| (DRAIN_FAILURE_EXIT_CODE, pty.working_directory.clone()));
+    /// Get a mutable reference to the active PTY session.
+    fn pty_mut(&mut self) -> Result<&mut session::PtySession, TerminalError> {
+        self.guard
+            .as_mut()
+            .ok_or(TerminalError::SessionNotInitialized)
+    }
 
-    let active_pids = session::run_jobs_p_sync(&mut pty.session);
-    pty.working_directory.clone_from(&cwd);
-    Ok((
-        output,
-        Outcome::Killed {
-            exit_code,
-            working_directory: cwd,
-            timeout_secs,
-        },
-        active_pids,
-    ))
-}
+    /// Kill the current shell and spawn a fresh one, returning the new working directory.
+    fn respawn(&mut self) -> Result<String, TerminalError> {
+        let new_pty =
+            session::PtySession::spawn_blocking_inner(self.init_file.as_deref(), &self.extra_env)?;
+        let cwd = new_pty.working_directory.clone();
+        *self.guard = Some(new_pty);
+        Ok(cwd)
+    }
 
-/// Handle shell exit (EOF): drain buffered output and respawn a fresh session.
-fn handle_shell_exited(
-    guard: &mut Option<session::PtySession>,
-    init_file: Option<&std::path::Path>,
-    extra_env: &[(String, String)],
-) -> Result<CallResult, TerminalError> {
-    let pty = guard.as_mut().ok_or(TerminalError::SessionNotInitialized)?;
-    let output = session::drain_buf(&mut pty.session);
+    /// Handle a successful sentinel match: extract output, exit code, cwd, and
+    /// sync background jobs.
+    fn handle_completed(
+        &mut self,
+        captures: &expectrl::Captures,
+    ) -> Result<CallResult, TerminalError> {
+        let pty = self.pty_mut()?;
+        let output = captures.before().to_vec();
+        let (exit_code, cwd) = session::parse_sentinel(captures);
+        let active_pids = session::run_jobs_p_sync(&mut pty.session);
+        pty.working_directory.clone_from(&cwd);
+        Ok((
+            output,
+            Outcome::Completed {
+                exit_code,
+                working_directory: cwd,
+            },
+            active_pids,
+        ))
+    }
 
-    let new_pty = session::PtySession::spawn_blocking_inner(init_file, extra_env)?;
-    let cwd = new_pty.working_directory.clone();
-    *guard = Some(new_pty);
+    /// Handle a non-interactive timeout: kill the foreground process, drain
+    /// the PTY, and return the killed outcome. If the kill fails, respawn
+    /// the shell entirely.
+    fn handle_noninteractive_timeout(&mut self) -> Result<CallResult, TerminalError> {
+        let pty = self
+            .guard
+            .as_mut()
+            .ok_or(TerminalError::SessionNotInitialized)?;
+        let shell_pid = pty.shell_pid;
+        let output = session::drain_buf(&mut pty.session);
 
-    Ok((output, Outcome::ShellExited { working_directory: cwd }, None))
+        if !session::kill_foreground(shell_pid, &self.background_pids) {
+            // Foreground processes survived SIGKILL — the shell is unrecoverable.
+            session::kill_shell(shell_pid);
+            let cwd = self.respawn()?;
+            return Ok((
+                output,
+                Outcome::ShellExited {
+                    working_directory: cwd,
+                },
+                None,
+            ));
+        }
+
+        // Drain PTY to restore a clean prompt; extract post-kill exit code and $PWD.
+        let pty = self
+            .guard
+            .as_mut()
+            .ok_or(TerminalError::SessionNotInitialized)?;
+        let (exit_code, cwd) = session::drain_after_kill(&mut pty.session)
+            .unwrap_or_else(|| (DRAIN_FAILURE_EXIT_CODE, pty.working_directory.clone()));
+
+        let active_pids = session::run_jobs_p_sync(&mut pty.session);
+        pty.working_directory.clone_from(&cwd);
+        Ok((
+            output,
+            Outcome::Killed {
+                exit_code,
+                working_directory: cwd,
+                timeout_secs: self.timeout_secs,
+            },
+            active_pids,
+        ))
+    }
+
+    /// Handle shell exit (EOF): drain buffered output and respawn a fresh session.
+    fn handle_shell_exited(&mut self) -> Result<CallResult, TerminalError> {
+        let pty = self.pty_mut()?;
+        let output = session::drain_buf(&mut pty.session);
+        let cwd = self.respawn()?;
+        Ok((
+            output,
+            Outcome::ShellExited {
+                working_directory: cwd,
+            },
+            None,
+        ))
+    }
 }
 
 impl Tool for TerminalTool {
@@ -980,7 +1049,7 @@ impl Tool for TerminalTool {
 
     #[expect(
         clippy::significant_drop_tightening,
-        reason = "guard is moved into spawn_blocking"
+        reason = "guard is moved into CommandRunner / spawn_blocking"
     )]
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let action = parse_args(args)?;
@@ -993,61 +1062,29 @@ impl Tool for TerminalTool {
             } => (bytes, interactive, timeout),
         };
 
-        let background_pids = self.job_manager.lock().unwrap().tracked_pids();
-
         // Acquire session as an OwnedMutexGuard so it can be sent to spawn_blocking.
         let guard = Arc::clone(&self.session).lock_owned().await;
         if guard.is_none() {
             return Err(TerminalError::SessionNotInitialized);
         }
 
+        let runner = CommandRunner {
+            guard,
+            background_pids: self.job_manager.lock().unwrap().tracked_pids(),
+            init_file: self.init_file.clone(),
+            extra_env: self.extra_env.clone(),
+            interactive,
+            timeout,
+            timeout_secs: timeout.as_secs_f64(),
+        };
+
         // Run the blocking PTY I/O in a dedicated thread-pool thread.
         // active_pids is Some(pids) when we have a fresh `jobs -p` snapshot (normal
         // return, non-interactive timeout) and None otherwise (interactive timeout,
         // shell exit) to suppress spurious completion callbacks.
-        let timeout_secs = timeout.as_secs_f64();
-        let init_file = self.init_file.clone();
-        let extra_env = self.extra_env.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<_, TerminalError> {
-            let mut guard = guard;
-
-            // 1. Send keys to the PTY.
-            {
-                let pty = guard.as_mut().ok_or(TerminalError::SessionNotInitialized)?;
-                pty.session
-                    .send(bytes)
-                    .map_err(|e| TerminalError::PtyWrite(e.to_string()))?;
-            }
-
-            // 2. Wait for the prompt sentinel.
-            let sentinel = {
-                let pty = guard.as_mut().ok_or(TerminalError::SessionNotInitialized)?;
-                session::wait_for_sentinel(&mut pty.session, timeout)
-            };
-
-            match sentinel {
-                Ok(captures) => handle_completed(&mut guard, &captures),
-                Err(expectrl::Error::ExpectTimeout) if !interactive => {
-                    handle_noninteractive_timeout(
-                        &mut guard,
-                        &background_pids,
-                        init_file.as_deref(),
-                        &extra_env,
-                        timeout_secs,
-                    )
-                }
-                Err(expectrl::Error::ExpectTimeout) => {
-                    let pty = guard.as_mut().ok_or(TerminalError::SessionNotInitialized)?;
-                    Ok((session::drain_buf(&mut pty.session), Outcome::Waiting, None))
-                }
-                Err(expectrl::Error::Eof) => {
-                    handle_shell_exited(&mut guard, init_file.as_deref(), &extra_env)
-                }
-                Err(e) => Err(TerminalError::PtyRead(e.to_string())),
-            }
-        })
-        .await
-        .map_err(|e| TerminalError::PtyRead(e.to_string()))?;
+        let result = tokio::task::spawn_blocking(move || runner.run(bytes))
+            .await
+            .map_err(|e| TerminalError::PtyRead(e.to_string()))?;
 
         let (output_bytes, outcome, active_pids) = result?;
 
