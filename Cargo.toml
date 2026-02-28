@@ -22,5 +22,14 @@ cargo = { level = "warn", priority = -1 }
 # Transitive dependency version duplication — not actionable
 multiple_crate_versions = "allow"
 
+# License is TBD
+cargo_common_metadata = "allow"
+# Two-lambda form is no better than if-let
+option_if_let_else = "allow"
+# pub(crate) is intentional visibility documentation even in private modules
+redundant_pub_crate = "allow"
+# Method references can be less readable when the type isn't spelled out nearby
+redundant_closure_for_method_calls = "allow"
+
 [workspace.lints.rust]
 unsafe_code = "deny"

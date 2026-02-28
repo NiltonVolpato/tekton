@@ -66,6 +66,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use expectrl::Expect as _;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
@@ -136,6 +137,7 @@ pub struct TerminalArgs {
 
 impl TerminalArgs {
     /// Resolved timeout: caller's value, or the mode-appropriate default.
+    #[must_use]
     pub fn resolved_timeout(&self) -> f64 {
         self.timeout.unwrap_or(if self.interactive {
             DEFAULT_INTERACTIVE_TIMEOUT_SECS
@@ -266,6 +268,7 @@ pub struct JobManager {
 
 impl JobManager {
     /// Create a new, empty `JobManager` with no callback.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             jobs: HashMap::new(),
@@ -273,7 +276,14 @@ impl JobManager {
         }
     }
 
+    /// Return the set of currently tracked background PIDs.
+    #[must_use]
+    pub fn tracked_pids(&self) -> HashSet<u32> {
+        self.jobs.keys().copied().collect()
+    }
+
     /// Register a callback invoked for each completed background job.
+    #[must_use]
     pub fn with_callback(
         mut self,
         callback: impl Fn(JobNotification) + Send + Sync + 'static,
@@ -379,6 +389,7 @@ impl Default for JobManager {
 ///
 /// `jobs -p` prints one PID per line. Lines that cannot be parsed as integers
 /// are silently skipped.
+#[must_use]
 pub fn parse_jobs_p(output: &str) -> HashSet<u32> {
     output
         .lines()
@@ -397,6 +408,11 @@ pub fn parse_jobs_p(output: &str) -> HashSet<u32> {
 /// Each token is parsed by [`crokey::parse`], converted to a
 /// [`terminput::KeyEvent`] via [`terminput_crossterm::to_terminput_key`],
 /// and encoded with [`terminput::Event::encode`] using xterm encoding.
+///
+/// # Errors
+///
+/// Returns [`TerminalError::InvalidInput`] if a key token cannot be parsed,
+/// converted, or encoded.
 pub fn encode_control_keys(input: &str) -> Result<Vec<u8>, TerminalError> {
     let mut bytes = Vec::new();
     let mut encode_buf = [0u8; 32];
@@ -488,6 +504,7 @@ impl TerminalTool {
     /// Use the builder methods [`with_name`](Self::with_name) and
     /// [`with_job_callback`](Self::with_job_callback) to configure the tool,
     /// then call [`spawn`](Self::spawn) to start the PTY session.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             session: Arc::new(tokio::sync::Mutex::new(None)),
@@ -502,6 +519,7 @@ impl TerminalTool {
     ///
     /// When set, prompts look like `$?=0 claude:/Users/nilton/src $ `.
     /// When empty (the default), the name prefix is omitted: `$?=0 /Users/nilton/src $ `.
+    #[must_use]
     pub fn with_name(mut self, name: impl AsRef<str>) -> Self {
         self.agent_name = name.as_ref().to_string();
         self
@@ -512,6 +530,7 @@ impl TerminalTool {
     /// The file is sourced before the harness injects its own `PROMPT_COMMAND`
     /// and `PS1`, so user customizations (env vars, aliases, functions) are
     /// available but prompt control remains with the harness.
+    #[must_use]
     pub fn with_init_file(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.init_file = Some(path.into());
         self
@@ -522,6 +541,7 @@ impl TerminalTool {
     /// These are applied after the `TEKTON_*` passthrough and before the
     /// fixed overrides (LANG, EDITOR, etc.). Call multiple times to set
     /// several variables.
+    #[must_use]
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.extra_env.push((key.into(), value.into()));
         self
@@ -531,6 +551,10 @@ impl TerminalTool {
     ///
     /// Consumes `self` (from the builder chain) and returns an initialized tool.
     /// Use [`working_directory`](Self::working_directory) to read the initial `$PWD`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerminalError::PtySpawn`] if the bash session fails to start.
     pub async fn spawn(self) -> Result<Self, TerminalError> {
         let pty_session =
             session::PtySession::spawn(self.init_file.clone(), self.extra_env.clone()).await?;
@@ -559,6 +583,12 @@ impl TerminalTool {
     /// Must be called **before** [`TerminalTool::job_manager`] is cloned.
     ///
     /// Delegates to [`JobManager::with_callback`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `JobManager` Arc has been cloned (i.e., called after
+    /// [`job_manager()`](Self::job_manager) or [`spawn_watcher()`](Self::spawn_watcher)).
+    #[must_use]
     pub fn with_job_callback(
         self,
         callback: impl Fn(JobNotification) + Send + Sync + 'static,
@@ -584,6 +614,7 @@ impl TerminalTool {
     /// Return a shared handle to the [`JobManager`].
     ///
     /// The harness task uses this to call [`JobManager::sync`] on the idle path.
+    #[must_use]
     pub fn job_manager(&self) -> Arc<Mutex<JobManager>> {
         Arc::clone(&self.job_manager)
     }
@@ -597,6 +628,7 @@ impl TerminalTool {
     ///
     /// Returns a [`JoinHandle`](tokio::task::JoinHandle) the harness can
     /// `.abort()` on shutdown.
+    #[must_use]
     pub fn spawn_watcher(&self) -> tokio::task::JoinHandle<()> {
         let job_manager = Arc::clone(&self.job_manager);
         tokio::spawn(async move {
@@ -636,25 +668,24 @@ impl TerminalTool {
 
                     // Backfill the command field for alive jobs that don't have one yet.
                     for &pid in &alive {
-                        if let Some(job) = jm.jobs.get_mut(&pid) {
-                            if job.command.is_empty() {
-                                if let Some(proc) = sys.process(sysinfo::Pid::from_u32(pid)) {
-                                    let cmd = proc.cmd();
-                                    if !cmd.is_empty() {
-                                        job.command = cmd
-                                            .iter()
-                                            .map(|s| s.to_string_lossy())
-                                            .collect::<Vec<_>>()
-                                            .join(" ");
-                                    } else {
-                                        // cmd() can be empty (permissions, kernel threads).
-                                        // Fall back to the process name (short but non-empty).
-                                        let name = proc.name().to_string_lossy();
-                                        if !name.is_empty() {
-                                            job.command = name.into_owned();
-                                        }
-                                    }
+                        if let Some(job) = jm.jobs.get_mut(&pid)
+                            && job.command.is_empty()
+                            && let Some(proc) = sys.process(sysinfo::Pid::from_u32(pid))
+                        {
+                            let cmd = proc.cmd();
+                            if cmd.is_empty() {
+                                // cmd() can be empty (permissions, kernel threads).
+                                // Fall back to the process name (short but non-empty).
+                                let name = proc.name().to_string_lossy();
+                                if !name.is_empty() {
+                                    job.command = name.into_owned();
                                 }
+                            } else {
+                                job.command = cmd
+                                    .iter()
+                                    .map(|s| s.to_string_lossy())
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
                             }
                         }
                     }
@@ -678,12 +709,223 @@ impl TerminalTool {
             format!("$?={} {}:{} $ ", exit_code, self.agent_name, cwd)
         }
     }
+
+    /// Kill the current shell, spawn a fresh session, and return [`Outcome::Reset`].
+    async fn call_reset(&self) -> Result<TerminalOutput, TerminalError> {
+        let mut guard = self.session.lock().await;
+
+        // Kill the old shell if it exists.
+        if let Some(pty) = guard.as_ref() {
+            session::kill_shell(pty.shell_pid);
+        }
+
+        // Spawn a fresh session (re-applying init file if configured).
+        let new_pty =
+            session::PtySession::spawn(self.init_file.clone(), self.extra_env.clone()).await?;
+        let working_directory = new_pty.working_directory.clone();
+        *guard = Some(new_pty);
+        drop(guard);
+
+        // Clear all tracked background jobs — they belonged to the old shell.
+        self.job_manager.lock().unwrap().jobs.clear();
+
+        let mut output = String::from("Session reset\n");
+        output.push_str(&self.format_prompt(0, &working_directory));
+
+        Ok(TerminalOutput {
+            output,
+            output_truncated: false,
+            outcome: Outcome::Reset { working_directory },
+        })
+    }
+
+    /// Convert raw output bytes + outcome into the final [`TerminalOutput`].
+    ///
+    /// Applies truncation and appends the harness-built prompt.
+    fn format_output(&self, output_bytes: &[u8], outcome: Outcome) -> TerminalOutput {
+        let output = String::from_utf8_lossy(output_bytes).into_owned();
+        let (mut output, output_truncated) = truncate_output(output, MAX_OUTPUT_CHARS);
+
+        // Append the harness-built prompt so the model sees exit code, identity,
+        // and location context at the end of every command's output.
+        match &outcome {
+            Outcome::Completed {
+                exit_code,
+                working_directory,
+            } => {
+                output.push_str(&self.format_prompt(*exit_code, working_directory));
+            }
+            Outcome::Killed {
+                exit_code,
+                working_directory,
+                ..
+            } => {
+                output.push_str("Killed\n");
+                output.push_str(&self.format_prompt(*exit_code, working_directory));
+            }
+            Outcome::ShellExited { working_directory } => {
+                output.push_str("Shell exited, respawned\n");
+                output.push_str(&self.format_prompt(0, working_directory));
+            }
+            Outcome::Reset { .. } => {
+                // Reset builds its own output via call_reset().
+                unreachable!("reset returns early");
+            }
+            Outcome::Waiting => {
+                // Process still running — no prompt to append.
+            }
+        }
+
+        TerminalOutput {
+            output,
+            output_truncated,
+            outcome,
+        }
+    }
 }
 
 impl Default for TerminalTool {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ── Action parsing ────────────────────────────────────────────────────────────
+
+/// A validated, ready-to-execute "low-level" action parsed from [`TerminalArgs`].
+enum Action {
+    /// Kill the current shell and spawn a fresh one.
+    Reset,
+    /// Send a sequence of key presses.
+    Keys {
+        bytes: Vec<u8>,
+        interactive: bool,
+        timeout: Duration,
+    },
+}
+
+/// Parse raw [`TerminalArgs`] while validating and return the [`Action`] to perform.
+///
+/// Handles reset-ignores-everything, mutual exclusivity of command/control,
+/// timeout range validation, and control key encoding.
+fn parse_args(args: TerminalArgs) -> Result<Action, TerminalError> {
+    if args.reset {
+        return Ok(Action::Reset);
+    }
+
+    let raw_timeout = args.resolved_timeout();
+    if !(0.0..=MAX_TIMEOUT_SECS).contains(&raw_timeout) {
+        return Err(TerminalError::InvalidTimeout(raw_timeout));
+    }
+    let timeout = Duration::from_secs_f64(raw_timeout);
+    let interactive = args.interactive;
+
+    match (args.command, args.control) {
+        (Some(command), None) => Ok(Action::Keys {
+            bytes: format!("{command}\n").into_bytes(),
+            interactive,
+            timeout,
+        }),
+        (None, Some(control)) => {
+            let bytes = encode_control_keys(&control)?;
+            Ok(Action::Keys {
+                bytes,
+                interactive,
+                timeout,
+            })
+        }
+        (Some(_), Some(_)) => Err(TerminalError::InvalidInput(
+            "both `command` and `control` provided; use exactly one".into(),
+        )),
+        (None, None) => Err(TerminalError::InvalidInput(
+            "neither `command` nor `control` provided; use exactly one".into(),
+        )),
+    }
+}
+
+/// Return type for the sentinel-wait handlers inside `spawn_blocking`.
+///
+/// - `Vec<u8>`: raw output bytes captured before the sentinel (or timeout).
+/// - `Outcome`: what happened (completed, killed, waiting, shell exited).
+/// - `Option<HashSet<u32>>`: fresh `jobs -p` snapshot when available, `None`
+///   to suppress the post-call job sync.
+type CallResult = (Vec<u8>, Outcome, Option<HashSet<u32>>);
+
+/// Handle a successful sentinel match: extract output, exit code, cwd, and
+/// sync background jobs.
+fn handle_completed(
+    guard: &mut Option<session::PtySession>,
+    captures: &expectrl::Captures,
+) -> Result<CallResult, TerminalError> {
+    let pty = guard.as_mut().ok_or(TerminalError::SessionNotInitialized)?;
+    let output = captures.before().to_vec();
+    let (exit_code, cwd) = session::parse_sentinel(captures);
+    let active_pids = session::run_jobs_p_sync(&mut pty.session);
+    pty.working_directory.clone_from(&cwd);
+    Ok((
+        output,
+        Outcome::Completed {
+            exit_code,
+            working_directory: cwd,
+        },
+        active_pids,
+    ))
+}
+
+/// Handle a non-interactive timeout: kill the foreground process, drain
+/// the PTY, and return the killed outcome. If the kill fails, respawn
+/// the shell entirely.
+fn handle_noninteractive_timeout(
+    guard: &mut Option<session::PtySession>,
+    background_pids: &HashSet<u32>,
+    init_file: Option<&std::path::Path>,
+    extra_env: &[(String, String)],
+    timeout_secs: f64,
+) -> Result<CallResult, TerminalError> {
+    let pty = guard.as_mut().ok_or(TerminalError::SessionNotInitialized)?;
+    let shell_pid = pty.shell_pid;
+    let output = session::drain_buf(&mut pty.session);
+
+    if !session::kill_foreground(shell_pid, background_pids) {
+        // Foreground processes survived SIGKILL — the shell is unrecoverable.
+        session::kill_shell(shell_pid);
+        let new_pty = session::PtySession::spawn_blocking_inner(init_file, extra_env)?;
+        let cwd = new_pty.working_directory.clone();
+        *guard = Some(new_pty);
+        return Ok((output, Outcome::ShellExited { working_directory: cwd }, None));
+    }
+
+    // Drain PTY to restore a clean prompt; extract post-kill exit code and $PWD.
+    let (exit_code, cwd) = session::drain_after_kill(&mut pty.session)
+        .unwrap_or_else(|| (DRAIN_FAILURE_EXIT_CODE, pty.working_directory.clone()));
+
+    let active_pids = session::run_jobs_p_sync(&mut pty.session);
+    pty.working_directory.clone_from(&cwd);
+    Ok((
+        output,
+        Outcome::Killed {
+            exit_code,
+            working_directory: cwd,
+            timeout_secs,
+        },
+        active_pids,
+    ))
+}
+
+/// Handle shell exit (EOF): drain buffered output and respawn a fresh session.
+fn handle_shell_exited(
+    guard: &mut Option<session::PtySession>,
+    init_file: Option<&std::path::Path>,
+    extra_env: &[(String, String)],
+) -> Result<CallResult, TerminalError> {
+    let pty = guard.as_mut().ok_or(TerminalError::SessionNotInitialized)?;
+    let output = session::drain_buf(&mut pty.session);
+
+    let new_pty = session::PtySession::spawn_blocking_inner(init_file, extra_env)?;
+    let cwd = new_pty.working_directory.clone();
+    *guard = Some(new_pty);
+
+    Ok((output, Outcome::ShellExited { working_directory: cwd }, None))
 }
 
 impl Tool for TerminalTool {
@@ -736,182 +978,71 @@ impl Tool for TerminalTool {
         }
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "guard is moved into spawn_blocking"
+    )]
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        // Reset: kill the current shell and spawn a fresh one. All other args ignored.
-        if args.reset {
-            let mut guard = self.session.lock().await;
-
-            // Kill the old shell if it exists.
-            if let Some(pty) = guard.as_ref() {
-                session::kill_shell(pty.shell_pid);
-            }
-
-            // Spawn a fresh session (re-applying init file if configured).
-            let new_pty =
-                session::PtySession::spawn(self.init_file.clone(), self.extra_env.clone()).await?;
-            let working_directory = new_pty.working_directory.clone();
-            *guard = Some(new_pty);
-
-            // Clear all tracked background jobs — they belonged to the old shell.
-            self.job_manager.lock().unwrap().jobs.clear();
-
-            let mut output = String::from("Session reset\n");
-            output.push_str(&self.format_prompt(0, &working_directory));
-
-            return Ok(TerminalOutput {
-                output,
-                output_truncated: false,
-                outcome: Outcome::Reset { working_directory },
-            });
-        }
-
-        // Validate: exactly one of `command` or `control` must be provided.
-        if args.command.is_some() && args.control.is_some() {
-            return Err(TerminalError::InvalidInput(
-                "both `command` and `control` provided; use exactly one".into(),
-            ));
-        }
-        if args.command.is_none() && args.control.is_none() {
-            return Err(TerminalError::InvalidInput(
-                "neither `command` nor `control` provided; use exactly one".into(),
-            ));
-        }
-
-        let raw_timeout = args.resolved_timeout();
-        if raw_timeout.is_nan()
-            || raw_timeout.is_infinite()
-            || raw_timeout < 0.0
-            || raw_timeout > MAX_TIMEOUT_SECS
-        {
-            return Err(TerminalError::InvalidTimeout(raw_timeout));
-        }
-        let timeout = Duration::from_secs_f64(raw_timeout);
-        let command = args.command.clone();
-        let control = args.control.clone();
-        // Pre-encode control keys before entering spawn_blocking.
-        let control_bytes = match &control {
-            Some(ctrl) => Some(encode_control_keys(ctrl)?),
-            None => None,
+        let action = parse_args(args)?;
+        let (bytes, interactive, timeout) = match action {
+            Action::Reset => return self.call_reset().await,
+            Action::Keys {
+                bytes,
+                interactive,
+                timeout,
+            } => (bytes, interactive, timeout),
         };
-        let interactive = args.interactive;
-        let background_pids: HashSet<u32> = self
-            .job_manager
-            .lock()
-            .unwrap()
-            .jobs
-            .keys()
-            .copied()
-            .collect();
+
+        let background_pids = self.job_manager.lock().unwrap().tracked_pids();
 
         // Acquire session as an OwnedMutexGuard so it can be sent to spawn_blocking.
         let guard = Arc::clone(&self.session).lock_owned().await;
-
-        // Fast-path: no session — return the error without spawning a thread.
         if guard.is_none() {
             return Err(TerminalError::SessionNotInitialized);
         }
 
         // Run the blocking PTY I/O in a dedicated thread-pool thread.
-        //
-        // The active_pids slot is `Option<HashSet<u32>>`:
-        //   - `Some(pids)` on a normal return or non-interactive timeout — sync the manager.
-        //   - `None` on an interactive timeout or shell exit — the foreground process is
-        //     still alive (Waiting) or gone (ShellExited), so we have no fresh `jobs -p`
-        //     snapshot.
+        // active_pids is Some(pids) when we have a fresh `jobs -p` snapshot (normal
+        // return, non-interactive timeout) and None otherwise (interactive timeout,
+        // shell exit) to suppress spurious completion callbacks.
         let timeout_secs = timeout.as_secs_f64();
         let init_file = self.init_file.clone();
         let extra_env = self.extra_env.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<_, TerminalError> {
             let mut guard = guard;
-            let pty = guard.as_mut().ok_or(TerminalError::SessionNotInitialized)?;
-            let shell_pid = pty.shell_pid;
 
-            // 1. Send command or control keys to the PTY.
-            use expectrl::Expect; // trait needed for .send()/.send_line()
-            if let Some(ref cmd) = command {
-                pty.session
-                    .send_line(cmd)
-                    .map_err(|e| TerminalError::PtyWrite(e.to_string()))?;
-            } else if let Some(ref bytes) = control_bytes {
+            // 1. Send keys to the PTY.
+            {
+                let pty = guard.as_mut().ok_or(TerminalError::SessionNotInitialized)?;
                 pty.session
                     .send(bytes)
                     .map_err(|e| TerminalError::PtyWrite(e.to_string()))?;
             }
 
             // 2. Wait for the prompt sentinel.
-            match session::wait_for_sentinel(&mut pty.session, timeout) {
-                Ok(captures) => {
-                    let output = captures.before().to_vec();
-                    let (exit_code, cwd) = session::parse_sentinel(&captures);
-                    let active_pids = session::run_jobs_p_sync(&mut pty.session);
-                    pty.working_directory = cwd.clone();
-                    let outcome = Outcome::Completed {
-                        exit_code,
-                        working_directory: cwd,
-                    };
-                    Ok((output, outcome, active_pids))
-                }
+            let sentinel = {
+                let pty = guard.as_mut().ok_or(TerminalError::SessionNotInitialized)?;
+                session::wait_for_sentinel(&mut pty.session, timeout)
+            };
 
+            match sentinel {
+                Ok(captures) => handle_completed(&mut guard, &captures),
                 Err(expectrl::Error::ExpectTimeout) if !interactive => {
-                    // Drain partial output buffered by expect() before the timeout.
-                    let output = session::drain_buf(&mut pty.session);
-
-                    // Kill the foreground process (SIGTERM → SIGKILL).
-                    if !session::kill_foreground(shell_pid, &background_pids) {
-                        // Foreground processes survived SIGKILL — the shell is
-                        // unrecoverable. Kill it entirely and respawn.
-                        session::kill_shell(shell_pid);
-                        let new_pty =
-                            session::PtySession::spawn_blocking_inner(init_file.as_deref(), &extra_env)?;
-                        let cwd = new_pty.working_directory.clone();
-                        *guard = Some(new_pty);
-                        let outcome = Outcome::ShellExited {
-                            working_directory: cwd,
-                        };
-                        return Ok((output, outcome, None));
-                    }
-
-                    // Drain PTY to restore a clean prompt; extract post-kill exit code and $PWD.
-                    let (exit_code, cwd) = session::drain_after_kill(&mut pty.session)
-                        .unwrap_or_else(|| {
-                            (DRAIN_FAILURE_EXIT_CODE, pty.working_directory.clone())
-                        });
-
-                    let active_pids = session::run_jobs_p_sync(&mut pty.session);
-                    pty.working_directory = cwd.clone();
-                    let outcome = Outcome::Killed {
-                        exit_code,
-                        working_directory: cwd,
+                    handle_noninteractive_timeout(
+                        &mut guard,
+                        &background_pids,
+                        init_file.as_deref(),
+                        &extra_env,
                         timeout_secs,
-                    };
-                    Ok((output, outcome, active_pids))
+                    )
                 }
-
                 Err(expectrl::Error::ExpectTimeout) => {
-                    // Interactive timeout: return partial output; process still alive.
-                    // active_pids is None to suppress the post-call sync — we have no
-                    // fresh jobs-p snapshot and syncing with an empty set would fire
-                    // spurious completion callbacks for all tracked background jobs.
-                    let output = session::drain_buf(&mut pty.session);
-                    Ok((output, Outcome::Waiting, None))
+                    let pty = guard.as_mut().ok_or(TerminalError::SessionNotInitialized)?;
+                    Ok((session::drain_buf(&mut pty.session), Outcome::Waiting, None))
                 }
-
                 Err(expectrl::Error::Eof) => {
-                    // Shell process exited (exec, exit, crash, etc.).
-                    // Drain any buffered output before EOF.
-                    let output = session::drain_buf(&mut pty.session);
-
-                    // Respawn a fresh session so the next call() works.
-                    let new_pty = session::PtySession::spawn_blocking_inner(init_file.as_deref(), &extra_env)?;
-                    let cwd = new_pty.working_directory.clone();
-                    *guard = Some(new_pty);
-
-                    let outcome = Outcome::ShellExited {
-                        working_directory: cwd,
-                    };
-                    Ok((output, outcome, None))
+                    handle_shell_exited(&mut guard, init_file.as_deref(), &extra_env)
                 }
-
                 Err(e) => Err(TerminalError::PtyRead(e.to_string())),
             }
         })
@@ -924,44 +1055,7 @@ impl Tool for TerminalTool {
             self.job_manager.lock().unwrap().sync(&active_pids);
         }
 
-        let output = String::from_utf8_lossy(&output_bytes).into_owned();
-        let (mut output, output_truncated) = truncate_output(output, MAX_OUTPUT_CHARS);
-
-        // Append the harness-built prompt so the model sees exit code, identity,
-        // and location context at the end of every command's output.
-        match &outcome {
-            Outcome::Completed {
-                exit_code,
-                working_directory,
-            } => {
-                output.push_str(&self.format_prompt(*exit_code, working_directory));
-            }
-            Outcome::Killed {
-                exit_code,
-                working_directory,
-                ..
-            } => {
-                output.push_str("Killed\n");
-                output.push_str(&self.format_prompt(*exit_code, working_directory));
-            }
-            Outcome::ShellExited { working_directory } => {
-                output.push_str("Shell exited, respawned\n");
-                output.push_str(&self.format_prompt(0, working_directory));
-            }
-            Outcome::Reset { .. } => {
-                // Reset builds its own output and returns early above.
-                unreachable!("reset returns early");
-            }
-            Outcome::Waiting => {
-                // Process still running — no prompt to append.
-            }
-        }
-
-        Ok(TerminalOutput {
-            output,
-            output_truncated,
-            outcome,
-        })
+        Ok(self.format_output(&output_bytes, outcome))
     }
 }
 

@@ -21,6 +21,13 @@ pub(crate) const SENTINEL_REGEX: &str = r"\x1b\]999;(\d+);([^\x07]*)\x07";
 /// Drain timeout after killing the foreground process.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Shell init commands injected as `PROMPT_COMMAND`.
+///
+/// Sets up the OSC 999 sentinel, clears PS1, and disables job monitoring
+/// so all children inherit the shell's process group.
+const HARNESS_INIT: &str =
+    "PROMPT_COMMAND='printf \"\\033]999;%d;%s\\007\" $? \"$PWD\"'; PS1=''; set +m";
+
 /// Environment variables inherited from the parent process (if set).
 ///
 /// Everything else is cleared via `env_clear()` to prevent credential
@@ -123,7 +130,7 @@ impl PtySession {
             .map_err(|e| TerminalError::PtySpawn(format!("set_echo failed: {e}")))?;
 
         // 3. Get the shell PID.
-        let shell_pid = session.get_process().pid().as_raw() as u32;
+        let shell_pid = session.get_process().pid().as_raw().cast_unsigned();
 
         // 4. Wait for the known PS1 prompt so the shell is ready for input.
         //    Without this, send_line can race with bash's startup and the
@@ -150,8 +157,6 @@ impl PtySession {
         //    in a single line. The init file loads first (env vars, aliases,
         //    functions), then we overwrite PS1 and PROMPT_COMMAND so the harness
         //    has full prompt control regardless of what the init file set.
-        const HARNESS_INIT: &str =
-            "PROMPT_COMMAND='printf \"\\033]999;%d;%s\\007\" $? \"$PWD\"'; PS1=''; set +m";
         let init_line = if let Some(path) = init_file {
             let escaped = shell_escape::escape(path.display().to_string().into());
             format!("source {escaped}; {HARNESS_INIT}")
@@ -288,7 +293,7 @@ pub(crate) fn kill_foreground(shell_pid: u32, background_pids: &HashSet<u32>) ->
     //    continues the loop.
     //
     // shell_pid is always non-zero (it's a real PID from fork).
-    let pid = rustix::process::Pid::from_raw(shell_pid as i32).expect("shell_pid is non-zero");
+    let pid = rustix::process::Pid::from_raw(shell_pid.cast_signed()).expect("shell_pid is non-zero");
     let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::INT);
 
     // Give SIGINT a moment to be delivered and processed before enumerating
@@ -371,9 +376,9 @@ pub(crate) fn drain_after_kill(session: &mut OsSession) -> Option<(i32, String)>
 ///
 /// We use `check()` (single non-blocking read + pattern match) instead of
 /// `fill_buf()`. The latter delegates to `BufReader::fill_buf()` which
-/// does a blocking `read()` when the BufReader layer is empty — even if
+/// does a blocking `read()` when the `BufReader` layer is empty — even if
 /// expectrl's own buffer has data. With PS1='', a command that produces
-/// no output (e.g. `sleep`) leaves both the OS fd and BufReader empty,
+/// no output (e.g. `sleep`) leaves both the OS fd and `BufReader` empty,
 /// so `fill_buf()` blocks forever. `check()` correctly consults both
 /// the OS fd (via `read_available`) and expectrl's internal buffer (via
 /// `get_available`), returning immediately in either case.
