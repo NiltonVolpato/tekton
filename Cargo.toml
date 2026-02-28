@@ -2,4 +2,25 @@
 resolver = "3"
 members = [
     "terminal-tool",
+    "experimental",
 ]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+authors = ["Nilton Volpato <nilton@volpa.to>"]
+# license = ? # TODO pick a license.
+repository = "https://github.com/NiltonVolpato/tekton"
+readme = "README.md"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# Transitive dependency version duplication — not actionable
+multiple_crate_versions = "allow"
+
+[workspace.lints.rust]
+unsafe_code = "deny"

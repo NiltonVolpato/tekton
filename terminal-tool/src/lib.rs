@@ -157,9 +157,7 @@ fn truncate_output(output: String, max_chars: usize) -> (String, bool) {
 
     let omitted = char_count - max_chars;
     // Build the marker first so we know its length.
-    let marker = format!(
-        "\n\n--- OUTPUT TRUNCATED ({omitted} characters omitted) ---\n\n"
-    );
+    let marker = format!("\n\n--- OUTPUT TRUNCATED ({omitted} characters omitted) ---\n\n");
     let marker_chars = marker.chars().count();
 
     // Budget available for head + tail after subtracting the marker.
@@ -168,7 +166,10 @@ fn truncate_output(output: String, max_chars: usize) -> (String, bool) {
     let tail_chars = budget - head_chars; // 40 %
 
     // Find byte offsets on char boundaries.
-    let head_end: usize = output.char_indices().nth(head_chars).map_or(output.len(), |(i, _)| i);
+    let head_end: usize = output
+        .char_indices()
+        .nth(head_chars)
+        .map_or(output.len(), |(i, _)| i);
     let tail_start: usize = output
         .char_indices()
         .nth(char_count - tail_chars)
@@ -472,6 +473,13 @@ pub struct TerminalTool {
     /// customizations (env vars, aliases, functions) to load before the
     /// harness takes over with its own `PROMPT_COMMAND` and `PS1`.
     init_file: Option<std::path::PathBuf>,
+
+    /// Extra environment variables set on the PTY child process.
+    ///
+    /// Applied after the `TEKTON_*` passthrough and before the fixed overrides
+    /// (LANG, EDITOR, etc.), so they can set arbitrary vars but cannot override
+    /// the harness's own settings.
+    extra_env: Vec<(String, String)>,
 }
 
 impl TerminalTool {
@@ -486,6 +494,7 @@ impl TerminalTool {
             job_manager: Arc::new(Mutex::new(JobManager::new())),
             agent_name: String::new(),
             init_file: None,
+            extra_env: Vec::new(),
         }
     }
 
@@ -508,17 +517,29 @@ impl TerminalTool {
         self
     }
 
+    /// Add an environment variable to set on the PTY child process.
+    ///
+    /// These are applied after the `TEKTON_*` passthrough and before the
+    /// fixed overrides (LANG, EDITOR, etc.). Call multiple times to set
+    /// several variables.
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_env.push((key.into(), value.into()));
+        self
+    }
+
     /// Spawn a bash PTY session and return a fully initialized `TerminalTool`.
     ///
     /// Consumes `self` (from the builder chain) and returns an initialized tool.
     /// Use [`working_directory`](Self::working_directory) to read the initial `$PWD`.
     pub async fn spawn(self) -> Result<Self, TerminalError> {
-        let pty_session = session::PtySession::spawn(self.init_file.clone()).await?;
+        let pty_session =
+            session::PtySession::spawn(self.init_file.clone(), self.extra_env.clone()).await?;
         Ok(Self {
             session: Arc::new(tokio::sync::Mutex::new(Some(pty_session))),
             job_manager: self.job_manager,
             agent_name: self.agent_name,
             init_file: self.init_file,
+            extra_env: self.extra_env,
         })
     }
 
@@ -556,6 +577,7 @@ impl TerminalTool {
             job_manager: Arc::new(Mutex::new(manager)),
             agent_name: self.agent_name,
             init_file: self.init_file,
+            extra_env: self.extra_env,
         }
     }
 
@@ -725,7 +747,8 @@ impl Tool for TerminalTool {
             }
 
             // Spawn a fresh session (re-applying init file if configured).
-            let new_pty = session::PtySession::spawn(self.init_file.clone()).await?;
+            let new_pty =
+                session::PtySession::spawn(self.init_file.clone(), self.extra_env.clone()).await?;
             let working_directory = new_pty.working_directory.clone();
             *guard = Some(new_pty);
 
@@ -797,6 +820,7 @@ impl Tool for TerminalTool {
         //     snapshot.
         let timeout_secs = timeout.as_secs_f64();
         let init_file = self.init_file.clone();
+        let extra_env = self.extra_env.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<_, TerminalError> {
             let mut guard = guard;
             let pty = guard.as_mut().ok_or(TerminalError::SessionNotInitialized)?;
@@ -830,14 +854,15 @@ impl Tool for TerminalTool {
 
                 Err(expectrl::Error::ExpectTimeout) if !interactive => {
                     // Drain partial output buffered by expect() before the timeout.
-                    let output = session::drain_buf(&mut pty.session)?;
+                    let output = session::drain_buf(&mut pty.session);
 
                     // Kill the foreground process (SIGTERM → SIGKILL).
                     if !session::kill_foreground(shell_pid, &background_pids) {
                         // Foreground processes survived SIGKILL — the shell is
                         // unrecoverable. Kill it entirely and respawn.
                         session::kill_shell(shell_pid);
-                        let new_pty = session::PtySession::spawn_blocking_inner(init_file.as_deref())?;
+                        let new_pty =
+                            session::PtySession::spawn_blocking_inner(init_file.as_deref(), &extra_env)?;
                         let cwd = new_pty.working_directory.clone();
                         *guard = Some(new_pty);
                         let outcome = Outcome::ShellExited {
@@ -867,17 +892,17 @@ impl Tool for TerminalTool {
                     // active_pids is None to suppress the post-call sync — we have no
                     // fresh jobs-p snapshot and syncing with an empty set would fire
                     // spurious completion callbacks for all tracked background jobs.
-                    let output = session::drain_buf(&mut pty.session)?;
+                    let output = session::drain_buf(&mut pty.session);
                     Ok((output, Outcome::Waiting, None))
                 }
 
                 Err(expectrl::Error::Eof) => {
                     // Shell process exited (exec, exit, crash, etc.).
                     // Drain any buffered output before EOF.
-                    let output = session::drain_buf(&mut pty.session)?;
+                    let output = session::drain_buf(&mut pty.session);
 
                     // Respawn a fresh session so the next call() works.
-                    let new_pty = session::PtySession::spawn_blocking_inner(init_file.as_deref())?;
+                    let new_pty = session::PtySession::spawn_blocking_inner(init_file.as_deref(), &extra_env)?;
                     let cwd = new_pty.working_directory.clone();
                     *guard = Some(new_pty);
 
@@ -1073,7 +1098,9 @@ mod tests {
     #[test]
     fn truncate_output_truncates_over_limit() {
         // 1000 chars, limit 200 → must truncate
-        let input: String = (0..1000u16).map(|i| (b'A' + (i % 26) as u8) as char).collect();
+        let input: String = (0..1000u16)
+            .map(|i| (b'A' + (i % 26) as u8) as char)
+            .collect();
         let (result, truncated) = truncate_output(input.clone(), 200);
         assert!(truncated);
         // Result must start with head of input and end with tail of input
@@ -1105,7 +1132,9 @@ mod tests {
     #[test]
     fn truncate_output_head_tail_ratio() {
         // With a large enough input, head should be ~60% and tail ~40% of budget.
-        let input: String = (0..10_000).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        let input: String = (0..10_000)
+            .map(|i| (b'a' + (i % 26) as u8) as char)
+            .collect();
         let (result, truncated) = truncate_output(input.clone(), 1000);
         assert!(truncated);
 

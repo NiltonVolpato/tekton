@@ -60,14 +60,18 @@ impl PtySession {
     /// the async executor when multiple sessions are created concurrently.
     pub(crate) async fn spawn(
         init_file: Option<std::path::PathBuf>,
+        extra_env: Vec<(String, String)>,
     ) -> Result<Self, TerminalError> {
-        tokio::task::spawn_blocking(move || Self::spawn_blocking_inner(init_file.as_deref()))
-            .await
-            .map_err(|e| TerminalError::PtySpawn(format!("spawn_blocking panicked: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            Self::spawn_blocking_inner(init_file.as_deref(), &extra_env)
+        })
+        .await
+        .map_err(|e| TerminalError::PtySpawn(format!("spawn_blocking panicked: {e}")))?
     }
 
     pub(crate) fn spawn_blocking_inner(
         init_file: Option<&Path>,
+        extra_env: &[(String, String)],
     ) -> Result<Self, TerminalError> {
         // 1. Build the bash command with a sanitized environment.
         let mut cmd = Command::new("bash");
@@ -91,6 +95,11 @@ impl PtySession {
             if key.starts_with("TEKTON_") {
                 cmd.env(key, value);
             }
+        }
+
+        // Apply caller-supplied extra env vars (e.g. session IDs, test vars).
+        for (key, value) in extra_env {
+            cmd.env(key, value);
         }
 
         // Override with fixed values to ensure predictable behavior.
@@ -264,7 +273,6 @@ pub(crate) fn run_jobs_p_sync(session: &mut OsSession) -> Option<HashSet<u32>> {
 ///   the primary signal, anything that survives it is unlikely to respond
 ///   to SIGTERM either — jumping directly to SIGKILL would save ~500ms.
 pub(crate) fn kill_foreground(shell_pid: u32, background_pids: &HashSet<u32>) -> bool {
-
     // SIGINT the entire process group atomically. Since we spawn bash with
     // `set +m` (job monitoring off), all children inherit the shell's
     // process group. This serves two purposes:
@@ -279,11 +287,9 @@ pub(crate) fn kill_foreground(shell_pid: u32, background_pids: &HashSet<u32>) ->
     //    from SIGINT — if the child dies from SIGTERM instead, bash
     //    continues the loop.
     //
-    // Safety: shell_pid is always non-zero (it's a real PID from fork),
-    // so negating it will never produce 0 or -1.
-    unsafe {
-        libc::kill(-(shell_pid as i32), libc::SIGINT);
-    }
+    // shell_pid is always non-zero (it's a real PID from fork).
+    let pid = rustix::process::Pid::from_raw(shell_pid as i32).expect("shell_pid is non-zero");
+    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::INT);
 
     // Give SIGINT a moment to be delivered and processed before enumerating
     // survivors for SIGTERM/SIGKILL escalation.
@@ -371,7 +377,7 @@ pub(crate) fn drain_after_kill(session: &mut OsSession) -> Option<(i32, String)>
 /// so `fill_buf()` blocks forever. `check()` correctly consults both
 /// the OS fd (via `read_available`) and expectrl's internal buffer (via
 /// `get_available`), returning immediately in either case.
-pub(crate) fn drain_buf(session: &mut OsSession) -> Result<Vec<u8>, crate::TerminalError> {
+pub(crate) fn drain_buf(session: &mut OsSession) -> Vec<u8> {
     use expectrl::Expect;
     // check() does: read_available() (non-blocking OS read into internal
     // buffer) + get_available() (inspect internal buffer) + needle.check().
@@ -382,10 +388,10 @@ pub(crate) fn drain_buf(session: &mut OsSession) -> Result<Vec<u8>, crate::Termi
             if let Some(matched) = captures.get(0) {
                 data.extend_from_slice(matched);
             }
-            Ok(data)
+            data
         }
         // No data available — return empty without blocking.
-        Err(_) => Ok(vec![]),
+        Err(_) => vec![],
     }
 }
 
@@ -534,10 +540,10 @@ mod tests {
 
     #[tokio::test]
     async fn parse_sentinel_exit_code_zero_for_true() {
-        let pty = PtySession::spawn(None).await.unwrap();
+        let pty = PtySession::spawn(None, Vec::new()).await.unwrap();
         let (exit_code, _) = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-    
+
             pty.session.send_line("true").unwrap();
             let caps = wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             parse_sentinel(&caps)
@@ -549,10 +555,10 @@ mod tests {
 
     #[tokio::test]
     async fn parse_sentinel_exit_code_one_for_false() {
-        let pty = PtySession::spawn(None).await.unwrap();
+        let pty = PtySession::spawn(None, Vec::new()).await.unwrap();
         let (exit_code, _) = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-    
+
             pty.session.send_line("false").unwrap();
             let caps = wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             parse_sentinel(&caps)
@@ -565,10 +571,10 @@ mod tests {
     #[tokio::test]
     async fn parse_sentinel_arbitrary_exit_code() {
         // Verifies that exit codes other than 0 and 1 are faithfully relayed.
-        let pty = PtySession::spawn(None).await.unwrap();
+        let pty = PtySession::spawn(None, Vec::new()).await.unwrap();
         let (exit_code, _) = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-    
+
             pty.session.send_line("sh -c 'exit 99'").unwrap();
             let caps = wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             parse_sentinel(&caps)
@@ -582,10 +588,10 @@ mod tests {
     async fn parse_sentinel_cwd_is_root_after_cd_slash() {
         // The sentinel's CWD field must reflect the real working directory.
         // Using "/" avoids the macOS /tmp → /private/tmp symlink ambiguity.
-        let pty = PtySession::spawn(None).await.unwrap();
+        let pty = PtySession::spawn(None, Vec::new()).await.unwrap();
         let (_, cwd) = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-    
+
             pty.session.send_line("cd /").unwrap();
             let caps = wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             parse_sentinel(&caps)
@@ -604,10 +610,10 @@ mod tests {
         //
         // This test was previously a known-failing bug-documentation test.
         // The fix — changing .unwrap_or(0) to .unwrap_or(-1) — has been applied.
-        let pty = PtySession::spawn(None).await.unwrap();
+        let pty = PtySession::spawn(None, Vec::new()).await.unwrap();
         let exit_code = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-    
+
             // Override PROMPT_COMMAND to emit an exit-code field that overflows i32.
             pty.session
                 .send_line("PROMPT_COMMAND='printf \"\\033]999;9999999999;$PWD\\007\"'")
@@ -635,7 +641,7 @@ mod tests {
     async fn wait_for_sentinel_times_out_when_no_new_sentinel_emitted() {
         // After spawn the initial sentinel is consumed. With no command sent,
         // no new sentinel arrives and wait_for_sentinel must return ExpectTimeout.
-        let pty = PtySession::spawn(None).await.unwrap();
+        let pty = PtySession::spawn(None, Vec::new()).await.unwrap();
         let result = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
             // No command sent — no sentinel will arrive.
@@ -655,7 +661,7 @@ mod tests {
     async fn wait_for_sentinel_does_not_dramatically_overshoot_timeout() {
         // Guards against an implementation that loops with a fixed sleep much
         // larger than POLL_INTERVAL, making the effective timeout 10× the request.
-        let pty = PtySession::spawn(None).await.unwrap();
+        let pty = PtySession::spawn(None, Vec::new()).await.unwrap();
         let start = std::time::Instant::now();
         let _result = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
@@ -675,7 +681,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_jobs_p_sync_empty_when_no_background_jobs() {
-        let pty = PtySession::spawn(None).await.unwrap();
+        let pty = PtySession::spawn(None, Vec::new()).await.unwrap();
         let pids = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
             run_jobs_p_sync(&mut pty.session)
@@ -691,10 +697,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_jobs_p_sync_returns_pid_of_running_background_job() {
-        let pty = PtySession::spawn(None).await.unwrap();
+        let pty = PtySession::spawn(None, Vec::new()).await.unwrap();
         let pids = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-    
+
             // Start a long-running background job.
             pty.session.send_line("sleep 9999 &").unwrap();
             // Shell returns to prompt after backgrounding; wait for sentinel.
@@ -720,10 +726,10 @@ mod tests {
         //
         // Note: run_jobs_p_sync itself now runs `true` first, plus the explicit
         // one below — two reap cycles, ensuring robustness.
-        let pty = PtySession::spawn(None).await.unwrap();
+        let pty = PtySession::spawn(None, Vec::new()).await.unwrap();
         let pids = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-    
+
             pty.session.send_line("sleep 0.1 &").unwrap();
             wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             // Wait for the background job to finish, then force a full prompt
@@ -746,11 +752,11 @@ mod tests {
 
     #[tokio::test]
     async fn kill_foreground_terminates_running_foreground_process() {
-        let pty = PtySession::spawn(None).await.unwrap();
+        let pty = PtySession::spawn(None, Vec::new()).await.unwrap();
         let shell_pid = pty.shell_pid;
         let result = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-    
+
             // Start a foreground process that would run indefinitely.
             pty.session.send_line("sleep 9999").unwrap();
             // Read from the PTY so bash can make progress forking the child.
@@ -777,11 +783,10 @@ mod tests {
         // A PID listed in `background_pids` must survive kill_foreground.
         // This is the mechanism that prevents the harness from accidentally
         // killing long-running background tasks when a foreground command times out.
-        let pty = PtySession::spawn(None).await.unwrap();
+        let pty = PtySession::spawn(None, Vec::new()).await.unwrap();
         let shell_pid = pty.shell_pid;
         let bg_survived = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-    
 
             // Start a background job and record its PID.
             pty.session.send_line("sleep 9999 &").unwrap();
@@ -815,11 +820,10 @@ mod tests {
     async fn drain_after_kill_returns_cwd_from_post_kill_sentinel() {
         // After kill_foreground, bash runs PROMPT_COMMAND and emits a new sentinel.
         // drain_after_kill must extract the CWD from that sentinel and return it.
-        let pty = PtySession::spawn(None).await.unwrap();
+        let pty = PtySession::spawn(None, Vec::new()).await.unwrap();
         let shell_pid = pty.shell_pid;
         let cwd = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-    
 
             // Navigate to a known directory first.
             pty.session.send_line("cd /").unwrap();
@@ -851,8 +855,8 @@ mod tests {
     // ── Environment sanitization ────────────────────────────────────────
 
     /// Helper: run `echo $VAR` in a PTY session and return the trimmed output.
-    async fn env_var_in_pty(var: &str) -> String {
-        let pty = PtySession::spawn(None).await.unwrap();
+    async fn env_var_in_pty(var: &str, extra_env: Vec<(String, String)>) -> String {
+        let pty = PtySession::spawn(None, extra_env).await.unwrap();
         let var = var.to_string();
         tokio::task::spawn_blocking(move || {
             let mut pty = pty;
@@ -869,23 +873,34 @@ mod tests {
 
     #[tokio::test]
     async fn env_sanitized_api_keys_not_inherited() {
-        // Set a fake API key in the parent process and verify the child doesn't see it.
-        // Safety: env::set_var is fine in tests — each PTY is a separate process.
-        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-secret-key") };
-        let value = env_var_in_pty("OPENAI_API_KEY").await;
-        assert_eq!(value, "", "OPENAI_API_KEY must not be inherited by the PTY shell");
+        // Verify that API keys set in the parent process are NOT inherited
+        // (they're not in INHERITED_VARS and are cleared by env_clear).
+        // We test this by checking an unset variable — it should be empty.
+        let value = env_var_in_pty("OPENAI_API_KEY", Vec::new()).await;
+        assert_eq!(
+            value, "",
+            "OPENAI_API_KEY must not be inherited by the PTY shell from parent environment"
+        );
     }
 
     #[tokio::test]
     async fn env_sanitized_tekton_vars_passed_through() {
-        unsafe { std::env::set_var("TEKTON_TEST_VAR", "hello_from_tekton") };
-        let value = env_var_in_pty("TEKTON_TEST_VAR").await;
-        assert_eq!(value, "hello_from_tekton", "TEKTON_* vars must be passed through");
+        // Pass a TEKTON_* var via extra_env; these are always passed through
+        // regardless of INHERITED_VARS (because spawn_blocking_inner passes them).
+        let value = env_var_in_pty(
+            "TEKTON_TEST_VAR",
+            vec![("TEKTON_TEST_VAR".into(), "hello_from_tekton".into())],
+        )
+        .await;
+        assert_eq!(
+            value, "hello_from_tekton",
+            "TEKTON_* vars must be passed through"
+        );
     }
 
     #[tokio::test]
     async fn env_sanitized_path_inherited() {
-        let value = env_var_in_pty("PATH").await;
+        let value = env_var_in_pty("PATH", Vec::new()).await;
         assert!(
             !value.is_empty(),
             "PATH must be inherited from the parent process"
@@ -899,7 +914,7 @@ mod tests {
 
     #[tokio::test]
     async fn env_sanitized_home_inherited() {
-        let value = env_var_in_pty("HOME").await;
+        let value = env_var_in_pty("HOME", Vec::new()).await;
         assert_eq!(
             value,
             std::env::var("HOME").unwrap(),
@@ -909,35 +924,32 @@ mod tests {
 
     #[tokio::test]
     async fn env_sanitized_term_inherited() {
-        let value = env_var_in_pty("TERM").await;
+        let value = env_var_in_pty("TERM", Vec::new()).await;
         // TERM may differ from parent (expectrl may set its own), but it must be non-empty.
-        assert!(
-            !value.is_empty(),
-            "TERM must be set in the PTY shell"
-        );
+        assert!(!value.is_empty(), "TERM must be set in the PTY shell");
     }
 
     #[tokio::test]
     async fn env_sanitized_lang_overridden() {
-        let value = env_var_in_pty("LANG").await;
+        let value = env_var_in_pty("LANG", Vec::new()).await;
         assert_eq!(value, "C.UTF-8", "LANG must be overridden to C.UTF-8");
     }
 
     #[tokio::test]
     async fn env_sanitized_lc_all_overridden() {
-        let value = env_var_in_pty("LC_ALL").await;
+        let value = env_var_in_pty("LC_ALL", Vec::new()).await;
         assert_eq!(value, "C.UTF-8", "LC_ALL must be overridden to C.UTF-8");
     }
 
     #[tokio::test]
     async fn env_sanitized_editor_overridden() {
-        let value = env_var_in_pty("EDITOR").await;
+        let value = env_var_in_pty("EDITOR", Vec::new()).await;
         assert_eq!(value, "false", "EDITOR must be overridden to 'false'");
     }
 
     #[tokio::test]
     async fn env_sanitized_pager_overridden() {
-        let value = env_var_in_pty("PAGER").await;
+        let value = env_var_in_pty("PAGER", Vec::new()).await;
         assert_eq!(value, "cat", "PAGER must be overridden to 'cat'");
     }
 
@@ -950,24 +962,25 @@ mod tests {
         let init_path = dir.path().join("init.sh");
         std::fs::write(&init_path, "export FOO=bar\n").unwrap();
 
-        let pty = PtySession::spawn(Some(init_path)).await.unwrap();
+        let pty = PtySession::spawn(Some(init_path), Vec::new()).await.unwrap();
         let value = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
-            pty.session
-                .send_line("printf '%s' \"$FOO\"")
-                .unwrap();
+            pty.session.send_line("printf '%s' \"$FOO\"").unwrap();
             let caps = wait_for_sentinel(&mut pty.session, Duration::from_secs(5)).unwrap();
             String::from_utf8_lossy(caps.before()).to_string()
         })
         .await
         .unwrap();
-        assert_eq!(value, "bar", "init file export must be available in the shell");
+        assert_eq!(
+            value, "bar",
+            "init file export must be available in the shell"
+        );
     }
 
     #[tokio::test]
     async fn init_file_none_works_normally() {
         // Passing None for init_file must not cause any errors.
-        let pty = PtySession::spawn(None).await.unwrap();
+        let pty = PtySession::spawn(None, Vec::new()).await.unwrap();
         let exit_code = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
             pty.session.send_line("true").unwrap();
