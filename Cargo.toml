@@ -9,7 +9,7 @@ members = [
 version = "0.0.0"
 edition = "2024"
 authors = ["Nilton Volpato <nilton@volpa.to>"]
-license = "TBD"  # TODO pick a license.
+# license = ? # TODO pick a license.
 repository = "https://github.com/NiltonVolpato/tekton"
 readme = "README.md"
 
