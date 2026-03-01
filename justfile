@@ -31,6 +31,7 @@ lint:
 _mock-server-start:
     #!/usr/bin/env bash
     set -euo pipefail
+    cleanup() { kill "$(cat {{ mock_server_pid_file }})" 2>/dev/null || true; rm -f {{ mock_server_pid_file }}; }
     timeout 5m vidaimock &
     echo $! > {{ mock_server_pid_file }}
     for i in $(seq 1 30); do
@@ -40,6 +41,7 @@ _mock-server-start:
         sleep 0.1
     done
     echo "ERROR: mock server failed to become ready after 3 seconds" >&2
+    cleanup
     exit 1
 
 # Stop mock server if running

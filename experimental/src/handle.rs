@@ -197,6 +197,47 @@ mod tests {
     }
 
     #[test]
+    fn map_chunk_filters_tool_call_delta() {
+        use rig::streaming::ToolCallDeltaContent;
+
+        let item: Result<MultiTurnStreamItem<()>, StreamingError> =
+            Ok(MultiTurnStreamItem::StreamAssistantItem(
+                StreamedAssistantContent::ToolCallDelta {
+                    id: "id".to_string(),
+                    internal_call_id: "internal".to_string(),
+                    content: ToolCallDeltaContent::Delta("chunk".to_string()),
+                },
+            ));
+        assert!(map_chunk(item).is_none());
+    }
+
+    #[test]
+    fn map_chunk_filters_reasoning() {
+        use rig::completion::message::Reasoning;
+
+        let reasoning: Reasoning =
+            serde_json::from_value(serde_json::json!({"content": []}))
+                .expect("should deserialize Reasoning");
+        let item: Result<MultiTurnStreamItem<()>, StreamingError> =
+            Ok(MultiTurnStreamItem::StreamAssistantItem(
+                StreamedAssistantContent::Reasoning(reasoning),
+            ));
+        assert!(map_chunk(item).is_none());
+    }
+
+    #[test]
+    fn map_chunk_filters_reasoning_delta() {
+        let item: Result<MultiTurnStreamItem<()>, StreamingError> =
+            Ok(MultiTurnStreamItem::StreamAssistantItem(
+                StreamedAssistantContent::ReasoningDelta {
+                    id: None,
+                    reasoning: "thinking...".to_string(),
+                },
+            ));
+        assert!(map_chunk(item).is_none());
+    }
+
+    #[test]
     fn map_chunk_passes_through_errors() {
         use rig::completion::CompletionError;
 
