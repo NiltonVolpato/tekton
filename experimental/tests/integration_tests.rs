@@ -25,7 +25,8 @@ system_prompt = "You are a test agent."
 
 #[tokio::test]
 async fn integration_prompt() {
-    let _url = common::test_server_url();
+    // Guard: ensure mock server env is configured (the agent reads OPENAI_BASE_URL directly).
+    let _ = common::test_server_url();
     let dir = tempfile::tempdir().unwrap();
     let pkl = mock_agent_config(dir.path());
     let config = load_config(&pkl).unwrap();
@@ -36,7 +37,8 @@ async fn integration_prompt() {
 
 #[tokio::test]
 async fn integration_chat() {
-    let _url = common::test_server_url();
+    // Guard: ensure mock server env is configured (the agent reads OPENAI_BASE_URL directly).
+    let _ = common::test_server_url();
     let dir = tempfile::tempdir().unwrap();
     let pkl = mock_agent_config(dir.path());
     let config = load_config(&pkl).unwrap();
@@ -47,7 +49,8 @@ async fn integration_chat() {
 
 #[tokio::test]
 async fn integration_stream_chat() {
-    let _url = common::test_server_url();
+    // Guard: ensure mock server env is configured (the agent reads OPENAI_BASE_URL directly).
+    let _ = common::test_server_url();
     let dir = tempfile::tempdir().unwrap();
     let pkl = mock_agent_config(dir.path());
     let config = load_config(&pkl).unwrap();
@@ -59,8 +62,10 @@ async fn integration_stream_chat() {
     let mut stream = agent.stream_chat("Hello", vec![]).await;
     let mut texts = Vec::new();
     while let Some(event) = stream.next().await {
-        if let Ok(StreamEvent::Text(t)) = event {
-            texts.push(t);
+        match event {
+            Ok(StreamEvent::Text(t)) => texts.push(t),
+            Ok(StreamEvent::ToolCall { .. }) => {}
+            Err(e) => panic!("stream returned an error: {e}"),
         }
     }
     assert!(!texts.is_empty());

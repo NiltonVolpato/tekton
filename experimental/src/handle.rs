@@ -209,6 +209,9 @@ mod tests {
         let item: Result<MultiTurnStreamItem<()>, StreamingError> = Err(streaming_err);
         let result = map_chunk(item);
         let err = result.expect("should be Some").unwrap_err();
-        assert!(err.to_string().contains("JsonError"));
+        assert!(
+            matches!(err, StreamingError::Completion(CompletionError::JsonError(_))),
+            "expected StreamingError::Completion(CompletionError::JsonError(_)), got: {err:?}"
+        );
     }
 }

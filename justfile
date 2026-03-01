@@ -1,6 +1,6 @@
 
 nextest_args := "--status-level fail --show-progress none --no-output-indent --cargo-quiet"
-test_server_pid_file := shell("mktemp -t pid")
+mock_server_pid_file := "/tmp/mock-server.pid"
 
 export TEST_SERVER_URL := "http://localhost:8100"
 export OPENAI_API_KEY := "fake-key"
@@ -30,13 +30,22 @@ lint:
 # Start mock server in background, wait for readiness
 _mock-server-start:
     #!/usr/bin/env bash
+    set -euo pipefail
     timeout 5m vidaimock &
-    echo $! > {{ test_server_pid_file }}
+    echo $! > {{ mock_server_pid_file }}
     for i in $(seq 1 30); do
-        curl -sf http://localhost:8100/health > /dev/null 2>&1 && break
+        if curl -sf http://localhost:8100/health > /dev/null 2>&1; then
+            exit 0
+        fi
         sleep 0.1
     done
+    echo "ERROR: mock server failed to become ready after 3 seconds" >&2
+    exit 1
 
 # Stop mock server if running
 _mock-server-stop:
-    -kill $(cat {{ test_server_pid_file }})
+    #!/usr/bin/env bash
+    if [ -f {{ mock_server_pid_file }} ]; then
+        kill "$(cat {{ mock_server_pid_file }})" 2>/dev/null || true
+        rm -f {{ mock_server_pid_file }}
+    fi
