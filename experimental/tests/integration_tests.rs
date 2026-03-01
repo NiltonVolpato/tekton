@@ -6,7 +6,7 @@ use tekton_experimental::{build_agent, load_config};
 
 use common::{write_base_schema, write_pkl};
 
-fn vidaimock_config(dir: &Path) -> std::path::PathBuf {
+fn mock_agent_config(dir: &Path) -> std::path::PathBuf {
     write_base_schema(dir);
     write_pkl(
         dir,
@@ -24,10 +24,10 @@ system_prompt = "You are a test agent."
 }
 
 #[tokio::test]
-async fn vidaimock_prompt() {
-    let _url = common::vidaimock_url();
+async fn integration_prompt() {
+    let _url = common::test_server_url();
     let dir = tempfile::tempdir().unwrap();
-    let pkl = vidaimock_config(dir.path());
+    let pkl = mock_agent_config(dir.path());
     let config = load_config(&pkl).unwrap();
     let agent = build_agent(&config).await.unwrap();
     let response = agent.prompt("Hello").await.unwrap();
@@ -35,10 +35,10 @@ async fn vidaimock_prompt() {
 }
 
 #[tokio::test]
-async fn vidaimock_chat() {
-    let _url = common::vidaimock_url();
+async fn integration_chat() {
+    let _url = common::test_server_url();
     let dir = tempfile::tempdir().unwrap();
-    let pkl = vidaimock_config(dir.path());
+    let pkl = mock_agent_config(dir.path());
     let config = load_config(&pkl).unwrap();
     let agent = build_agent(&config).await.unwrap();
     let response = agent.chat("Hello", vec![]).await.unwrap();
@@ -46,10 +46,10 @@ async fn vidaimock_chat() {
 }
 
 #[tokio::test]
-async fn vidaimock_stream_chat() {
-    let _url = common::vidaimock_url();
+async fn integration_stream_chat() {
+    let _url = common::test_server_url();
     let dir = tempfile::tempdir().unwrap();
-    let pkl = vidaimock_config(dir.path());
+    let pkl = mock_agent_config(dir.path());
     let config = load_config(&pkl).unwrap();
     let agent = build_agent(&config).await.unwrap();
 
