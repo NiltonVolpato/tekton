@@ -5,6 +5,7 @@ use rig::providers::{anthropic, gemini, openai};
 use tekton_terminal_tool::TerminalTool;
 
 use crate::config::{AgentConfig, ApiType, Config, Credentials, ResolvedProvider};
+use crate::environment::{EnvironmentView, RealEnvironment};
 use crate::error::FactoryError;
 use crate::handle::AgentHandle;
 
@@ -32,15 +33,23 @@ fn configure_agent<M: CompletionModel>(
 fn resolve_api_key(
     provider: &ResolvedProvider,
     creds: Option<&Credentials>,
+    env: &dyn EnvironmentView,
 ) -> Result<String, FactoryError> {
-    if let Some(c) = creds
-        && let Some(key) = &c.api_key
-    {
-        return Ok(key.clone());
+    if let Some(c) = creds {
+        // Credentials entry exists — api_key must be present.
+        // Having a credentials entry signals explicit configuration;
+        // if the key is missing, that's an error, not a fallback.
+        return match &c.api_key {
+            Some(key) => Ok(key.clone()),
+            None => Err(FactoryError::MissingApiKey {
+                provider: provider.name.clone(),
+                env: "api_key in credentials".to_string(),
+            }),
+        };
     }
-    // No explicit credentials — try env vars from catalog
+    // No credentials entry — try env vars from catalog
     for var in &provider.env {
-        if let Ok(key) = std::env::var(var) {
+        if let Some(key) = env.var(var) {
             return Ok(key);
         }
     }
@@ -73,7 +82,7 @@ pub async fn build_agent(
         .ok_or_else(|| FactoryError::UnknownProvider(agent_config.model.provider.clone()))?;
 
     let creds = config.credentials.get(&agent_config.model.provider);
-    let api_key = resolve_api_key(provider, creds)?;
+    let api_key = resolve_api_key(provider, creds, &RealEnvironment)?;
 
     // Credential base_url overrides catalog base_url
     let base_url = creds
@@ -123,4 +132,93 @@ pub async fn build_agent(
     };
 
     Ok(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::environment::MockEnvironment;
+
+    fn test_provider() -> ResolvedProvider {
+        ResolvedProvider {
+            name: "test-provider".to_string(),
+            api_type: ApiType::Anthropic,
+            base_url: None,
+            env: vec![
+                "PRIMARY_KEY".to_string(),
+                "SECONDARY_KEY".to_string(),
+            ],
+        }
+    }
+
+    #[test]
+    fn resolve_api_key_from_credentials() {
+        let provider = test_provider();
+        let creds = Credentials {
+            api_key: Some("explicit-key".to_string()),
+            base_url: None,
+        };
+        let env = MockEnvironment::new();
+        let result = resolve_api_key(&provider, Some(&creds), &env).unwrap();
+        assert_eq!(result, "explicit-key");
+    }
+
+    #[test]
+    fn resolve_api_key_credentials_without_key_is_error() {
+        let provider = test_provider();
+        let creds = Credentials {
+            api_key: None,
+            base_url: Some("https://custom.api".to_string()),
+        };
+        let env = MockEnvironment::new();
+        let err = resolve_api_key(&provider, Some(&creds), &env).unwrap_err();
+        let FactoryError::MissingApiKey { provider: p, env: e } = &err else {
+            panic!("expected MissingApiKey, got: {err:?}");
+        };
+        assert_eq!(p, "test-provider");
+        assert_eq!(e, "api_key in credentials");
+    }
+
+    #[test]
+    fn resolve_api_key_credentials_without_key_does_not_fall_back_to_env() {
+        let provider = test_provider();
+        let creds = Credentials {
+            api_key: None,
+            base_url: None,
+        };
+        // Even if the env var is set, having a credentials entry without
+        // api_key should be an error — not a silent fallback.
+        let env = MockEnvironment::new().set("PRIMARY_KEY", "env-key");
+        let result = resolve_api_key(&provider, Some(&creds), &env);
+        assert!(result.is_err(), "should not fall back to env var when credentials entry exists");
+    }
+
+    #[test]
+    fn resolve_api_key_no_credentials_uses_env_var() {
+        let provider = test_provider();
+        let env = MockEnvironment::new().set("PRIMARY_KEY", "from-env");
+        let result = resolve_api_key(&provider, None, &env).unwrap();
+        assert_eq!(result, "from-env");
+    }
+
+    #[test]
+    fn resolve_api_key_no_credentials_tries_secondary_env_var() {
+        let provider = test_provider();
+        // Primary not set, secondary is set
+        let env = MockEnvironment::new().set("SECONDARY_KEY", "from-secondary");
+        let result = resolve_api_key(&provider, None, &env).unwrap();
+        assert_eq!(result, "from-secondary");
+    }
+
+    #[test]
+    fn resolve_api_key_no_credentials_no_env_is_error() {
+        let provider = test_provider();
+        let env = MockEnvironment::new();
+        let err = resolve_api_key(&provider, None, &env).unwrap_err();
+        let FactoryError::MissingApiKey { provider: p, env: e } = &err else {
+            panic!("expected MissingApiKey, got: {err:?}");
+        };
+        assert_eq!(p, "test-provider");
+        assert_eq!(e, "PRIMARY_KEY or SECONDARY_KEY");
+    }
 }
