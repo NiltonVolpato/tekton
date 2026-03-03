@@ -4,57 +4,81 @@ use std::path::Path;
 
 use tekton_experimental::{build_agent, load_config};
 
-use common::{write_base_schema, write_pkl};
+use common::{write_config_schema, write_pkl};
 
+/// Write a config that points at the mock server.
+/// All credentials are in the Pkl config — no env vars needed.
 fn mock_agent_config(dir: &Path) -> std::path::PathBuf {
-    write_base_schema(dir);
+    write_config_schema(dir);
+
+    // Add mock provider to the catalog (overwrite providers.pkl from write_config_schema)
+    write_pkl(
+        dir,
+        "models_dev/providers.pkl",
+        r#"amends "models_dev_providers.pkl"
+
+providers {
+  ["mock"] {
+    name = "Mock Server"
+    api_type = "OpenAICompatible"
+    base_url = "http://localhost:8100/v1"
+    env {}
+  }
+}
+"#,
+    );
+
     write_pkl(
         dir,
         "test.pkl",
         r#"
-amends "AgentConfig.pkl"
-name = "mock-agent"
-model {
-  provider = "OpenAICompatible"
-  name = "openai"
+amends "Config.pkl"
+
+default_agent = "mock-agent"
+
+credentials {
+  ["mock"] = new {
+    api_key = "fake-key"
+    base_url = "http://localhost:8100/v1"
+  }
 }
-system_prompt = "You are a test agent."
+
+agents {
+  ["mock-agent"] = new {
+    model = new { provider = "mock"; name = "openai" }
+    system_prompt = "You are a test agent."
+  }
+}
 "#,
     )
 }
 
 #[tokio::test]
 async fn integration_prompt() {
-    // Guard: ensure mock server env is configured (the agent reads OPENAI_BASE_URL directly).
-    let _ = common::test_server_url();
     let dir = tempfile::tempdir().unwrap();
     let pkl = mock_agent_config(dir.path());
     let config = load_config(&pkl).unwrap();
-    let agent = build_agent(&config).await.unwrap();
+    let agent = build_agent(&config, "mock-agent").await.unwrap();
     let response = agent.prompt("Hello").await.unwrap();
     assert!(!response.is_empty());
 }
 
 #[tokio::test]
 async fn integration_chat() {
-    // Guard: ensure mock server env is configured (the agent reads OPENAI_BASE_URL directly).
-    let _ = common::test_server_url();
     let dir = tempfile::tempdir().unwrap();
     let pkl = mock_agent_config(dir.path());
     let config = load_config(&pkl).unwrap();
-    let agent = build_agent(&config).await.unwrap();
+    let agent = build_agent(&config, "mock-agent").await.unwrap();
     let response = agent.chat("Hello", vec![]).await.unwrap();
     assert!(!response.is_empty());
 }
 
 #[tokio::test]
 async fn integration_stream_chat() {
-    // Guard: ensure mock server env is configured (the agent reads OPENAI_BASE_URL directly).
-    let _ = common::test_server_url();
     let dir = tempfile::tempdir().unwrap();
     let pkl = mock_agent_config(dir.path());
     let config = load_config(&pkl).unwrap();
-    let agent = build_agent(&config).await.unwrap();
+    let agent = build_agent(&config, "mock-agent").await.unwrap();
 
     use futures::StreamExt;
     use tekton_experimental::StreamEvent;

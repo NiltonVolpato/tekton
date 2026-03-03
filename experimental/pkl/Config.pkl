@@ -1,0 +1,39 @@
+open module Config
+
+import "models_dev/providers.pkl" as providerConfig
+
+class ModelIdentifier {
+  provider: String
+  name: String
+}
+
+class Credentials {
+  api_key: String?
+  base_url: String?
+}
+
+class AgentConfig {
+  model: ModelIdentifier
+  system_prompt: String
+  temperature: Float?
+  max_tokens: Int?
+  max_turns: Int = 20
+}
+
+default_agent: String
+agents: Mapping<String, AgentConfig>
+credentials: Mapping<String, Credentials> = new {}
+
+/// Unique provider IDs referenced by agents.
+local uniqueProviderIds: Set<String> = new Listing {
+  for (_name, agent in agents) {
+    agent.model.provider
+  }
+}.toList().toSet()
+
+/// Auto-computed: deduplicated providers referenced by agents.
+resolved_providers: Mapping<String, providerConfig.ProviderInfo> = new Mapping {
+  for (providerId in uniqueProviderIds) {
+    [providerId] = providerConfig.providers[providerId]
+  }
+}

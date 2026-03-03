@@ -1,0 +1,286 @@
+/// This module was generated from JSON Schema from models.dev.
+/// See: https://github.com/anomalyco/models.dev
+///
+/// WARN: unable to determine module-level properties on the root schema.
+module ProviderSchema
+
+class Provider {
+  id: String
+
+  env: Listing<String>(!isEmpty)
+
+  npm: String(!isEmpty)
+
+  api: String?
+
+  name: String(!isEmpty)
+
+  doc: String(!isEmpty)
+
+  models: Mapping<String, Models>
+}
+
+class Models {
+  id: String
+
+  name: String(!isEmpty)
+
+  family: (
+    "trinity"
+    |"trinity-mini"
+    |"gpt"
+    |"gpt-codex"
+    |"gpt-codex-spark"
+    |"gpt-codex-mini"
+    |"gpt-pro"
+    |"gpt-mini"
+    |"gpt-nano"
+    |"gpt-oss"
+    |"o"
+    |"o-mini"
+    |"o-pro"
+    |"claude"
+    |"claude-haiku"
+    |"claude-sonnet"
+    |"claude-opus"
+    |"gemini"
+    |"gemini-pro"
+    |"gemini-flash"
+    |"gemini-flash-lite"
+    |"gemini-embedding"
+    |"glm"
+    |"glmv"
+    |"glm-air"
+    |"glm-flash"
+    |"glm-free"
+    |"glm-z"
+    |"llama"
+    |"qwen"
+    |"deepseek"
+    |"deepseek-thinking"
+    |"phi"
+    |"kimi"
+    |"kimi-free"
+    |"kimi-thinking"
+    |"mistral"
+    |"mistral-large"
+    |"mistral-medium"
+    |"mistral-small"
+    |"mistral-nemo"
+    |"ministral"
+    |"codestral"
+    |"devstral"
+    |"pixtral"
+    |"mixtral"
+    |"grok"
+    |"grok-vision"
+    |"grok-beta"
+    |"gemma"
+    |"nova"
+    |"nova-pro"
+    |"nova-lite"
+    |"nova-micro"
+    |"command"
+    |"command-r"
+    |"command-a"
+    |"command-light"
+    |"jamba"
+    |"nemotron"
+    |"titan"
+    |"titan-embed"
+    |"minimax"
+    |"minimax-free"
+    |"hunyuan"
+    |"yi"
+    |"granite"
+    |"reka"
+    |"sonar"
+    |"sonar-pro"
+    |"sonar-reasoning"
+    |"sonar-deep-research"
+    |"solar"
+    |"solar-mini"
+    |"solar-pro"
+    |"step"
+    |"text-embedding"
+    |"cohere-embed"
+    |"voyage"
+    |"mistral-embed"
+    |"bge"
+    |"plamo"
+    |"codestral-embed"
+    |"dall-e"
+    |"flux"
+    |"imagen"
+    |"recraft"
+    |"stable-diffusion"
+    |"ideogram"
+    |"dreamshaper"
+    |"sora"
+    |"veo"
+    |"runway"
+    |"dream-machine"
+    |"whisper"
+    |"elevenlabs"
+    |"lyria"
+    |"melotts"
+    |"ernie"
+    |"hermes"
+    |"zephyr"
+    |"openchat"
+    |"starling"
+    |"qvq"
+    |"sherlock"
+    |"pony"
+    |"mercury"
+    |"cogito"
+    |"mimo"
+    |"longcat"
+    |"magistral"
+    |"magistral-small"
+    |"magistral-medium"
+    |"phoenix"
+    |"trinity"
+    |"lucid"
+    |"intellect"
+    |"aura"
+    |"jais"
+    |"sarvam"
+    |"falcon"
+    |"baichuan"
+    |"skywork"
+    |"bart"
+    |"distilbert"
+    |"resnet"
+    |"m2m"
+    |"indictrans"
+    |"llava"
+    |"seed"
+    |"ray"
+    |"tstars"
+    |"rnj"
+    |"ling"
+    |"ring"
+    |"kat-coder"
+    |"sqlcoder"
+    |"discolm"
+    |"osmosis"
+    |"parakeet"
+    |"nemoretriever"
+    |"nano-banana"
+    |"una-cybertron"
+    |"morph"
+    |"voxtral"
+    |"venice"
+    |"auto"
+    |"model-router"
+    |"v0"
+    |"tako"
+    |"mai"
+    |"rednote"
+    |"smart-turn"
+    |"qwerky"
+    |"big-pickle"
+    |"chutesai"
+    |"opengvlab"
+    |"tngtech"
+    |"topazlabs"
+    |"unsloth"
+    |"nousresearch"
+    |"alpha"
+    |"oswe"
+    |"neural-chat"
+    |"pangu"
+    |"liquid"
+    |"sourceful"
+    |"allenai"
+    |"palmyra")?
+
+  attachment: Boolean
+
+  reasoning: Boolean
+
+  tool_call: Boolean
+
+  interleaved: (Boolean(this == true)|InterleavedAlternate1)?
+
+  structured_output: Boolean?
+
+  temperature: Boolean?
+
+  knowledge: String(matches(Regex(#"^\d{4}-\d{2}(-\d{2})?$"#)))?
+
+  release_date: String(matches(Regex(#"^\d{4}-\d{2}(-\d{2})?$"#)))
+
+  last_updated: String(matches(Regex(#"^\d{4}-\d{2}(-\d{2})?$"#)))
+
+  modalities: Modalities
+
+  open_weights: Boolean
+
+  cost: Cost?
+
+  limit: Limit
+
+  status: ("alpha"|"beta"|"deprecated")?
+
+  provider: ModelsProvider?
+}
+
+class InterleavedAlternate1 {
+  field: "reasoning_content"|"reasoning_details"
+}
+
+class Modalities {
+  input: Listing<"text"|"audio"|"image"|"video"|"pdf">
+
+  output: Listing<"text"|"audio"|"image"|"video"|"pdf">
+}
+
+class Cost {
+  input: Number(isPositive)
+
+  output: Number(isPositive)
+
+  reasoning: Number(isPositive)?
+
+  cache_read: Number(isPositive)?
+
+  cache_write: Number(isPositive)?
+
+  input_audio: Number(isPositive)?
+
+  output_audio: Number(isPositive)?
+
+  context_over_200k: ContextOver200k?
+}
+
+class ContextOver200k {
+  input: Number(isPositive)
+
+  output: Number(isPositive)
+
+  reasoning: Number(isPositive)?
+
+  cache_read: Number(isPositive)?
+
+  cache_write: Number(isPositive)?
+
+  input_audio: Number(isPositive)?
+
+  output_audio: Number(isPositive)?
+}
+
+class Limit {
+  context: Number(isPositive)
+
+  input: Number(isPositive)?
+
+  output: Number(isPositive)
+}
+
+class ModelsProvider {
+  npm: String?
+
+  api: String?
+}

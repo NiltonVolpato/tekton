@@ -1,0 +1,14 @@
+amends "models_dev_providers.pkl"
+
+/// Add custom providers here or in a project-level override:
+///   providers {
+///     ["my-local"] {
+///       name = "My Local LLM"
+///       api_type = "OpenAICompatible"
+///       env = new {}
+///       base_url = "http://localhost:8080/v1"
+///     }
+///   }
+
+// Inherit all catalog providers. Add custom entries above.
+providers {}
