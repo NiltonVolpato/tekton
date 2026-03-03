@@ -1,6 +1,7 @@
 open module Config
 
 import "models_dev/providers.pkl" as providerConfig
+import "models_dev/providerSchema.pkl"
 
 class ModelIdentifier {
   provider: String
@@ -15,7 +16,7 @@ class Credentials {
 class AgentConfig {
   model: ModelIdentifier
   system_prompt: String
-  temperature: Float?
+  temperature: Float(isBetween(0.0, 2.0))?
   max_tokens: Int?
   max_turns: Int = 20
 }
@@ -31,9 +32,40 @@ local uniqueProviderIds: Set<String> = new Listing {
   }
 }.toList().toSet()
 
+/// Model names referenced by agents, grouped by provider ID.
+local modelNamesByProvider: Map<String, Set<String>> = uniqueProviderIds.fold(Map(), (acc, providerId) ->
+  let (names = new Listing {
+    for (_name, agent in agents) {
+      when (agent.model.provider == providerId) {
+        agent.model.name
+      }
+    }
+  }.toList().toSet())
+    acc.put(providerId, names)
+)
+
 /// Auto-computed: deduplicated providers referenced by agents.
-resolved_providers: Mapping<String, providerConfig.ProviderInfo> = new Mapping {
-  for (providerId in uniqueProviderIds) {
-    [providerId] = providerConfig.providers[providerId]
+/// Only includes models that agents actually use. Validates model names exist.
+providers: Mapping<String, providerSchema.Provider> = let (
+  _ = agents.every((agentName, agent) ->
+    let (provider = providerConfig.providers[agent.model.provider])
+      if (!provider.models.containsKey(agent.model.name))
+        throw("Agent \"\(agentName)\": model \"\(agent.model.name)\" not found in provider \"\(agent.model.provider)\". Available models: \(provider.models.keys.toList().join(", "))")
+      else true
+  )
+)
+  new Mapping {
+    for (providerId in uniqueProviderIds) {
+      [providerId] = let (fullProvider = providerConfig.providers[providerId])
+        let (usedModelNames = modelNamesByProvider[providerId])
+          (fullProvider) {
+            models = new Mapping {
+              for (modelName, model in fullProvider.models) {
+                when (usedModelNames.contains(modelName)) {
+                  [modelName] = model
+                }
+              }
+            }
+          }
+    }
   }
-}

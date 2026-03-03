@@ -9,24 +9,47 @@ use common::{write_config_schema, write_pkl};
 /// Write a config that points at the mock server.
 /// All credentials are in the Pkl config — no env vars needed.
 ///
-/// The catalog entry has no `base_url`, so the credential `base_url` is the
+/// The catalog entry has no `api`, so the credential `base_url` is the
 /// only source. This exercises the "credential base_url overrides catalog"
 /// code path.
 fn mock_agent_config(dir: &Path) -> std::path::PathBuf {
     write_config_schema(dir);
 
-    // Add mock provider to the catalog — no base_url here, so
+    // Add mock provider to the catalog — no api URL here, so
     // credentials.base_url is the sole source of the endpoint.
     write_pkl(
         dir,
         "models_dev/providers.pkl",
-        r#"amends "models_dev_providers.pkl"
+        r#"amends "providers_models_dev.pkl"
 
 providers {
   ["mock"] {
+    id = "mock"
     name = "Mock Server"
-    api_type = "OpenAICompatible"
+    npm = "@ai-sdk/openai-compatible"
+    client_type = "OpenAICompatible"
+    doc = "https://example.com"
     env {}
+    models {
+      ["openai"] {
+        id = "openai"
+        name = "OpenAI Mock"
+        attachment = false
+        reasoning = false
+        tool_call = false
+        release_date = "2025-01"
+        last_updated = "2025-01"
+        modalities {
+          input { "text" }
+          output { "text" }
+        }
+        open_weights = false
+        limit {
+          context = 128000
+          output = 4096
+        }
+      }
+    }
   }
 }
 "#,

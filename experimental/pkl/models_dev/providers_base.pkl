@@ -1,0 +1,3 @@
+import "providerSchema.pkl"
+
+providers: Mapping<String, providerSchema.Provider>

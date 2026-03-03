@@ -1,0 +1,7 @@
+amends "pkl:Project"
+
+dependencies {
+  ["deepToTyped"] {
+    uri = "package://pkg.pkl-lang.org/pkl-pantry/pkl.experimental.deepToTyped@1.2.0"
+  }
+}

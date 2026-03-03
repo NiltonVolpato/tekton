@@ -1,6 +1,6 @@
 mod common;
 
-use tekton_experimental::{ApiType, load_config};
+use tekton_experimental::{ClientType, load_config};
 
 use common::{write_config_schema, write_pkl};
 
@@ -19,7 +19,7 @@ default_agent = "test"
 
 agents {
   ["test"] = new {
-    model = new { provider = "anthropic"; name = "claude-sonnet-4-20250514" }
+    model = new { provider = "anthropic"; name = "claude-sonnet-4-6" }
     system_prompt = "You are a test agent."
     temperature = 0.5
     max_tokens = 4096
@@ -33,16 +33,16 @@ agents {
 
     let agent = &config.agents["test"];
     assert_eq!(agent.model.provider, "anthropic");
-    assert_eq!(agent.model.name, "claude-sonnet-4-20250514");
+    assert_eq!(agent.model.name, "claude-sonnet-4-6");
     assert_eq!(agent.system_prompt, "You are a test agent.");
     assert_eq!(agent.temperature, Some(0.5));
     assert_eq!(agent.max_tokens, Some(4096));
     assert_eq!(agent.max_turns, 20); // default
 
-    // resolved_providers should contain anthropic
-    let provider = &config.resolved_providers["anthropic"];
+    // providers should contain anthropic
+    let provider = &config.providers["anthropic"];
     assert_eq!(provider.name, "Anthropic");
-    assert_eq!(provider.api_type, ApiType::Anthropic);
+    assert_eq!(provider.client_type, ClientType::Anthropic);
     assert_eq!(provider.env, vec!["ANTHROPIC_API_KEY"]);
 }
 
@@ -61,7 +61,7 @@ default_agent = "oai"
 
 agents {
   ["oai"] = new {
-    model = new { provider = "openai"; name = "gpt-4o" }
+    model = new { provider = "openai"; name = "gpt-5.3-codex" }
     system_prompt = "Hello."
   }
 }
@@ -71,12 +71,12 @@ agents {
     let config = load_config(&pkl).unwrap();
     let agent = &config.agents["oai"];
     assert_eq!(agent.model.provider, "openai");
-    assert_eq!(agent.model.name, "gpt-4o");
+    assert_eq!(agent.model.name, "gpt-5.3-codex");
     assert_eq!(agent.temperature, None);
     assert_eq!(agent.max_tokens, None);
 
-    let provider = &config.resolved_providers["openai"];
-    assert_eq!(provider.api_type, ApiType::OpenAI);
+    let provider = &config.providers["openai"];
+    assert_eq!(provider.client_type, ClientType::OpenAI);
 }
 
 #[test]
@@ -108,10 +108,10 @@ agents {
     assert_eq!(agent.model.name, "llama-3.3-70b");
     assert_eq!(agent.max_turns, 5);
 
-    let provider = &config.resolved_providers["openrouter"];
-    assert_eq!(provider.api_type, ApiType::OpenAICompatible);
+    let provider = &config.providers["openrouter"];
+    assert_eq!(provider.client_type, ClientType::OpenAICompatible);
     assert_eq!(
-        provider.base_url.as_deref(),
+        provider.api.as_deref(),
         Some("https://openrouter.ai/api/v1")
     );
 }
@@ -131,7 +131,7 @@ default_agent = "gem"
 
 agents {
   ["gem"] = new {
-    model = new { provider = "google"; name = "gemini-2.0-flash" }
+    model = new { provider = "google"; name = "gemini-3.1-pro" }
     system_prompt = "You are a Gemini agent."
     temperature = 1.0
   }
@@ -142,11 +142,11 @@ agents {
     let config = load_config(&pkl).unwrap();
     let agent = &config.agents["gem"];
     assert_eq!(agent.model.provider, "google");
-    assert_eq!(agent.model.name, "gemini-2.0-flash");
+    assert_eq!(agent.model.name, "gemini-3.1-pro");
     assert_eq!(agent.temperature, Some(1.0));
 
-    let provider = &config.resolved_providers["google"];
-    assert_eq!(provider.api_type, ApiType::Gemini);
+    let provider = &config.providers["google"];
+    assert_eq!(provider.client_type, ClientType::Gemini);
 }
 
 #[test]
@@ -164,15 +164,15 @@ default_agent = "a"
 
 agents {
   ["a"] = new {
-    model = new { provider = "anthropic"; name = "claude-sonnet-4-20250514" }
+    model = new { provider = "anthropic"; name = "claude-sonnet-4-6" }
     system_prompt = "Agent A."
   }
   ["b"] = new {
-    model = new { provider = "anthropic"; name = "claude-haiku-4-5-20251001" }
+    model = new { provider = "anthropic"; name = "claude-haiku-4-5" }
     system_prompt = "Agent B."
   }
   ["c"] = new {
-    model = new { provider = "openai"; name = "gpt-4o" }
+    model = new { provider = "openai"; name = "gpt-5.3-codex" }
     system_prompt = "Agent C."
   }
 }
@@ -182,9 +182,9 @@ agents {
     let config = load_config(&pkl).unwrap();
     assert_eq!(config.agents.len(), 3);
     // Only 2 unique providers despite 3 agents (two use anthropic)
-    assert_eq!(config.resolved_providers.len(), 2);
-    assert!(config.resolved_providers.contains_key("anthropic"));
-    assert!(config.resolved_providers.contains_key("openai"));
+    assert_eq!(config.providers.len(), 2);
+    assert!(config.providers.contains_key("anthropic"));
+    assert!(config.providers.contains_key("openai"));
 }
 
 #[test]
@@ -212,7 +212,7 @@ credentials {
 
 agents {
   ["test"] = new {
-    model = new { provider = "anthropic"; name = "claude-sonnet-4-20250514" }
+    model = new { provider = "anthropic"; name = "claude-sonnet-4-6" }
     system_prompt = "Test."
   }
 }
@@ -235,52 +235,47 @@ agents {
 #[test]
 fn load_config_with_custom_provider() {
     let dir = tempfile::tempdir().unwrap();
+    write_config_schema(dir.path());
 
-    // Write a catalog that includes a custom provider
-    write_pkl(
-        dir.path(),
-        "models_dev/models_dev_providers.pkl",
-        r#"module models_dev_providers
-
-class ProviderInfo {
-  name: String
-  api_type: "Anthropic"|"OpenAI"|"OpenAICompatible"|"Gemini"
-  base_url: String?
-  env: Listing<String>
-}
-
-providers: Mapping<String, ProviderInfo> = new {
-  ["anthropic"] {
-    name = "Anthropic"
-    api_type = "Anthropic"
-    env { "ANTHROPIC_API_KEY" }
-  }
-}
-"#,
-    );
-
-    // providers.pkl adds a custom provider
+    // providers.pkl adds a custom provider with a local model
     write_pkl(
         dir.path(),
         "models_dev/providers.pkl",
-        r#"amends "models_dev_providers.pkl"
+        r#"amends "providers_models_dev.pkl"
 
 providers {
   ["my-local"] {
+    id = "my-local"
     name = "My Local LLM"
-    api_type = "OpenAICompatible"
-    base_url = "http://localhost:8080/v1"
+    npm = "@ai-sdk/openai-compatible"
+    client_type = "OpenAICompatible"
+    api = "http://localhost:8080/v1"
+    doc = "https://example.com"
     env {}
+    models {
+      ["qwen3.5-397b-a17b"] {
+        id = "qwen3.5-397b-a17b"
+        name = "Qwen 3.5 397B A17B"
+        attachment = false
+        reasoning = false
+        tool_call = true
+        release_date = "2025-06"
+        last_updated = "2025-06"
+        modalities {
+          input { "text" }
+          output { "text" }
+        }
+        open_weights = true
+        limit {
+          context = 131072
+          output = 8192
+        }
+      }
+    }
   }
 }
 "#,
     );
-
-    let config_schema = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pkl/Config.pkl"),
-    )
-    .unwrap();
-    write_pkl(dir.path(), "Config.pkl", &config_schema);
 
     let pkl = write_pkl(
         dir.path(),
@@ -292,7 +287,7 @@ default_agent = "local"
 
 agents {
   ["local"] = new {
-    model = new { provider = "my-local"; name = "llama-3" }
+    model = new { provider = "my-local"; name = "qwen3.5-397b-a17b" }
     system_prompt = "Local model."
   }
 }
@@ -300,14 +295,40 @@ agents {
     );
 
     let config = load_config(&pkl).unwrap();
-    let provider = &config.resolved_providers["my-local"];
+    let provider = &config.providers["my-local"];
     assert_eq!(provider.name, "My Local LLM");
-    assert_eq!(provider.api_type, ApiType::OpenAICompatible);
+    assert_eq!(provider.client_type, ClientType::OpenAICompatible);
     assert_eq!(
-        provider.base_url.as_deref(),
+        provider.api.as_deref(),
         Some("http://localhost:8080/v1")
     );
     assert!(provider.env.is_empty());
+}
+
+#[test]
+fn load_config_unknown_model_returns_error() {
+    let dir = tempfile::tempdir().unwrap();
+    write_config_schema(dir.path());
+
+    let pkl = write_pkl(
+        dir.path(),
+        "test.pkl",
+        r#"
+amends "Config.pkl"
+
+default_agent = "test"
+
+agents {
+  ["test"] = new {
+    model = new { provider = "anthropic"; name = "claude-nonexistent-9000" }
+    system_prompt = "hello"
+  }
+}
+"#,
+    );
+
+    let result = load_config(&pkl);
+    assert!(result.is_err());
 }
 
 #[test]
@@ -347,19 +368,83 @@ fn load_config_invalid_pkl_returns_error() {
 }
 
 #[test]
-fn load_example_coder_config() {
+fn load_example_config() {
     let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pkl/examples/coder.pkl");
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pkl/examples/example.pkl");
     let config = load_config(&path).unwrap();
     assert_eq!(config.default_agent, "coder");
 
     let agent = &config.agents["coder"];
     assert_eq!(agent.model.provider, "anthropic");
-    assert_eq!(agent.model.name, "claude-sonnet-4-20250514");
+    assert_eq!(agent.model.name, "claude-sonnet-4-6");
     assert_eq!(agent.temperature, Some(0.3));
     assert_eq!(agent.max_tokens, Some(8192));
     assert_eq!(agent.max_turns, 20);
 
-    let provider = &config.resolved_providers["anthropic"];
-    assert_eq!(provider.api_type, ApiType::Anthropic);
+    let provider = &config.providers["anthropic"];
+    assert_eq!(provider.client_type, ClientType::Anthropic);
+}
+
+/// Test hierarchical config: a "global" config directory (like ~/.tekton)
+/// provides the schema, and a project directory amends it via --module-path.
+#[test]
+fn load_config_with_module_path_hierarchy() {
+    let root = tempfile::tempdir().unwrap();
+
+    // Global config location (e.g. ~/.tekton)
+    let global_dir = root.path().join("global");
+    std::fs::create_dir_all(&global_dir).unwrap();
+    write_config_schema(&global_dir);
+
+    // Project config in a separate directory
+    let project_dir = root.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // The project config amends Config.pkl via modulepath: URI scheme.
+    let project_config = project_dir.join("tekton.pkl");
+    std::fs::write(
+        &project_config,
+        r#"amends "modulepath:/Config.pkl"
+
+default_agent = "dev"
+
+agents {
+  ["dev"] = new {
+    model = new { provider = "anthropic"; name = "claude-sonnet-4-6" }
+    system_prompt = "Project agent."
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    // Use pkl eval with --module-path to verify it works
+    let output = std::process::Command::new("pkl")
+        .args([
+            "eval",
+            "--module-path",
+            global_dir.to_str().unwrap(),
+            "-f",
+            "json",
+            project_config.to_str().unwrap(),
+        ])
+        .output()
+        .expect("pkl must be installed");
+
+    assert!(
+        output.status.success(),
+        "pkl eval failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Parse the JSON output to verify it's valid
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("pkl output should be valid JSON");
+
+    assert_eq!(json["default_agent"], "dev");
+    assert_eq!(json["providers"]["anthropic"]["name"], "Anthropic");
+    assert_eq!(
+        json["providers"]["anthropic"]["client_type"],
+        "Anthropic"
+    );
 }

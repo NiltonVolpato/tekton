@@ -34,7 +34,7 @@ agents {{
 #[ignore = "requires ANTHROPIC_API_KEY"]
 async fn build_agent_anthropic() {
     let dir = tempfile::tempdir().unwrap();
-    let pkl = make_config(dir.path(), "anthropic", "claude-sonnet-4-20250514");
+    let pkl = make_config(dir.path(), "anthropic", "claude-sonnet-4-6");
     let config = load_config(&pkl).unwrap();
     let _agent = build_agent(&config, "factory-test").await.unwrap();
 }
@@ -43,7 +43,7 @@ async fn build_agent_anthropic() {
 #[ignore = "requires OPENAI_API_KEY"]
 async fn build_agent_openai() {
     let dir = tempfile::tempdir().unwrap();
-    let pkl = make_config(dir.path(), "openai", "gpt-4o");
+    let pkl = make_config(dir.path(), "openai", "gpt-5.3-codex");
     let config = load_config(&pkl).unwrap();
     let _agent = build_agent(&config, "factory-test").await.unwrap();
 }
@@ -61,7 +61,7 @@ async fn build_agent_openai_compatible() {
 #[ignore = "requires GEMINI_API_KEY"]
 async fn build_agent_gemini() {
     let dir = tempfile::tempdir().unwrap();
-    let pkl = make_config(dir.path(), "google", "gemini-2.0-flash");
+    let pkl = make_config(dir.path(), "google", "gemini-3.1-pro");
     let config = load_config(&pkl).unwrap();
     let _agent = build_agent(&config, "factory-test").await.unwrap();
 }

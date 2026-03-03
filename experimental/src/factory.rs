@@ -4,7 +4,7 @@ use rig::completion::CompletionModel;
 use rig::providers::{anthropic, gemini, openai};
 use tekton_terminal_tool::TerminalTool;
 
-use crate::config::{AgentConfig, ApiType, Config, Credentials, ResolvedProvider};
+use crate::config::{AgentConfig, ClientType, Config, Credentials, Provider};
 use crate::environment::{EnvironmentView, RealEnvironment};
 use crate::error::FactoryError;
 use crate::handle::AgentHandle;
@@ -31,7 +31,7 @@ fn configure_agent<M: CompletionModel>(
 /// - If no `Credentials` entry exists, try env vars from the provider's `env` list.
 /// - If neither, return an error.
 fn resolve_api_key(
-    provider: &ResolvedProvider,
+    provider: &Provider,
     creds: Option<&Credentials>,
     env: &dyn EnvironmentView,
 ) -> Result<String, FactoryError> {
@@ -77,17 +77,17 @@ pub async fn build_agent(
         .get(agent_name)
         .ok_or_else(|| FactoryError::UnknownAgent(agent_name.to_string()))?;
     let provider = config
-        .resolved_providers
+        .providers
         .get(&agent_config.model.provider)
         .ok_or_else(|| FactoryError::UnknownProvider(agent_config.model.provider.clone()))?;
 
     let creds = config.credentials.get(&agent_config.model.provider);
     let api_key = resolve_api_key(provider, creds, &RealEnvironment)?;
 
-    // Credential base_url overrides catalog base_url
+    // Credential base_url overrides catalog api URL
     let base_url = creds
         .and_then(|c| c.base_url.as_deref())
-        .or(provider.base_url.as_deref());
+        .or(provider.api.as_deref());
 
     let tool = TerminalTool::new()
         .with_name(agent_name)
@@ -106,23 +106,23 @@ pub async fn build_agent(
         }};
     }
 
-    let handle = match provider.api_type {
-        ApiType::Anthropic => {
+    let handle = match provider.client_type {
+        ClientType::Anthropic => {
             let client = build_client!(anthropic::Client, &api_key, base_url);
             let builder = client.agent(model_name).tool(tool);
             AgentHandle::Anthropic(configure_agent(builder, agent_config))
         }
-        ApiType::OpenAI => {
+        ClientType::OpenAI => {
             let client = build_client!(openai::Client, &api_key, base_url);
             let builder = client.agent(model_name).tool(tool);
             AgentHandle::OpenAI(configure_agent(builder, agent_config))
         }
-        ApiType::OpenAICompatible => {
+        ClientType::OpenAICompatible => {
             let client = build_client!(openai::CompletionsClient, &api_key, base_url);
             let builder = client.agent(model_name).tool(tool);
             AgentHandle::OpenAICompatible(configure_agent(builder, agent_config))
         }
-        ApiType::Gemini => {
+        ClientType::Gemini => {
             let client = build_client!(gemini::Client, &api_key, base_url);
             let builder = client.agent(model_name).tool(tool);
             AgentHandle::Gemini(configure_agent(builder, agent_config))
@@ -134,18 +134,24 @@ pub async fn build_agent(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::environment::MockEnvironment;
 
-    fn test_provider() -> ResolvedProvider {
-        ResolvedProvider {
+    fn test_provider() -> Provider {
+        Provider {
+            id: "test-provider".to_string(),
             name: "test-provider".to_string(),
-            api_type: ApiType::Anthropic,
-            base_url: None,
+            npm: "@ai-sdk/anthropic".to_string(),
+            client_type: ClientType::Anthropic,
+            api: None,
+            doc: "https://example.com".to_string(),
             env: vec![
                 "PRIMARY_KEY".to_string(),
                 "SECONDARY_KEY".to_string(),
             ],
+            models: HashMap::new(),
         }
     }
 

@@ -24,9 +24,9 @@ build:
 lint:
     cargo clippy --workspace -- -D warnings
 
-# Regenerate models_dev_providers.pkl from models.dev api.json
+# Regenerate providers_models_dev.pkl from models.dev API
 generate-providers:
-    python3 experimental/pkl/models_dev/generate_providers.py --fetch
+    cd experimental/pkl/models_dev && pkl eval -o providers_models_dev.pkl generate_providers.pkl
 
 # Start mock server in background, wait for readiness
 _mock-server-start:

@@ -20,5 +20,3 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Fetched models.dev catalog (regenerate with: just generate-providers)
-experimental/pkl/models_dev/api.json

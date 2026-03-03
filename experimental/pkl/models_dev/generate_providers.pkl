@@ -1,0 +1,38 @@
+amends "providers_base.pkl"
+
+import "pkl:json"
+import "providerSchema.pkl"
+import "@deepToTyped/deepToTyped.pkl"
+
+local npmToClientType: Map<String, String> = Map(
+  "@ai-sdk/anthropic", "Anthropic",
+  "@ai-sdk/openai", "OpenAI",
+  "@ai-sdk/openai-compatible", "OpenAICompatible",
+  "@openrouter/ai-sdk-provider", "OpenAICompatible",
+  "@ai-sdk/google", "Gemini",
+  "@ai-sdk/google-vertex", "Gemini"
+)
+
+local parsed = new json.Parser {
+  useMapping = true
+  converters {
+    ["^*"] = (p) -> (p) {
+      ["client_type"] = npmToClientType.getOrNull(p["npm"])
+    }
+  }
+}.parse(read("https://models.dev/api.json"))
+
+// Convert each supported provider individually — unsupported ones (null
+// client_type) are skipped before deepToTyped sees them, because the
+// typed schema requires a non-null client_type.
+providers = new Mapping {
+  for (key, value in parsed) {
+    when (value["client_type"] != null) {
+      [key] = deepToTyped.apply(providerSchema.Provider, value)
+    }
+  }
+}
+
+output {
+  text = "amends \"providers_base.pkl\"\n\n" + super.text
+}

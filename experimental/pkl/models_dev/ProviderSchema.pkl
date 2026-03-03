@@ -1,8 +1,7 @@
-/// This module was generated from JSON Schema from models.dev.
-/// See: https://github.com/anomalyco/models.dev
-///
-/// WARN: unable to determine module-level properties on the root schema.
-module ProviderSchema
+/// TODO: Auto-generate this file from models.dev JSON Schema.
+/// Currently requires a manual patch after generation:
+///   Add `client_type: "Anthropic"|"OpenAI"|"OpenAICompatible"|"Gemini"` field after `npm`
+module providerSchema
 
 class Provider {
   id: String
@@ -10,6 +9,8 @@ class Provider {
   env: Listing<String>(!isEmpty)
 
   npm: String(!isEmpty)
+
+  client_type: "Anthropic"|"OpenAI"|"OpenAICompatible"|"Gemini"
 
   api: String?
 
@@ -25,176 +26,7 @@ class Models {
 
   name: String(!isEmpty)
 
-  family: (
-    "trinity"
-    |"trinity-mini"
-    |"gpt"
-    |"gpt-codex"
-    |"gpt-codex-spark"
-    |"gpt-codex-mini"
-    |"gpt-pro"
-    |"gpt-mini"
-    |"gpt-nano"
-    |"gpt-oss"
-    |"o"
-    |"o-mini"
-    |"o-pro"
-    |"claude"
-    |"claude-haiku"
-    |"claude-sonnet"
-    |"claude-opus"
-    |"gemini"
-    |"gemini-pro"
-    |"gemini-flash"
-    |"gemini-flash-lite"
-    |"gemini-embedding"
-    |"glm"
-    |"glmv"
-    |"glm-air"
-    |"glm-flash"
-    |"glm-free"
-    |"glm-z"
-    |"llama"
-    |"qwen"
-    |"deepseek"
-    |"deepseek-thinking"
-    |"phi"
-    |"kimi"
-    |"kimi-free"
-    |"kimi-thinking"
-    |"mistral"
-    |"mistral-large"
-    |"mistral-medium"
-    |"mistral-small"
-    |"mistral-nemo"
-    |"ministral"
-    |"codestral"
-    |"devstral"
-    |"pixtral"
-    |"mixtral"
-    |"grok"
-    |"grok-vision"
-    |"grok-beta"
-    |"gemma"
-    |"nova"
-    |"nova-pro"
-    |"nova-lite"
-    |"nova-micro"
-    |"command"
-    |"command-r"
-    |"command-a"
-    |"command-light"
-    |"jamba"
-    |"nemotron"
-    |"titan"
-    |"titan-embed"
-    |"minimax"
-    |"minimax-free"
-    |"hunyuan"
-    |"yi"
-    |"granite"
-    |"reka"
-    |"sonar"
-    |"sonar-pro"
-    |"sonar-reasoning"
-    |"sonar-deep-research"
-    |"solar"
-    |"solar-mini"
-    |"solar-pro"
-    |"step"
-    |"text-embedding"
-    |"cohere-embed"
-    |"voyage"
-    |"mistral-embed"
-    |"bge"
-    |"plamo"
-    |"codestral-embed"
-    |"dall-e"
-    |"flux"
-    |"imagen"
-    |"recraft"
-    |"stable-diffusion"
-    |"ideogram"
-    |"dreamshaper"
-    |"sora"
-    |"veo"
-    |"runway"
-    |"dream-machine"
-    |"whisper"
-    |"elevenlabs"
-    |"lyria"
-    |"melotts"
-    |"ernie"
-    |"hermes"
-    |"zephyr"
-    |"openchat"
-    |"starling"
-    |"qvq"
-    |"sherlock"
-    |"pony"
-    |"mercury"
-    |"cogito"
-    |"mimo"
-    |"longcat"
-    |"magistral"
-    |"magistral-small"
-    |"magistral-medium"
-    |"phoenix"
-    |"trinity"
-    |"lucid"
-    |"intellect"
-    |"aura"
-    |"jais"
-    |"sarvam"
-    |"falcon"
-    |"baichuan"
-    |"skywork"
-    |"bart"
-    |"distilbert"
-    |"resnet"
-    |"m2m"
-    |"indictrans"
-    |"llava"
-    |"seed"
-    |"ray"
-    |"tstars"
-    |"rnj"
-    |"ling"
-    |"ring"
-    |"kat-coder"
-    |"sqlcoder"
-    |"discolm"
-    |"osmosis"
-    |"parakeet"
-    |"nemoretriever"
-    |"nano-banana"
-    |"una-cybertron"
-    |"morph"
-    |"voxtral"
-    |"venice"
-    |"auto"
-    |"model-router"
-    |"v0"
-    |"tako"
-    |"mai"
-    |"rednote"
-    |"smart-turn"
-    |"qwerky"
-    |"big-pickle"
-    |"chutesai"
-    |"opengvlab"
-    |"tngtech"
-    |"topazlabs"
-    |"unsloth"
-    |"nousresearch"
-    |"alpha"
-    |"oswe"
-    |"neural-chat"
-    |"pangu"
-    |"liquid"
-    |"sourceful"
-    |"allenai"
-    |"palmyra")?
+  family: String?
 
   attachment: Boolean
 
@@ -222,19 +54,23 @@ class Models {
 
   limit: Limit
 
-  status: ("alpha"|"beta"|"deprecated")?
+  status: ModelStatus?
 
   provider: ModelsProvider?
 }
+
+typealias Modality = "text"|"audio"|"image"|"video"|"pdf"
+
+typealias ModelStatus = "alpha"|"beta"|"deprecated"
 
 class InterleavedAlternate1 {
   field: "reasoning_content"|"reasoning_details"
 }
 
 class Modalities {
-  input: Listing<"text"|"audio"|"image"|"video"|"pdf">
+  input: Listing<Modality>
 
-  output: Listing<"text"|"audio"|"image"|"video"|"pdf">
+  output: Listing<Modality>
 }
 
 class Cost {
