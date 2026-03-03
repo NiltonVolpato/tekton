@@ -96,36 +96,34 @@ pub async fn build_agent(
 
     let model_name = &agent_config.model.name;
 
+    macro_rules! build_client {
+        ($client:ty, $api_key:expr, $base_url:expr) => {{
+            let mut builder = <$client>::builder().api_key($api_key);
+            if let Some(url) = $base_url {
+                builder = builder.base_url(url);
+            }
+            builder.build()?
+        }};
+    }
+
     let handle = match provider.api_type {
         ApiType::Anthropic => {
-            let client = match base_url {
-                Some(url) => anthropic::Client::builder().api_key(&api_key).base_url(url).build()?,
-                None => anthropic::Client::new(&api_key)?,
-            };
+            let client = build_client!(anthropic::Client, &api_key, base_url);
             let builder = client.agent(model_name).tool(tool);
             AgentHandle::Anthropic(configure_agent(builder, agent_config))
         }
         ApiType::OpenAI => {
-            let client = match base_url {
-                Some(url) => openai::Client::builder().api_key(&api_key).base_url(url).build()?,
-                None => openai::Client::new(&api_key)?,
-            };
+            let client = build_client!(openai::Client, &api_key, base_url);
             let builder = client.agent(model_name).tool(tool);
             AgentHandle::OpenAI(configure_agent(builder, agent_config))
         }
         ApiType::OpenAICompatible => {
-            let client = match base_url {
-                Some(url) => openai::CompletionsClient::builder().api_key(&api_key).base_url(url).build()?,
-                None => openai::CompletionsClient::new(&api_key)?,
-            };
+            let client = build_client!(openai::CompletionsClient, &api_key, base_url);
             let builder = client.agent(model_name).tool(tool);
             AgentHandle::OpenAICompatible(configure_agent(builder, agent_config))
         }
         ApiType::Gemini => {
-            let client = match base_url {
-                Some(url) => gemini::Client::builder().api_key(&api_key).base_url(url).build()?,
-                None => gemini::Client::new(&api_key)?,
-            };
+            let client = build_client!(gemini::Client, &api_key, base_url);
             let builder = client.agent(model_name).tool(tool);
             AgentHandle::Gemini(configure_agent(builder, agent_config))
         }
