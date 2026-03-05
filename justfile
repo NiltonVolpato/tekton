@@ -26,7 +26,7 @@ lint:
 
 # Regenerate providers_models_dev.pkl from models.dev API
 generate-providers:
-    cd experimental/pkl/models_dev && pkl eval -o providers_models_dev.pkl generate_providers.pkl
+    cd experimental/pkl/models_dev && pkl run generate_providers.pkl -- --output providers_models_dev.pkl
 
 # Start mock server in background, wait for readiness
 _mock-server-start:
