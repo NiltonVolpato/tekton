@@ -20,7 +20,7 @@ fn mock_agent_config(dir: &Path) -> std::path::PathBuf {
     write_pkl(
         dir,
         "models_dev/providers.pkl",
-        r#"amends "providers_models_dev.pkl"
+        r#"amends "providersModelsDev.pkl"
 
 providers {
   ["mock"] {

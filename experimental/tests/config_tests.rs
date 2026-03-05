@@ -241,7 +241,7 @@ fn load_config_with_custom_provider() {
     write_pkl(
         dir.path(),
         "models_dev/providers.pkl",
-        r#"amends "providers_models_dev.pkl"
+        r#"amends "providersModelsDev.pkl"
 
 providers {
   ["my-local"] {

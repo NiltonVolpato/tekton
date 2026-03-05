@@ -1,3 +1,8 @@
+/// Top-level configuration template for Tekton.
+///
+/// Users amend this module to define agents, credentials, and model assignments.
+/// The `providers` property is auto-computed: it collects only the providers and
+/// models that the configured agents actually reference.
 open module Config
 
 import "models_dev/providers.pkl" as providerConfig

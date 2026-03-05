@@ -39,8 +39,8 @@ fn test_model_entry(id: &str, name: &str) -> String {
 ///
 /// Creates:
 /// - `providerSchema.pkl` — minimal provider schema for tests
-/// - `models_dev/providers_base.pkl` — declares typed providers property
-/// - `models_dev/providers_models_dev.pkl` — a minimal provider catalog for tests
+/// - `models_dev/ProvidersBase.pkl` — declares typed providers property
+/// - `models_dev/providersModelsDev.pkl` — a minimal provider catalog for tests
 /// - `models_dev/providers.pkl` — amends the catalog (no custom providers)
 /// - `Config.pkl` — the system config schema
 ///
@@ -119,7 +119,7 @@ class Model {
     // Base module declaring typed property
     write_pkl(
         dir,
-        "models_dev/providers_base.pkl",
+        "models_dev/ProvidersBase.pkl",
         r#"import "../providerSchema.pkl" as providerSchema
 
 providers: Mapping<String, providerSchema.Provider>
@@ -135,9 +135,9 @@ providers: Mapping<String, providerSchema.Provider>
     // Test catalog with a few providers
     write_pkl(
         dir,
-        "models_dev/providers_models_dev.pkl",
+        "models_dev/providersModelsDev.pkl",
         &format!(
-            r#"amends "providers_base.pkl"
+            r#"amends "ProvidersBase.pkl"
 
 providers {{
   ["anthropic"] {{
@@ -199,7 +199,7 @@ providers {{
     write_pkl(
         dir,
         "models_dev/providers.pkl",
-        r#"amends "providers_models_dev.pkl"
+        r#"amends "providersModelsDev.pkl"
 
 providers {}
 "#,

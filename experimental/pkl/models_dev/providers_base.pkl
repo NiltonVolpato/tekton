@@ -1,3 +1,0 @@
-import "../providerSchema.pkl" as providerSchema
-
-providers: Mapping<String, providerSchema.Provider>

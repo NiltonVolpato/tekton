@@ -1,3 +1,6 @@
+/// Example Tekton configuration.
+///
+/// Demonstrates a single-agent setup with Anthropic credentials.
 amends "../Config.pkl"
 
 default_agent = "coder"

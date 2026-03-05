@@ -1,3 +1,7 @@
+/// Core type definitions for the provider/model catalog.
+///
+/// Defines [Provider], [Model], and supporting types (capabilities, modalities, limits).
+/// All other Pkl files in this project reference these types.
 module providerSchema
 
 class ProviderMetadata {
