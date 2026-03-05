@@ -1,8 +1,20 @@
-amends "providers_base.pkl"
+#!/usr/bin/env -S pkl run
+extends "pkl:Command"
 
 import "pkl:json"
 import "providerSchema.pkl"
 import "@deepToTyped/deepToTyped.pkl"
+
+command {
+  name = "generate-providers"
+}
+
+options: Options
+
+class Options {
+  /// Output file path. If omitted, writes to stdout.
+  output: String?
+}
 
 local npmToClientType: Map<String, String> = Map(
   "@ai-sdk/anthropic", "Anthropic",
@@ -25,7 +37,7 @@ local parsed = new json.Parser {
 // Convert each supported provider individually — unsupported ones (null
 // client_type) are skipped before deepToTyped sees them, because the
 // typed schema requires a non-null client_type.
-providers = new Mapping {
+local providerEntries: Mapping<String, providerSchema.Provider> = new Mapping {
   for (key, value in parsed) {
     when (value["client_type"] != null) {
       [key] = deepToTyped.apply(providerSchema.Provider, value)
@@ -33,6 +45,15 @@ providers = new Mapping {
   }
 }
 
+local generatedText = "amends \"providers_base.pkl\"\n\n" + new PcfRenderer {}.renderDocument(new Dynamic {
+  providers = providerEntries
+})
+
 output {
-  text = "amends \"providers_base.pkl\"\n\n" + super.text
+  text = if (options.output == null) generatedText else ""
+  files {
+    when (options.output != null) {
+      [options.output] { text = generatedText }
+    }
+  }
 }
