@@ -369,9 +369,38 @@ fn load_config_invalid_pkl_returns_error() {
 
 #[test]
 fn load_example_config() {
-    let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pkl/examples/example.pkl");
-    let config = load_config(&path).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    write_config_schema(dir.path());
+
+    let pkl = write_pkl(
+        dir.path(),
+        "test.pkl",
+        r#"
+amends "Config.pkl"
+
+default_agent = "coder"
+
+credentials {
+  ["anthropic"] = new {
+    api_key = "sk-test"
+  }
+}
+
+agents {
+  ["coder"] = new {
+    model = new { provider = "anthropic"; name = "claude-sonnet-4-6" }
+    system_prompt = """
+      You are a software engineer. You have access to a terminal tool
+      for running shell commands.
+      """
+    temperature = 0.3
+    max_tokens = 8192
+  }
+}
+"#,
+    );
+
+    let config = load_config(&pkl).unwrap();
     assert_eq!(config.default_agent, "coder");
 
     let agent = &config.agents["coder"];

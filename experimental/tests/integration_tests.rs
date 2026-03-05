@@ -25,25 +25,25 @@ fn mock_agent_config(dir: &Path) -> std::path::PathBuf {
 providers {
   ["mock"] {
     id = "mock"
-    name = "Mock Server"
-    npm = "@ai-sdk/openai-compatible"
+    metadata {
+      name = "Mock Server"
+      doc = "https://example.com"
+    }
     client_type = "OpenAICompatible"
-    doc = "https://example.com"
     env {}
-    models {
+    model {
       ["openai"] {
         id = "openai"
-        name = "OpenAI Mock"
-        attachment = false
-        reasoning = false
-        tool_call = false
-        release_date = "2025-01"
-        last_updated = "2025-01"
+        metadata {
+          name = "OpenAI Mock"
+          release_date = "2025-01"
+          last_updated = "2025-01"
+        }
+        capabilities {}
         modalities {
           input { "text" }
           output { "text" }
         }
-        open_weights = false
         limit {
           context = 128000
           output = 4096
