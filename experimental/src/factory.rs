@@ -42,7 +42,7 @@ fn resolve_api_key(
         return match &c.api_key {
             Some(key) => Ok(key.clone()),
             None => Err(FactoryError::MissingApiKey {
-                provider: provider.name.clone(),
+                provider: provider.metadata.name.clone(),
                 env: "api_key in credentials".to_string(),
             }),
         };
@@ -54,7 +54,7 @@ fn resolve_api_key(
         }
     }
     Err(FactoryError::MissingApiKey {
-        provider: provider.name.clone(),
+        provider: provider.metadata.name.clone(),
         env: provider.env.join(" or "),
     })
 }
@@ -84,10 +84,10 @@ pub async fn build_agent(
     let creds = config.credentials.get(&agent_config.model.provider);
     let api_key = resolve_api_key(provider, creds, &RealEnvironment)?;
 
-    // Credential base_url overrides catalog api URL
+    // Credential base_url overrides catalog base_url
     let base_url = creds
         .and_then(|c| c.base_url.as_deref())
-        .or(provider.api.as_deref());
+        .or(provider.base_url.as_deref());
 
     let tool = TerminalTool::new()
         .with_name(agent_name)
@@ -142,16 +142,17 @@ mod tests {
     fn test_provider() -> Provider {
         Provider {
             id: "test-provider".to_string(),
-            name: "test-provider".to_string(),
-            npm: "@ai-sdk/anthropic".to_string(),
+            metadata: crate::config::ProviderMetadata {
+                name: "test-provider".to_string(),
+                doc: "https://example.com".to_string(),
+            },
             client_type: ClientType::Anthropic,
-            api: None,
-            doc: "https://example.com".to_string(),
             env: vec![
                 "PRIMARY_KEY".to_string(),
                 "SECONDARY_KEY".to_string(),
             ],
-            models: HashMap::new(),
+            base_url: None,
+            model: HashMap::new(),
         }
     }
 

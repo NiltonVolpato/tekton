@@ -3,10 +3,12 @@ amends "providers_models_dev.pkl"
 /// Add custom providers here or in a project-level override:
 ///   providers {
 ///     ["my-local"] {
-///       name = "My Local LLM"
+///       id = "my-local"
+///       metadata { name = "My Local LLM"; doc = "https://..." }
 ///       client_type = "OpenAICompatible"
-///       env = new {}
-///       api = "http://localhost:8080/v1"
+///       env {}
+///       base_url = "http://localhost:8080/v1"
+///       model {}
 ///     }
 ///   }
 

@@ -41,7 +41,7 @@ agents {
 
     // providers should contain anthropic
     let provider = &config.providers["anthropic"];
-    assert_eq!(provider.name, "Anthropic");
+    assert_eq!(provider.metadata.name, "Anthropic");
     assert_eq!(provider.client_type, ClientType::Anthropic);
     assert_eq!(provider.env, vec!["ANTHROPIC_API_KEY"]);
 }
@@ -111,7 +111,7 @@ agents {
     let provider = &config.providers["openrouter"];
     assert_eq!(provider.client_type, ClientType::OpenAICompatible);
     assert_eq!(
-        provider.api.as_deref(),
+        provider.base_url.as_deref(),
         Some("https://openrouter.ai/api/v1")
     );
 }
@@ -246,26 +246,26 @@ fn load_config_with_custom_provider() {
 providers {
   ["my-local"] {
     id = "my-local"
-    name = "My Local LLM"
-    npm = "@ai-sdk/openai-compatible"
+    metadata {
+      name = "My Local LLM"
+      doc = "https://example.com"
+    }
     client_type = "OpenAICompatible"
-    api = "http://localhost:8080/v1"
-    doc = "https://example.com"
+    base_url = "http://localhost:8080/v1"
     env {}
-    models {
+    model {
       ["qwen3.5-397b-a17b"] {
         id = "qwen3.5-397b-a17b"
-        name = "Qwen 3.5 397B A17B"
-        attachment = false
-        reasoning = false
-        tool_call = true
-        release_date = "2025-06"
-        last_updated = "2025-06"
+        metadata {
+          name = "Qwen 3.5 397B A17B"
+          release_date = "2025-06"
+          last_updated = "2025-06"
+        }
+        capabilities { "tool_call"; "open_weights" }
         modalities {
           input { "text" }
           output { "text" }
         }
-        open_weights = true
         limit {
           context = 131072
           output = 8192
@@ -296,10 +296,10 @@ agents {
 
     let config = load_config(&pkl).unwrap();
     let provider = &config.providers["my-local"];
-    assert_eq!(provider.name, "My Local LLM");
+    assert_eq!(provider.metadata.name, "My Local LLM");
     assert_eq!(provider.client_type, ClientType::OpenAICompatible);
     assert_eq!(
-        provider.api.as_deref(),
+        provider.base_url.as_deref(),
         Some("http://localhost:8080/v1")
     );
     assert!(provider.env.is_empty());
@@ -442,7 +442,7 @@ agents {
         serde_json::from_slice(&output.stdout).expect("pkl output should be valid JSON");
 
     assert_eq!(json["default_agent"], "dev");
-    assert_eq!(json["providers"]["anthropic"]["name"], "Anthropic");
+    assert_eq!(json["providers"]["anthropic"]["metadata"]["name"], "Anthropic");
     assert_eq!(
         json["providers"]["anthropic"]["client_type"],
         "Anthropic"

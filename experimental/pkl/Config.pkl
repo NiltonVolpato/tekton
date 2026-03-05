@@ -1,7 +1,7 @@
 open module Config
 
 import "models_dev/providers.pkl" as providerConfig
-import "models_dev/providerSchema.pkl"
+import "providerSchema.pkl"
 
 class ModelIdentifier {
   provider: String
@@ -49,8 +49,8 @@ local modelNamesByProvider: Map<String, Set<String>> = uniqueProviderIds.fold(Ma
 providers: Mapping<String, providerSchema.Provider> = let (
   _ = agents.every((agentName, agent) ->
     let (provider = providerConfig.providers[agent.model.provider])
-      if (!provider.models.containsKey(agent.model.name))
-        throw("Agent \"\(agentName)\": model \"\(agent.model.name)\" not found in provider \"\(agent.model.provider)\". Available models: \(provider.models.keys.toList().join(", "))")
+      if (!provider.model.containsKey(agent.model.name))
+        throw("Agent \"\(agentName)\": model \"\(agent.model.name)\" not found in provider \"\(agent.model.provider)\". Available models: \(provider.model.keys.toList().join(", "))")
       else true
   )
 )
@@ -59,10 +59,10 @@ providers: Mapping<String, providerSchema.Provider> = let (
       [providerId] = let (fullProvider = providerConfig.providers[providerId])
         let (usedModelNames = modelNamesByProvider[providerId])
           (fullProvider) {
-            models = new Mapping {
-              for (modelName, model in fullProvider.models) {
+            model = new Mapping {
+              for (modelName, m in fullProvider.model) {
                 when (usedModelNames.contains(modelName)) {
-                  [modelName] = model
+                  [modelName] = m
                 }
               }
             }

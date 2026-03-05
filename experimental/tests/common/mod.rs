@@ -17,17 +17,16 @@ fn test_model_entry(id: &str, name: &str) -> String {
     format!(
         r#"    ["{id}"] {{
       id = "{id}"
-      name = "{name}"
-      attachment = false
-      reasoning = false
-      tool_call = false
-      release_date = "2025-01"
-      last_updated = "2025-01"
+      metadata {{
+        name = "{name}"
+        release_date = "2025-01"
+        last_updated = "2025-01"
+      }}
+      capabilities {{}}
       modalities {{
         input {{ "text" }}
         output {{ "text" }}
       }}
-      open_weights = false
       limit {{
         context = 200000
         output = 8192
@@ -39,7 +38,7 @@ fn test_model_entry(id: &str, name: &str) -> String {
 /// Write the full Config.pkl schema chain into a temp dir.
 ///
 /// Creates:
-/// - `models_dev/providerSchema.pkl` — minimal provider schema for tests
+/// - `providerSchema.pkl` — minimal provider schema for tests
 /// - `models_dev/providers_base.pkl` — declares typed providers property
 /// - `models_dev/providers_models_dev.pkl` — a minimal provider catalog for tests
 /// - `models_dev/providers.pkl` — amends the catalog (no custom providers)
@@ -50,80 +49,69 @@ pub fn write_config_schema(dir: &Path) -> std::path::PathBuf {
     // Minimal provider schema for tests
     write_pkl(
         dir,
-        "models_dev/providerSchema.pkl",
+        "providerSchema.pkl",
         r#"module providerSchema
+
+class ProviderMetadata {
+  name: String
+  doc: String
+}
+
+typealias ClientType = "Anthropic"|"OpenAI"|"OpenAICompatible"|"Gemini"
 
 class Provider {
   id: String
+  metadata: ProviderMetadata
+  client_type: ClientType
   env: Listing<String>
-  npm: String
-  client_type: "Anthropic"|"OpenAI"|"OpenAICompatible"|"Gemini"
-  api: String?
-  name: String
-  doc: String
-  models: Mapping<String, Models>
+  base_url: String?
+  model: Mapping<String, Model>
 }
 
-class Models {
-  id: String
+class ModelMetadata {
   name: String
-  family: String?
-  attachment: Boolean
-  reasoning: Boolean
-  tool_call: Boolean
-  interleaved: (Boolean(this == true)|InterleavedAlternate1)?
-  structured_output: Boolean?
-  temperature: Boolean?
-  knowledge: String?
   release_date: String
   last_updated: String
-  modalities: Modalities
-  open_weights: Boolean
-  cost: Cost?
-  limit: Limit
-  status: ("alpha"|"beta"|"deprecated")?
-  provider: ModelsProvider?
+  knowledge: String?
+  family: String?
 }
 
-class InterleavedAlternate1 {
-  field: "reasoning_content"|"reasoning_details"
-}
+typealias Modality = "text"|"audio"|"image"|"video"|"pdf"
 
 class Modalities {
-  input: Listing<String>
-  output: Listing<String>
+  input: Listing<Modality>
+  output: Listing<Modality>
 }
 
-class Cost {
-  input: Number
-  output: Number
-  reasoning: Number?
-  cache_read: Number?
-  cache_write: Number?
-  input_audio: Number?
-  output_audio: Number?
-  context_over_200k: ContextOver200k?
-}
+typealias ModelCapability =
+  "attachment"
+  | "reasoning"
+  | "tool_call"
+  | "temperature"
+  | "structured_output"
+  | "open_weights"
 
-class ContextOver200k {
-  input: Number
-  output: Number
-  reasoning: Number?
-  cache_read: Number?
-  cache_write: Number?
-  input_audio: Number?
-  output_audio: Number?
+class ProviderOverride {
+  client_type: ClientType?
+  base_url: String?
 }
 
 class Limit {
-  context: Number
-  input: Number?
-  output: Number
+  context: Int
+  input: Int?
+  output: Int
 }
 
-class ModelsProvider {
-  npm: String?
-  api: String?
+typealias ModelStatus = "alpha"|"beta"|"deprecated"
+
+class Model {
+  id: String
+  metadata: ModelMetadata
+  capabilities: Listing<ModelCapability>
+  modalities: Modalities
+  limit: Limit
+  provider_override: ProviderOverride?
+  status: ModelStatus?
 }
 "#,
     );
@@ -132,7 +120,7 @@ class ModelsProvider {
     write_pkl(
         dir,
         "models_dev/providers_base.pkl",
-        r#"import "providerSchema.pkl"
+        r#"import "../providerSchema.pkl" as providerSchema
 
 providers: Mapping<String, providerSchema.Provider>
 "#,
@@ -154,47 +142,51 @@ providers: Mapping<String, providerSchema.Provider>
 providers {{
   ["anthropic"] {{
     id = "anthropic"
-    name = "Anthropic"
-    npm = "@ai-sdk/anthropic"
+    metadata {{
+      name = "Anthropic"
+      doc = "https://docs.anthropic.com"
+    }}
     client_type = "Anthropic"
-    doc = "https://docs.anthropic.com"
     env {{ "ANTHROPIC_API_KEY" }}
-    models {{
+    model {{
 {claude_sonnet}
 {claude_haiku}
     }}
   }}
   ["openai"] {{
     id = "openai"
-    name = "OpenAI"
-    npm = "@ai-sdk/openai"
+    metadata {{
+      name = "OpenAI"
+      doc = "https://platform.openai.com/docs"
+    }}
     client_type = "OpenAI"
-    doc = "https://platform.openai.com/docs"
     env {{ "OPENAI_API_KEY" }}
-    models {{
+    model {{
 {gpt5_codex}
     }}
   }}
   ["openrouter"] {{
     id = "openrouter"
-    name = "OpenRouter"
-    npm = "@openrouter/ai-sdk-provider"
+    metadata {{
+      name = "OpenRouter"
+      doc = "https://openrouter.ai/docs"
+    }}
     client_type = "OpenAICompatible"
-    api = "https://openrouter.ai/api/v1"
-    doc = "https://openrouter.ai/docs"
+    base_url = "https://openrouter.ai/api/v1"
     env {{ "OPENROUTER_API_KEY" }}
-    models {{
+    model {{
 {llama}
     }}
   }}
   ["google"] {{
     id = "google"
-    name = "Google"
-    npm = "@ai-sdk/google"
+    metadata {{
+      name = "Google"
+      doc = "https://ai.google.dev/docs"
+    }}
     client_type = "Gemini"
-    doc = "https://ai.google.dev/docs"
     env {{ "GEMINI_API_KEY" }}
-    models {{
+    model {{
 {gemini_pro}
     }}
   }}
