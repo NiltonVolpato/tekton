@@ -39,7 +39,6 @@ fn test_model_entry(id: &str, name: &str) -> String {
 ///
 /// Creates:
 /// - `providerSchema.pkl` — minimal provider schema for tests
-/// - `models_dev/ProvidersBase.pkl` — declares typed providers property
 /// - `models_dev/providersModelsDev.pkl` — a minimal provider catalog for tests
 /// - `models_dev/providers.pkl` — amends the catalog (no custom providers)
 /// - `Config.pkl` — the system config schema
@@ -116,30 +115,20 @@ class Model {
 "#,
     );
 
-    // Base module declaring typed property
-    write_pkl(
-        dir,
-        "models_dev/ProvidersBase.pkl",
-        r#"import "../providerSchema.pkl" as providerSchema
-
-providers: Mapping<String, providerSchema.Provider>
-"#,
-    );
-
     let claude_sonnet = test_model_entry("claude-sonnet-4-6", "Claude Sonnet 4.6");
     let claude_haiku = test_model_entry("claude-haiku-4-5", "Claude Haiku 4.5");
     let gpt5_codex = test_model_entry("gpt-5.3-codex", "GPT-5.3 Codex");
     let gemini_pro = test_model_entry("gemini-3.1-pro", "Gemini 3.1 Pro");
     let llama = test_model_entry("llama-3.3-70b", "Llama 3.3 70B");
 
-    // Test catalog with a few providers
+    // Test catalog with a few providers (self-contained, mirrors generated output)
     write_pkl(
         dir,
         "models_dev/providersModelsDev.pkl",
         &format!(
-            r#"amends "ProvidersBase.pkl"
+            r#"import "../providerSchema.pkl" as providerSchema
 
-providers {{
+providers: Mapping<String, providerSchema.Provider> = new {{
   ["anthropic"] {{
     id = "anthropic"
     metadata {{

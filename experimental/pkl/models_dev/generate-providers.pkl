@@ -2,7 +2,8 @@
 /// Fetches the models.dev API and generates the provider catalog.
 ///
 /// Converts the API response into our [providerSchema] types and outputs a Pkl
-/// file that amends [ProvidersBase].
+/// file containing the providers and their respective models.
+///
 /// Run via `just generate-providers` or directly: `./generate-providers.pkl`.
 @ModuleInfo { minPklVersion = "0.31.0" }
 extends "pkl:Command"

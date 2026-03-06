@@ -1,9 +1,0 @@
-/// Base template for the provider catalog.
-///
-/// Declares the typed `providers` property.
-/// Both the generated catalog and the user's override layer amend this module.
-module ProvidersBase
-
-import "../providerSchema.pkl" as providerSchema
-
-providers: Mapping<String, providerSchema.Provider>
