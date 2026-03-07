@@ -1,0 +1,24 @@
+/// Example Tekton configuration.
+///
+/// Demonstrates a single-agent setup with Anthropic credentials.
+amends "../Config.pkl"
+
+default_agent = "coder"
+
+credentials {
+  ["anthropic"] = new {
+    api_key = read?("env:ANTHROPIC_API_KEY")
+  }
+}
+
+agents {
+  ["coder"] = new {
+    model = new { provider = "anthropic"; name = "claude-sonnet-4-6" }
+    system_prompt = """
+      You are a software engineer. You have access to a terminal tool
+      for running shell commands.
+      """
+    temperature = 0.3
+    max_tokens = 8192
+  }
+}

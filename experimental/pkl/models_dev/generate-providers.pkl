@@ -1,0 +1,143 @@
+#!/usr/bin/env -S pkl run
+/// Fetches the models.dev API and generates the provider catalog.
+///
+/// Converts the API response into our [providerSchema] types and outputs a Pkl
+/// file containing the providers and their respective models.
+///
+/// Run via `just generate-providers` or directly: `./generate-providers.pkl`.
+@ModuleInfo { minPklVersion = "0.31.0" }
+extends "pkl:Command"
+
+import "pkl:json"
+
+import "../providerSchema.pkl" as schema
+
+command {
+  name = "generate-providers"
+}
+
+options: Options
+
+class Options {
+  /// Output file path. If omitted, writes to stdout.
+  output: String?
+}
+
+/// Maps npm package to client type.
+local npmToClientType: Map<String, String> =
+  Map(
+    "@ai-sdk/anthropic", "Anthropic",
+    "@ai-sdk/openai", "OpenAI",
+    "@ai-sdk/openai-compatible", "OpenAICompatible",
+    "@openrouter/ai-sdk-provider", "OpenAICompatible",
+    "@ai-sdk/google", "Gemini",
+    "@ai-sdk/google-vertex", "Gemini",
+  )
+
+/// Parsed models.dev API response. useMapping = true so we get Mapping
+/// objects (for entry generation) and Listing arrays.
+local parsed: Map<String, Mapping> =
+  (
+    new json.Parser {
+      useMapping = true
+    }.parse(read("https://models.dev/api.json")) as Mapping
+  ).toMap() as Map<String, Mapping>
+
+// --- Model conversion ---
+
+local function convertModel(raw: Mapping): schema.Model = new schema.Model {
+  id = raw["id"] as String
+  metadata = new schema.ModelMetadata {
+    name = raw["name"] as String
+    release_date = raw["release_date"] as String
+    last_updated = raw["last_updated"] as String
+    knowledge = raw.getOrNull("knowledge") as String?
+    family = raw.getOrNull("family") as String?
+  }
+  capabilities = new Listing {
+    when (raw["attachment"] == true) { "attachment" }
+    when (raw["reasoning"] == true) { "reasoning" }
+    when (raw["tool_call"] == true) { "tool_call" }
+    when (raw.getOrNull("temperature") == true) { "temperature" }
+    when (raw.getOrNull("structured_output") == true) { "structured_output" }
+    when (raw["open_weights"] == true) { "open_weights" }
+  }
+  modalities =
+    let (rawMod = raw["modalities"] as Mapping)
+      new schema.Modalities {
+        input = rawMod["input"] as Listing
+        output = rawMod["output"] as Listing
+      }
+  limit =
+    let (rawLimit = raw["limit"] as Mapping)
+      new schema.Limit {
+        context = (rawLimit["context"] as Number).toInt()
+        input = (rawLimit.getOrNull("input") as Number?)?.toInt()
+        output = (rawLimit["output"] as Number).toInt()
+      }
+  provider_override =
+    let (rawOverride = raw.getOrNull("provider") as Mapping?)
+      if (rawOverride == null)
+        null
+      else
+        new schema.ProviderOverride {
+          client_type =
+            let (npm = rawOverride.getOrNull("npm") as String?)
+              if (npm == null) null else npmToClientType.getOrNull(npm)
+          base_url = rawOverride.getOrNull("api") as String?
+        }
+  status = raw.getOrNull("status") as String?
+}
+
+// --- Provider conversion ---
+
+local function convertProvider(providerId: String, raw: Mapping): schema.Provider = new schema
+  .Provider {
+  id = providerId
+  metadata = new schema.ProviderMetadata {
+    name = raw["name"] as String
+    doc = raw["doc"] as String
+  }
+  client_type = npmToClientType[raw["npm"] as String]
+  env = raw["env"] as Listing
+  base_url = raw.getOrNull("api") as String?
+  model =
+    let (models = (raw["models"] as Mapping).toMap())
+      new Mapping {
+        for (modelId, rawModel in models) {
+          [modelId] = convertModel(rawModel as Mapping)
+        }
+      }
+}
+
+// Convert each supported provider — unsupported ones (unmapped npm package)
+// are skipped because our schema requires a non-null client_type.
+local providerEntries: Mapping<String, schema.Provider> = new Mapping {
+  for (providerId, raw in parsed) {
+    when (npmToClientType.containsKey(raw["npm"] as String)) {
+      [providerId] = convertProvider(providerId, raw)
+    }
+  }
+}
+
+// --- Output ---
+
+local generatedText =
+  "import \"../providerSchema.pkl\" as providerSchema\n\n"
+    + new PcfRenderer {}
+      .renderDocument(new Dynamic {
+        providers = providerEntries
+      })
+      .replaceFirst(
+        Regex("^providers \\{"),
+        "providers: Mapping<String, providerSchema.Provider> = new {",
+      )
+
+output {
+  text = if (options.output == null) generatedText else ""
+  files {
+    when (options.output != null) {
+      [options.output] { text = generatedText }
+    }
+  }
+}

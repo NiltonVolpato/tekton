@@ -2,9 +2,6 @@
 nextest_args := "--status-level fail --show-progress none --no-output-indent --cargo-quiet"
 mock_server_pid_file := "/tmp/mock-server.pid"
 
-export TEST_SERVER_URL := "http://localhost:8100"
-export OPENAI_API_KEY := "fake-key"
-export OPENAI_BASE_URL := "http://localhost:8100/v1"
 
 # Default: run all tests (starts mock server automatically)
 # Examples: just test, just test -p my-crate, just test -E 'test(foo)'
@@ -26,6 +23,10 @@ build:
 # Lint
 lint:
     cargo clippy --workspace -- -D warnings
+
+# Regenerate providersModelsDev.pkl from models.dev API
+generate-providers:
+    cd experimental/pkl/models_dev && pkl run generate-providers.pkl -- --output providersModelsDev.pkl
 
 # Start mock server in background, wait for readiness
 _mock-server-start:

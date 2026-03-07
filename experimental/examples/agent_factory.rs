@@ -16,8 +16,9 @@ async fn main() {
         std::process::exit(1);
     });
 
-    eprintln!("Building agent '{}'...", config.name);
-    let agent = build_agent(&config).await.unwrap_or_else(|e| {
+    let agent_name = &config.default_agent;
+    eprintln!("Building agent '{agent_name}'...");
+    let agent = build_agent(&config, agent_name).await.unwrap_or_else(|e| {
         eprintln!("Failed to build agent: {e}");
         std::process::exit(1);
     });
