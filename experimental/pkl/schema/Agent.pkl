@@ -13,7 +13,7 @@ system_prompt: String
 temperature: Float(isBetween(0.0, 2.0))?
 
 /// Maximum number of tokens the model may generate per response.
-max_tokens: Int?
+max_tokens: Int(isPositive)?
 
 /// Maximum number of conversation turns before stopping.
-max_turns: Int = 20
+max_turns: Int(isPositive) = 20

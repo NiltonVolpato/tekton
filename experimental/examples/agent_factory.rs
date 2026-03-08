@@ -7,7 +7,7 @@ use tekton_experimental::{build_agent, load_config, StreamEvent};
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 3 {
-        eprintln!("Usage: cargo run --example agent-factory -- <config.pkl> <global-dir>");
+        eprintln!("Usage: cargo run --example agent_factory -- <config.pkl> <global-dir>");
         std::process::exit(1);
     }
 

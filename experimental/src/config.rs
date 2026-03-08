@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use rpkl::api::reader::{PathElements, PklModuleReader};
 use serde::Deserialize;
@@ -13,7 +13,7 @@ pub struct ModelIdentifier {
 }
 
 /// Determines which rig client to use for API calls.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum ClientType {
     Anthropic,
     OpenAI,
@@ -154,9 +154,41 @@ impl GlobalModuleReader {
     }
 
     /// Strip the `global:/` prefix and resolve against the root directory.
-    fn resolve(&self, uri: &str) -> PathBuf {
-        let relative = uri.strip_prefix("global:/").unwrap_or(uri);
-        self.root.join(relative)
+    ///
+    /// Returns an error if the URI does not start with exactly `global:/`,
+    /// or if the remaining path contains `..`, absolute components, or
+    /// Windows prefixes (path traversal).
+    fn resolve(&self, uri: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        // Require exactly "global:/" — reject "global://" which would produce
+        // an absolute path when joined (the second slash starts from root).
+        let relative = uri
+            .strip_prefix("global:/")
+            .filter(|rest| !rest.starts_with('/'))
+            .ok_or_else(|| format!("URI must start with exactly \"global:/\": {uri}"))?;
+
+        // Validate every component of the relative path.
+        for component in Path::new(relative).components() {
+            match component {
+                Component::Normal(_) | Component::CurDir => {}
+                Component::ParentDir => {
+                    return Err(
+                        format!("path traversal via \"..\" is not allowed: {uri}").into(),
+                    );
+                }
+                Component::RootDir => {
+                    return Err(
+                        format!("absolute path component is not allowed: {uri}").into(),
+                    );
+                }
+                Component::Prefix(_) => {
+                    return Err(
+                        format!("Windows prefix component is not allowed: {uri}").into(),
+                    );
+                }
+            }
+        }
+
+        Ok(self.root.join(relative))
     }
 }
 
@@ -174,12 +206,12 @@ impl PklModuleReader for GlobalModuleReader {
     }
 
     fn read(&self, uri: &str) -> Result<String, Box<dyn std::error::Error>> {
-        let path = self.resolve(uri);
+        let path = self.resolve(uri)?;
         std::fs::read_to_string(&path).map_err(|e| format!("{}: {}", path.display(), e).into())
     }
 
     fn list(&self, uri: &str) -> Result<Vec<PathElements>, Box<dyn std::error::Error>> {
-        let path = self.resolve(uri);
+        let path = self.resolve(uri)?;
         let mut entries = Vec::new();
         for entry in std::fs::read_dir(&path).map_err(|e| format!("{}: {}", path.display(), e))? {
             let entry = entry?;
@@ -208,4 +240,72 @@ pub fn load_config(
     let reader = GlobalModuleReader::new(global_dir);
     let options = rpkl::EvaluatorOptions::new().add_client_module_readers(reader);
     rpkl::from_config_with_options(path.as_ref(), options).map_err(ConfigError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reader() -> GlobalModuleReader {
+        GlobalModuleReader::new(PathBuf::from("/test/root"))
+    }
+
+    #[test]
+    fn resolve_normal_path() {
+        let r = reader();
+        let path = r.resolve("global:/schema/Config.pkl").unwrap();
+        assert_eq!(path, PathBuf::from("/test/root/schema/Config.pkl"));
+    }
+
+    #[test]
+    fn resolve_rejects_double_slash() {
+        let r = reader();
+        let err = r.resolve("global://etc/passwd").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "URI must start with exactly \"global:/\": global://etc/passwd"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_parent_dir() {
+        let r = reader();
+        let err = r.resolve("global:/../../etc/passwd").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "path traversal via \"..\" is not allowed: global:/../../etc/passwd"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_embedded_parent_dir() {
+        let r = reader();
+        let err = r
+            .resolve("global:/schema/../../../etc/passwd")
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "path traversal via \"..\" is not allowed: global:/schema/../../../etc/passwd"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_absolute_component() {
+        let r = reader();
+        let err = r.resolve("/etc/passwd").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "URI must start with exactly \"global:/\": /etc/passwd"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_missing_prefix() {
+        let r = reader();
+        let err = r.resolve("other:/foo").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "URI must start with exactly \"global:/\": other:/foo"
+        );
+    }
 }

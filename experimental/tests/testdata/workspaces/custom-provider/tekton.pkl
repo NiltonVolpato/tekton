@@ -1,19 +1,16 @@
 amends ".../config.pkl"
 
-import "global:/schema/Provider.pkl"
-import "global:/schema/Model.pkl"
-
 default_agent = "local"
 
 provider_catalog = (super.provider_catalog) {
-  ["my-local"] = new Provider {
+  ["my-local"] = new {
     id = "my-local"
     metadata { name = "My Local LLM"; doc = "https://example.com" }
     client_type = "OpenAICompatible"
     base_url = "http://localhost:8080/v1"
     env {}
     models {
-      ["qwen3.5-397b-a17b"] = new Model {
+      ["qwen3.5-397b-a17b"] = new {
         id = "qwen3.5-397b-a17b"
         metadata { name = "Qwen 3.5 397B A17B"; release_date = "2025-06"; last_updated = "2025-06" }
         capabilities { "tool_call"; "open_weights" }

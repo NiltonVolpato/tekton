@@ -9,7 +9,7 @@ import "Agent.pkl"
 import "Provider.pkl"
 
 /// The agent to use when none is specified.
-default_agent: String
+default_agent: String(agents.containsKey(this))
 
 /// Named agent configurations, keyed by agent ID.
 agents: Mapping<String, Agent>

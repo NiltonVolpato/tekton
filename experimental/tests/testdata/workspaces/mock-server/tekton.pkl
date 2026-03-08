@@ -1,8 +1,5 @@
 amends ".../config.pkl"
 
-import "global:/schema/Provider.pkl"
-import "global:/schema/Model.pkl"
-
 default_agent = "mock-agent"
 
 credentials {
@@ -12,14 +9,14 @@ credentials {
 }
 
 provider_catalog = (super.provider_catalog) {
-  ["mock"] = new Provider {
+  ["mock"] = new {
     id = "mock"
     metadata { name = "Mock Server"; doc = "https://example.com" }
     client_type = "OpenAICompatible"
     base_url = "http://localhost:8100/v1"
     env {}
     models {
-      ["openai"] = new Model {
+      ["openai"] = new {
         id = "openai"
         metadata { name = "OpenAI Mock"; release_date = "2025-01"; last_updated = "2025-01" }
         capabilities {}

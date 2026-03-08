@@ -127,6 +127,17 @@ fn load_config_invalid_pkl_returns_error() {
 }
 
 #[test]
+fn load_config_invalid_default_agent_returns_error() {
+    let result = load_config(workspace_pkl("invalid-default-agent"), global_dir());
+    let err = result.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("agents.containsKey(this)"),
+        "expected Pkl constraint violation, got: {msg}"
+    );
+}
+
+#[test]
 fn load_example_config() {
     let config = load_config(workspace_pkl("example"), global_dir()).unwrap();
 

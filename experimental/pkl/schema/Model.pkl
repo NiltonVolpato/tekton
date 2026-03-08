@@ -92,8 +92,8 @@ typealias Status = "alpha" | "beta" | "deprecated"
 /// References a specific model by provider ID and model name.
 class Identifier {
   /// Provider ID (must match a key in the provider catalog).
-  provider: String
+  provider: String(!isEmpty)
 
   /// Model name (must match a key in the provider's models mapping).
-  name: String
+  name: String(!isEmpty)
 }
