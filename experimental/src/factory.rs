@@ -139,7 +139,7 @@ mod tests {
                 "SECONDARY_KEY".to_string(),
             ],
             base_url: None,
-            model: HashMap::new(),
+            models: HashMap::new(),
         }
     }
 

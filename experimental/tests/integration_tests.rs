@@ -1,91 +1,15 @@
 mod common;
 
-use std::path::Path;
-
 use tekton_experimental::{build_agent, load_config};
 
-use common::{write_config_schema, write_pkl};
-
-/// Write a config that points at the mock server.
-/// All credentials are in the Pkl config — no env vars needed.
-///
-/// The catalog entry has no `api`, so the credential `base_url` is the
-/// only source. This exercises the "credential base_url overrides catalog"
-/// code path.
-fn mock_agent_config(dir: &Path) -> std::path::PathBuf {
-    write_config_schema(dir);
-
-    // Add mock provider to the catalog with the mock server's base_url.
-    write_pkl(
-        dir,
-        "providers.pkl",
-        r#"amends "models_dev/providersModelsDev.pkl"
-
-providers {
-  ["mock"] {
-    id = "mock"
-    metadata {
-      name = "Mock Server"
-      doc = "https://example.com"
-    }
-    client_type = "OpenAICompatible"
-    base_url = "http://localhost:8100/v1"
-    env {}
-    model {
-      ["openai"] {
-        id = "openai"
-        metadata {
-          name = "OpenAI Mock"
-          release_date = "2025-01"
-          last_updated = "2025-01"
-        }
-        capabilities {}
-        modalities {
-          input { "text" }
-          output { "text" }
-        }
-        limit {
-          context = 128000
-          output = 4096
-        }
-      }
-    }
-  }
-}
-"#,
-    );
-
-    write_pkl(
-        dir,
-        "test.pkl",
-        r#"
-amends "Config.pkl"
-
-default_agent = "mock-agent"
-
-credentials {
-  ["mock"] = new {
-    api_key = "fake-key"
-  }
-}
-
-agents {
-  ["mock-agent"] = new {
-    model = new { provider = "mock"; name = "openai" }
-    system_prompt = "You are a test agent."
-  }
-}
-"#,
-    )
-}
+use common::{global_dir, workspace_pkl};
 
 // These tests require the mock server on localhost:8100 (started by `just test`).
 // They intentionally fail if the server is not running — do not skip or ignore them.
+
 #[tokio::test]
 async fn integration_prompt() {
-    let dir = tempfile::tempdir().unwrap();
-    let pkl = mock_agent_config(dir.path());
-    let config = load_config(&pkl).unwrap();
+    let config = load_config(workspace_pkl("mock-server"), global_dir()).unwrap();
     let agent = build_agent(&config, "mock-agent").await.unwrap();
     let response = agent.prompt("Hello").await.unwrap();
     assert!(!response.is_empty());
@@ -93,9 +17,7 @@ async fn integration_prompt() {
 
 #[tokio::test]
 async fn integration_chat() {
-    let dir = tempfile::tempdir().unwrap();
-    let pkl = mock_agent_config(dir.path());
-    let config = load_config(&pkl).unwrap();
+    let config = load_config(workspace_pkl("mock-server"), global_dir()).unwrap();
     let agent = build_agent(&config, "mock-agent").await.unwrap();
     let response = agent.chat("Hello", vec![]).await.unwrap();
     assert!(!response.is_empty());
@@ -103,9 +25,7 @@ async fn integration_chat() {
 
 #[tokio::test]
 async fn integration_stream_chat() {
-    let dir = tempfile::tempdir().unwrap();
-    let pkl = mock_agent_config(dir.path());
-    let config = load_config(&pkl).unwrap();
+    let config = load_config(workspace_pkl("mock-server"), global_dir()).unwrap();
     let agent = build_agent(&config, "mock-agent").await.unwrap();
 
     use futures::StreamExt;

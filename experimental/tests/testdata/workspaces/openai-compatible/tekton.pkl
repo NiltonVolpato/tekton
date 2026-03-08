@@ -1,0 +1,11 @@
+amends ".../config.pkl"
+
+default_agent = "router"
+
+agents {
+  ["router"] = new {
+    model = new { provider = "openrouter"; name = "llama-3.3-70b" }
+    system_prompt = "You are a local model."
+    max_turns = 5
+  }
+}

@@ -1,0 +1,10 @@
+amends ".../config.pkl"
+
+default_agent = "oai"
+
+agents {
+  ["oai"] = new {
+    model = new { provider = "openai"; name = "gpt-5.3-codex" }
+    system_prompt = "Hello."
+  }
+}
