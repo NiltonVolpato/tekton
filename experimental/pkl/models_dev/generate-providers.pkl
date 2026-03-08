@@ -123,14 +123,14 @@ local providerEntries: Mapping<String, schema.Provider> = new Mapping {
 // --- Output ---
 
 local generatedText =
-  "import \"../providerSchema.pkl\" as providerSchema\n\n"
+  "import \"../schema/Provider.pkl\" as Provider\n\n"
     + new PcfRenderer {}
       .renderDocument(new Dynamic {
-        providers = providerEntries
+        catalog = providerEntries
       })
       .replaceFirst(
-        Regex("^providers \\{"),
-        "providers: Mapping<String, providerSchema.Provider> = new {",
+        Regex("^catalog \\{"),
+        "catalog: Mapping<String, Provider> = new {",
       )
 
 output {

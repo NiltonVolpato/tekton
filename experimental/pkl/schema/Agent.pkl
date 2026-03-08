@@ -1,0 +1,13 @@
+module Agent
+
+import "Model.pkl"
+
+model: Model.Identifier
+
+system_prompt: String
+
+temperature: Float(isBetween(0.0, 2.0))?
+
+max_tokens: Int?
+
+max_turns: Int = 20

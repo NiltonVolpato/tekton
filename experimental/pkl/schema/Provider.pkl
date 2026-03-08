@@ -1,0 +1,31 @@
+module Provider
+
+import "Model.pkl"
+
+/// Unique provider identifier (e.g. "anthropic", "openai").
+id: String(!isEmpty)
+
+metadata: ProviderMetadata
+
+/// Determines which client to use for API calls.
+client_type: ClientType
+
+/// Environment variables used for auth (e.g. "ANTHROPIC_API_KEY").
+/// May be empty for local providers that use credentials directly.
+env: Listing<String>
+
+/// Base URL for the API endpoint. Required for OpenAI-compatible providers.
+base_url: String?
+
+/// Models this provider supports, keyed by model ID.
+models: Mapping<String, Model>
+
+class ProviderMetadata {
+  /// Display name of the provider.
+  name: String(!isEmpty)
+
+  /// Link to the provider's documentation.
+  doc: String(!isEmpty)
+}
+
+typealias ClientType = "Anthropic" | "OpenAI" | "OpenAICompatible" | "Gemini"

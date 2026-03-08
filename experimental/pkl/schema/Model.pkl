@@ -1,0 +1,90 @@
+module Model
+
+import "Provider.pkl"
+
+/// Model identifier used by the AI SDK for lookups.
+id: String(!isEmpty)
+
+metadata: Metadata
+
+capabilities: Listing<Capability>
+
+modalities: Modalities
+
+limit: Limit
+
+/// Per-model overrides for provider-level settings.
+provider_override: ProviderOverride?
+
+status: Status?
+
+/// Human-readable metadata about a model.
+class Metadata {
+  /// Display name of the model.
+  name: String(!isEmpty)
+
+  /// First public release date (YYYY-MM or YYYY-MM-DD).
+  release_date: String(matches(Regex(#"^\d{4}-\d{2}(-\d{2})?$"#)))
+
+/// Most recent update date (YYYY-MM or YYYY-MM-DD).
+  last_updated: String(matches(Regex(#"^\d{4}-\d{2}(-\d{2})?$"#)))
+
+  /// Knowledge cutoff date (YYYY-MM or YYYY-MM-DD).
+  knowledge: String(matches(Regex(#"^\d{4}-\d{2}(-\d{2})?$"#)))?
+
+  /// Model family (e.g. "gpt", "claude", "gemini").
+  family: String?
+}
+
+typealias Modality = "text" | "audio" | "image" | "video" | "pdf"
+
+class Modalities {
+  /// Supported input modalities.
+  input: Listing<Modality>
+
+  /// Supported output modalities.
+  output: Listing<Modality>
+}
+
+/// Model capability flags:
+/// - "attachment": supports file attachments
+/// - "reasoning": supports reasoning / chain-of-thought
+/// - "tool_call": supports tool calling
+/// - "temperature": supports temperature control
+/// - "structured_output": supports a dedicated structured output feature
+/// - "open_weights": model's trained weights are publicly available
+typealias Capability =
+  "attachment"
+  | "reasoning"
+  | "tool_call"
+  | "temperature"
+  | "structured_output"
+  | "open_weights"
+
+/// Per-model overrides for provider-level settings.
+class ProviderOverride {
+  client_type: Provider.ClientType?
+
+  base_url: String?
+}
+
+/// Context window and token limits for a model.
+class Limit {
+  /// Maximum context window in tokens.
+  context: Int(isPositive)
+
+  /// Maximum input tokens.
+  input: Int(isPositive)?
+
+  /// Maximum output tokens.
+  output: Int(isPositive)
+}
+
+/// Lifecycle status of a model.
+typealias Status = "alpha" | "beta" | "deprecated"
+
+class Identifier {
+  provider: String
+
+  name: String
+}
