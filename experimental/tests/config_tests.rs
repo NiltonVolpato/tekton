@@ -106,15 +106,22 @@ fn load_config_with_custom_provider() {
 
 #[test]
 fn load_config_unknown_model_returns_error() {
-    let result = load_config(workspace_pkl("unknown-model"), global_dir());
-    assert!(result.is_err());
+    let err = load_config(workspace_pkl("unknown-model"), global_dir()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains(r#"model "claude-nonexistent-9000" not found in provider "anthropic""#),
+        "expected unknown-model error, got: {msg}"
+    );
 }
 
 #[test]
 fn load_config_missing_provider_returns_error() {
-    // Pkl will fail because "nonexistent" is not in the providers catalog
-    let result = load_config(workspace_pkl("missing-provider"), global_dir());
-    assert!(result.is_err());
+    let err = load_config(workspace_pkl("missing-provider"), global_dir()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains(r#"Cannot find key `"nonexistent"`"#),
+        "expected missing-provider error, got: {msg}"
+    );
 }
 
 #[test]
@@ -122,8 +129,12 @@ fn load_config_invalid_pkl_returns_error() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bad.pkl");
     std::fs::write(&path, "this is not valid pkl {{{").unwrap();
-    let result = load_config(&path, global_dir());
-    assert!(result.is_err());
+    let err = load_config(&path, global_dir()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Pkl Error"),
+        "expected Pkl parse error, got: {msg}"
+    );
 }
 
 #[test]
