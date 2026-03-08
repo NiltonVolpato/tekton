@@ -1,3 +1,4 @@
+/// A machine learning model offered by a provider.
 module Model
 
 import "Provider.pkl"
@@ -5,17 +6,22 @@ import "Provider.pkl"
 /// Model identifier used by the AI SDK for lookups.
 id: String(!isEmpty)
 
+/// Human-readable metadata (display name, dates, family).
 metadata: Metadata
 
+/// Feature flags describing what the model supports.
 capabilities: Listing<Capability>
 
+/// Supported input and output modalities.
 modalities: Modalities
 
+/// Context window and token limits.
 limit: Limit
 
 /// Per-model overrides for provider-level settings.
 provider_override: ProviderOverride?
 
+/// Lifecycle status (alpha, beta, deprecated). Null means generally available.
 status: Status?
 
 /// Human-readable metadata about a model.
@@ -26,7 +32,7 @@ class Metadata {
   /// First public release date (YYYY-MM or YYYY-MM-DD).
   release_date: String(matches(Regex(#"^\d{4}-\d{2}(-\d{2})?$"#)))
 
-/// Most recent update date (YYYY-MM or YYYY-MM-DD).
+  /// Most recent update date (YYYY-MM or YYYY-MM-DD).
   last_updated: String(matches(Regex(#"^\d{4}-\d{2}(-\d{2})?$"#)))
 
   /// Knowledge cutoff date (YYYY-MM or YYYY-MM-DD).
@@ -83,8 +89,11 @@ class Limit {
 /// Lifecycle status of a model.
 typealias Status = "alpha" | "beta" | "deprecated"
 
+/// References a specific model by provider ID and model name.
 class Identifier {
+  /// Provider ID (must match a key in the provider catalog).
   provider: String
 
+  /// Model name (must match a key in the provider's models mapping).
   name: String
 }

@@ -1,3 +1,4 @@
+/// An AI model provider (e.g. Anthropic, OpenAI, a local server).
 module Provider
 
 import "Model.pkl"
@@ -5,6 +6,7 @@ import "Model.pkl"
 /// Unique provider identifier (e.g. "anthropic", "openai").
 id: String(!isEmpty)
 
+/// Human-readable metadata (display name, documentation link).
 metadata: ProviderMetadata
 
 /// Determines which client to use for API calls.
@@ -20,6 +22,7 @@ base_url: String?
 /// Models this provider supports, keyed by model ID.
 models: Mapping<String, Model>
 
+/// Human-readable provider metadata.
 class ProviderMetadata {
   /// Display name of the provider.
   name: String(!isEmpty)
@@ -28,4 +31,5 @@ class ProviderMetadata {
   doc: String(!isEmpty)
 }
 
+/// Determines which SDK client to use for API calls.
 typealias ClientType = "Anthropic" | "OpenAI" | "OpenAICompatible" | "Gemini"

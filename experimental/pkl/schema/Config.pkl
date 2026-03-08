@@ -8,12 +8,16 @@ module Config
 import "Agent.pkl"
 import "Provider.pkl"
 
+/// The agent to use when none is specified.
 default_agent: String
 
+/// Named agent configurations, keyed by agent ID.
 agents: Mapping<String, Agent>
 
+/// API credentials, keyed by provider ID.
 credentials: Mapping<String, Credentials> = new {}
 
+/// Full provider catalog (built-in + custom). Not included in output.
 hidden provider_catalog: Mapping<String, Provider>
 
 /// Unique provider IDs referenced by agents.
@@ -61,6 +65,8 @@ providers: Mapping<String, Provider> = let (
     }
   }
 
+/// Authentication credentials for a provider.
 class Credentials {
+  /// API key or token.
   api_key: String(!isEmpty)
 }
