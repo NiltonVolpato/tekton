@@ -15,13 +15,14 @@ typealias ClientType = "Anthropic" | "OpenAI" | "OpenAICompatible" | "Gemini"
 
 class Provider {
   /// Unique provider identifier (e.g. "anthropic", "openai").
-  id: String
+  id: String(!isEmpty)
   metadata: ProviderMetadata
 
   /// Determines which client to use for API calls.
   client_type: ClientType
   /// Environment variables used for auth (e.g. "ANTHROPIC_API_KEY").
-  env: Listing<String>(!isEmpty)
+  /// May be empty for local providers that use credentials directly.
+  env: Listing<String>
   /// Base URL for the API endpoint. Required for OpenAI-compatible providers.
   base_url: String?
   /// Models this provider supports, keyed by model ID.
@@ -90,7 +91,7 @@ typealias ModelStatus = "alpha" | "beta" | "deprecated"
 
 class Model {
   /// Model identifier used by the AI SDK for lookups.
-  id: String
+  id: String(!isEmpty)
   metadata: ModelMetadata
   capabilities: Listing<ModelCapability>
   modalities: Modalities

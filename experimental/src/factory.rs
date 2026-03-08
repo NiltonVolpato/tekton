@@ -27,7 +27,7 @@ fn configure_agent<M: CompletionModel>(
 
 /// Resolve an API key from credentials or environment variables.
 ///
-/// - If a `Credentials` entry exists with an `api_key`, use it (no env fallback).
+/// - If a `Credentials` entry exists, use its `api_key` (always present, no env fallback).
 /// - If no `Credentials` entry exists, try env vars from the provider's `env` list.
 /// - If neither, return an error.
 fn resolve_api_key(
@@ -36,18 +36,8 @@ fn resolve_api_key(
     env: &dyn EnvironmentView,
 ) -> Result<String, FactoryError> {
     if let Some(c) = creds {
-        // Credentials entry exists — api_key must be present.
-        // Having a credentials entry signals explicit configuration;
-        // if the key is missing, that's an error, not a fallback.
-        return match &c.api_key {
-            Some(key) => Ok(key.clone()),
-            None => Err(FactoryError::MissingApiKey {
-                provider: provider.metadata.name.clone(),
-                env: "api_key in credentials".to_string(),
-            }),
-        };
+        return Ok(c.api_key.clone());
     }
-    // No credentials entry — try env vars from catalog
     for var in &provider.env {
         if let Some(key) = env.var(var) {
             return Ok(key);
@@ -84,10 +74,7 @@ pub async fn build_agent(
     let creds = config.credentials.get(&agent_config.model.provider);
     let api_key = resolve_api_key(provider, creds, &RealEnvironment)?;
 
-    // Credential base_url overrides catalog base_url
-    let base_url = creds
-        .and_then(|c| c.base_url.as_deref())
-        .or(provider.base_url.as_deref());
+    let base_url = provider.base_url.as_deref();
 
     let tool = TerminalTool::new()
         .with_name(agent_name)
@@ -160,8 +147,7 @@ mod tests {
     fn resolve_api_key_from_credentials() {
         let provider = test_provider();
         let creds = Credentials {
-            api_key: Some("explicit-key".to_string()),
-            base_url: None,
+            api_key: "explicit-key".to_string(),
         };
         let env = MockEnvironment::new();
         let result = resolve_api_key(&provider, Some(&creds), &env).unwrap();
@@ -169,33 +155,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_api_key_credentials_without_key_is_error() {
+    fn resolve_api_key_credentials_take_precedence_over_env() {
         let provider = test_provider();
         let creds = Credentials {
-            api_key: None,
-            base_url: Some("https://custom.api".to_string()),
+            api_key: "explicit-key".to_string(),
         };
-        let env = MockEnvironment::new();
-        let err = resolve_api_key(&provider, Some(&creds), &env).unwrap_err();
-        let FactoryError::MissingApiKey { provider: p, env: e } = &err else {
-            panic!("expected MissingApiKey, got: {err:?}");
-        };
-        assert_eq!(p, "test-provider");
-        assert_eq!(e, "api_key in credentials");
-    }
-
-    #[test]
-    fn resolve_api_key_credentials_without_key_does_not_fall_back_to_env() {
-        let provider = test_provider();
-        let creds = Credentials {
-            api_key: None,
-            base_url: None,
-        };
-        // Even if the env var is set, having a credentials entry without
-        // api_key should be an error — not a silent fallback.
         let env = MockEnvironment::new().set("PRIMARY_KEY", "env-key");
-        let result = resolve_api_key(&provider, Some(&creds), &env);
-        assert!(result.is_err(), "should not fall back to env var when credentials entry exists");
+        let result = resolve_api_key(&provider, Some(&creds), &env).unwrap();
+        assert_eq!(result, "explicit-key");
     }
 
     #[test]

@@ -81,9 +81,11 @@ mod tests {
 
     #[test]
     fn real_environment_reads_known_var() {
-        // PATH is always set on any Unix-like system
+        let (key, value) = std::env::vars()
+            .next()
+            .expect("no environment variables available");
         let env = RealEnvironment;
-        assert!(env.var("PATH").is_some());
+        assert_eq!(env.var(&key), Some(value));
     }
 
     #[test]

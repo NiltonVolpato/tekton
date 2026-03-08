@@ -5,7 +5,7 @@
 /// models that the configured agents actually reference.
 open module Config
 
-import "models_dev/providers.pkl" as providerConfig
+import "providers.pkl" as providerConfig
 import "providerSchema.pkl"
 
 class ModelIdentifier {
@@ -14,8 +14,7 @@ class ModelIdentifier {
 }
 
 class Credentials {
-  api_key: String?
-  base_url: String?
+  api_key: String(!isEmpty)
 }
 
 class AgentConfig {

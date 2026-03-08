@@ -206,7 +206,6 @@ credentials {
   }
   ["custom"] = new {
     api_key = "custom-key"
-    base_url = "http://localhost:8080/v1"
   }
 }
 
@@ -221,15 +220,10 @@ agents {
 
     let config = load_config(&pkl).unwrap();
     let anthropic_creds = &config.credentials["anthropic"];
-    assert_eq!(anthropic_creds.api_key.as_deref(), Some("sk-ant-test-key"));
-    assert_eq!(anthropic_creds.base_url, None);
+    assert_eq!(anthropic_creds.api_key, "sk-ant-test-key");
 
     let custom_creds = &config.credentials["custom"];
-    assert_eq!(custom_creds.api_key.as_deref(), Some("custom-key"));
-    assert_eq!(
-        custom_creds.base_url.as_deref(),
-        Some("http://localhost:8080/v1")
-    );
+    assert_eq!(custom_creds.api_key, "custom-key");
 }
 
 #[test]
@@ -240,8 +234,8 @@ fn load_config_with_custom_provider() {
     // providers.pkl adds a custom provider with a local model
     write_pkl(
         dir.path(),
-        "models_dev/providers.pkl",
-        r#"amends "providersModelsDev.pkl"
+        "providers.pkl",
+        r#"amends "models_dev/providersModelsDev.pkl"
 
 providers {
   ["my-local"] {
@@ -458,6 +452,7 @@ agents {
             project_config.to_str().unwrap(),
         ])
         .output()
+        // Intentional hard failure: pkl CLI is a required dependency for this test.
         .expect("pkl must be installed");
 
     assert!(

@@ -15,12 +15,11 @@ use common::{write_config_schema, write_pkl};
 fn mock_agent_config(dir: &Path) -> std::path::PathBuf {
     write_config_schema(dir);
 
-    // Add mock provider to the catalog — no api URL here, so
-    // credentials.base_url is the sole source of the endpoint.
+    // Add mock provider to the catalog with the mock server's base_url.
     write_pkl(
         dir,
-        "models_dev/providers.pkl",
-        r#"amends "providersModelsDev.pkl"
+        "providers.pkl",
+        r#"amends "models_dev/providersModelsDev.pkl"
 
 providers {
   ["mock"] {
@@ -30,6 +29,7 @@ providers {
       doc = "https://example.com"
     }
     client_type = "OpenAICompatible"
+    base_url = "http://localhost:8100/v1"
     env {}
     model {
       ["openai"] {
@@ -66,7 +66,6 @@ default_agent = "mock-agent"
 credentials {
   ["mock"] = new {
     api_key = "fake-key"
-    base_url = "http://localhost:8100/v1"
   }
 }
 
@@ -80,6 +79,8 @@ agents {
     )
 }
 
+// These tests require the mock server on localhost:8100 (started by `just test`).
+// They intentionally fail if the server is not running — do not skip or ignore them.
 #[tokio::test]
 async fn integration_prompt() {
     let dir = tempfile::tempdir().unwrap();

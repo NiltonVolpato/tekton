@@ -55,12 +55,12 @@ local function convertModel(raw: Mapping): schema.Model = new schema.Model {
     family = raw.getOrNull("family") as String?
   }
   capabilities = new Listing {
-    when (raw["attachment"] == true) { "attachment" }
-    when (raw["reasoning"] == true) { "reasoning" }
-    when (raw["tool_call"] == true) { "tool_call" }
+    when (raw.getOrNull("attachment") == true) { "attachment" }
+    when (raw.getOrNull("reasoning") == true) { "reasoning" }
+    when (raw.getOrNull("tool_call") == true) { "tool_call" }
     when (raw.getOrNull("temperature") == true) { "temperature" }
     when (raw.getOrNull("structured_output") == true) { "structured_output" }
-    when (raw["open_weights"] == true) { "open_weights" }
+    when (raw.getOrNull("open_weights") == true) { "open_weights" }
   }
   modalities =
     let (rawMod = raw["modalities"] as Mapping)

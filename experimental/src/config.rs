@@ -21,11 +21,9 @@ pub enum ClientType {
 }
 
 /// Provider credentials, separate from the catalog.
-/// Supports explicit API keys and base URL overrides.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Credentials {
-    pub api_key: Option<String>,
-    pub base_url: Option<String>,
+    pub api_key: String,
 }
 
 /// Display name and documentation link for a provider.
