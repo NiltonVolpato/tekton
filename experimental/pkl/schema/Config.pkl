@@ -43,8 +43,10 @@ local modelNamesByProvider: Map<String, Set<String>> = uniqueProviderIds.fold(Ma
 /// Only includes models that agents actually use. Validates model names exist.
 providers: Mapping<String, Provider> = let (
   _ = agents.every((agentName, agent) ->
-    let (provider = provider_catalog[agent.model.provider])
-      if (!provider.models.containsKey(agent.model.name))
+    let (provider = provider_catalog.getOrNull(agent.model.provider))
+      if (provider == null)
+        throw("Agent \"\(agentName)\": provider \"\(agent.model.provider)\" not found in provider catalog. Available providers: \(provider_catalog.keys.toList().join(", "))")
+      else if (!provider.models.containsKey(agent.model.name))
         throw("Agent \"\(agentName)\": model \"\(agent.model.name)\" not found in provider \"\(agent.model.provider)\". Available models: \(provider.models.keys.toList().join(", "))")
       else true
   )

@@ -119,7 +119,7 @@ fn load_config_missing_provider_returns_error() {
     let err = load_config(workspace_pkl("missing-provider"), global_dir()).unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains(r#"Cannot find key `"nonexistent"`"#),
+        msg.contains(r#"provider "nonexistent" not found in provider catalog"#),
         "expected missing-provider error, got: {msg}"
     );
 }
