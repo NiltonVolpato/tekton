@@ -1,0 +1,31 @@
+module config
+
+amends "schema/Config.pkl"
+import "models_dev/providers.pkl"
+
+default_agent = "main"
+
+agents {
+  ["main"] = new {
+    model = new { provider = "anthropic"; name = "claude-sonnet-4-6" }
+    system_prompt = "You are a helpful assistant."
+  }
+}
+
+provider_catalog = (providers.catalog) {
+  ["anthropic"] {
+    id = "anthropic"
+    metadata { name = "Anthropic"; doc = "https://docs.anthropic.com" }
+    client_type = "Anthropic"
+    env { "ANTHROPIC_API_KEY" }
+    models {
+      ["claude-sonnet-4-6"] {
+        id = "claude-sonnet-4-6"
+        metadata { name = "Claude Sonnet 4.6"; release_date = "2025-05"; last_updated = "2025-05" }
+        capabilities { "tool_call"; "temperature" }
+        modalities { input { "text"; "image" }; output { "text" } }
+        limit { context = 200000; output = 8192 }
+      }
+    }
+  }
+}

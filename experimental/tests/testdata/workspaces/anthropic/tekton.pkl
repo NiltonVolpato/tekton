@@ -1,0 +1,12 @@
+amends ".../config.pkl"
+
+default_agent = "test"
+
+agents {
+  ["test"] = new {
+    model = new { provider = "anthropic"; name = "claude-sonnet-4-6" }
+    system_prompt = "You are a test agent."
+    temperature = 0.5
+    max_tokens = 4096
+  }
+}

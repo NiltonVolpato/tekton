@@ -1,25 +1,19 @@
-use std::io::Write;
+use std::path::{Path, PathBuf};
 
-/// Returns the mock server URL.
-/// Panics if TEST_SERVER_URL is not set — use `just test` to run with the mock server.
-#[allow(dead_code)]
-pub fn test_server_url() -> String {
-    std::env::var("TEST_SERVER_URL")
-        .expect("TEST_SERVER_URL not set — run `just test` to start the mock server")
+/// The root of the `experimental` crate (resolved at compile time).
+fn crate_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
-pub fn write_pkl(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
-    let path = dir.join(name);
-    let mut f = std::fs::File::create(&path).unwrap();
-    f.write_all(content.as_bytes()).unwrap();
-    path
+/// The `global:` directory — production Pkl schema and config files.
+pub fn global_dir() -> PathBuf {
+    crate_root().join("pkl")
 }
 
-/// Write the base schema into the temp dir so amending configs can reference it.
-pub fn write_base_schema(dir: &std::path::Path) -> std::path::PathBuf {
-    let schema = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pkl/AgentConfig.pkl"),
-    )
-    .unwrap();
-    write_pkl(dir, "AgentConfig.pkl", &schema)
+/// Path to a workspace's `tekton.pkl` in testdata.
+pub fn workspace_pkl(name: &str) -> PathBuf {
+    crate_root()
+        .join("tests/testdata/workspaces")
+        .join(name)
+        .join("tekton.pkl")
 }

@@ -1,0 +1,10 @@
+amends ".../config.pkl"
+
+default_agent = "test"
+
+agents {
+  ["test"] = new {
+    model = new { provider = "anthropic"; name = "claude-nonexistent-9000" }
+    system_prompt = "hello"
+  }
+}

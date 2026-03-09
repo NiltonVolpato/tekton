@@ -6,18 +6,19 @@ use tekton_experimental::{build_agent, load_config, StreamEvent};
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Usage: cargo run --example agent-factory -- <config.pkl>");
+    if args.len() != 3 {
+        eprintln!("Usage: cargo run --example agent_factory -- <config.pkl> <global-dir>");
         std::process::exit(1);
     }
 
-    let config = load_config(&args[1]).unwrap_or_else(|e| {
+    let config = load_config(&args[1], &args[2]).unwrap_or_else(|e| {
         eprintln!("Failed to load config: {e}");
         std::process::exit(1);
     });
 
-    eprintln!("Building agent '{}'...", config.name);
-    let agent = build_agent(&config).await.unwrap_or_else(|e| {
+    let agent_name = &config.default_agent;
+    eprintln!("Building agent '{agent_name}'...");
+    let agent = build_agent(&config, agent_name).await.unwrap_or_else(|e| {
         eprintln!("Failed to build agent: {e}");
         std::process::exit(1);
     });

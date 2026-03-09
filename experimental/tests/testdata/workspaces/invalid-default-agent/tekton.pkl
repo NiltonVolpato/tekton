@@ -1,0 +1,10 @@
+amends ".../config.pkl"
+
+default_agent = "nonexistent"
+
+agents {
+  ["test"] = new {
+    model = new { provider = "anthropic"; name = "claude-sonnet-4-6" }
+    system_prompt = "You are a test agent."
+  }
+}

@@ -1,0 +1,76 @@
+/// Shared test configuration.
+///
+/// Provides a test provider catalog with a small set of providers.
+/// Workspace configs amend this via `amends ".../config.pkl"`.
+amends "global:/schema/Config.pkl"
+
+provider_catalog {
+  ["anthropic"] = new {
+    id = "anthropic"
+    metadata { name = "Anthropic"; doc = "https://docs.anthropic.com" }
+    client_type = "Anthropic"
+    env { "ANTHROPIC_API_KEY" }
+    models {
+      ["claude-sonnet-4-6"] = new {
+        id = "claude-sonnet-4-6"
+        metadata { name = "Claude Sonnet 4.6"; release_date = "2025-01"; last_updated = "2025-01" }
+        capabilities {}
+        modalities { input { "text" }; output { "text" } }
+        limit { context = 200000; output = 8192 }
+      }
+      ["claude-haiku-4-5"] = new {
+        id = "claude-haiku-4-5"
+        metadata { name = "Claude Haiku 4.5"; release_date = "2025-01"; last_updated = "2025-01" }
+        capabilities {}
+        modalities { input { "text" }; output { "text" } }
+        limit { context = 200000; output = 8192 }
+      }
+    }
+  }
+  ["openai"] = new {
+    id = "openai"
+    metadata { name = "OpenAI"; doc = "https://platform.openai.com/docs" }
+    client_type = "OpenAI"
+    env { "OPENAI_API_KEY" }
+    models {
+      ["gpt-5.3-codex"] = new {
+        id = "gpt-5.3-codex"
+        metadata { name = "GPT-5.3 Codex"; release_date = "2025-01"; last_updated = "2025-01" }
+        capabilities {}
+        modalities { input { "text" }; output { "text" } }
+        limit { context = 200000; output = 8192 }
+      }
+    }
+  }
+  ["openrouter"] = new {
+    id = "openrouter"
+    metadata { name = "OpenRouter"; doc = "https://openrouter.ai/docs" }
+    client_type = "OpenAICompatible"
+    base_url = "https://openrouter.ai/api/v1"
+    env { "OPENROUTER_API_KEY" }
+    models {
+      ["llama-3.3-70b"] = new {
+        id = "llama-3.3-70b"
+        metadata { name = "Llama 3.3 70B"; release_date = "2025-01"; last_updated = "2025-01" }
+        capabilities {}
+        modalities { input { "text" }; output { "text" } }
+        limit { context = 200000; output = 8192 }
+      }
+    }
+  }
+  ["google"] = new {
+    id = "google"
+    metadata { name = "Google"; doc = "https://ai.google.dev/docs" }
+    client_type = "Gemini"
+    env { "GEMINI_API_KEY" }
+    models {
+      ["gemini-3.1-pro"] = new {
+        id = "gemini-3.1-pro"
+        metadata { name = "Gemini 3.1 Pro"; release_date = "2025-01"; last_updated = "2025-01" }
+        capabilities {}
+        modalities { input { "text" }; output { "text" } }
+        limit { context = 200000; output = 8192 }
+      }
+    }
+  }
+}

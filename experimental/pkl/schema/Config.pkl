@@ -1,0 +1,74 @@
+/// Top-level configuration template for Tekton.
+///
+/// Users amend this module to define agents, credentials, and model assignments.
+/// The `providers` property is auto-computed: it collects only the providers and
+/// models that the configured agents actually reference.
+module Config
+
+import "Agent.pkl"
+import "Provider.pkl"
+
+/// The agent to use when none is specified.
+default_agent: String(agents.containsKey(this))
+
+/// Named agent configurations, keyed by agent ID.
+agents: Mapping<String, Agent>
+
+/// API credentials, keyed by provider ID.
+credentials: Mapping<String, Credentials> = new {}
+
+/// Full provider catalog (built-in + custom). Not included in output.
+hidden provider_catalog: Mapping<String, Provider>
+
+/// Unique provider IDs referenced by agents.
+local uniqueProviderIds: Set<String> = new Listing {
+  for (_name, agent in agents) {
+    agent.model.provider
+  }
+}.toList().toSet()
+
+/// Model names referenced by agents, grouped by provider ID.
+local modelNamesByProvider: Map<String, Set<String>> = uniqueProviderIds.fold(Map(), (acc, providerId) ->
+  let (names = new Listing {
+    for (_name, agent in agents) {
+      when (agent.model.provider == providerId) {
+        agent.model.name
+      }
+    }
+  }.toList().toSet())
+    acc.put(providerId, names)
+)
+
+/// Auto-computed: deduplicated providers referenced by agents.
+/// Only includes models that agents actually use. Validates model names exist.
+providers: Mapping<String, Provider> = let (
+  _ = agents.every((agentName, agent) ->
+    let (provider = provider_catalog.getOrNull(agent.model.provider))
+      if (provider == null)
+        throw("Agent \"\(agentName)\": provider \"\(agent.model.provider)\" not found in provider catalog. Available providers: \(provider_catalog.keys.toList().join(", "))")
+      else if (!provider.models.containsKey(agent.model.name))
+        throw("Agent \"\(agentName)\": model \"\(agent.model.name)\" not found in provider \"\(agent.model.provider)\". Available models: \(provider.models.keys.toList().join(", "))")
+      else true
+  )
+)
+  new Mapping {
+    for (providerId in uniqueProviderIds) {
+      [providerId] = let (fullProvider = provider_catalog[providerId])
+        let (usedModelNames = modelNamesByProvider[providerId])
+          (fullProvider) {
+            models = new Mapping {
+              for (modelName, m in fullProvider.models) {
+                when (usedModelNames.contains(modelName)) {
+                  [modelName] = m
+                }
+              }
+            }
+          }
+    }
+  }
+
+/// Authentication credentials for a provider.
+class Credentials {
+  /// API key or token.
+  api_key: String(!isEmpty)
+}

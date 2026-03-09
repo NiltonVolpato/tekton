@@ -1,0 +1,19 @@
+/// Configuration for a single AI agent.
+module Agent
+
+import "Model.pkl"
+
+/// Which provider and model this agent uses.
+model: Model.Identifier
+
+/// Instructions given to the model at the start of each conversation.
+system_prompt: String
+
+/// Sampling temperature (0.0 = deterministic, 2.0 = maximum randomness).
+temperature: Float(isBetween(0.0, 2.0))?
+
+/// Maximum number of tokens the model may generate per response.
+max_tokens: Int(isPositive)?
+
+/// Maximum number of conversation turns before stopping.
+max_turns: Int(isPositive) = 20

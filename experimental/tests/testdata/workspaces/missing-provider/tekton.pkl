@@ -1,0 +1,10 @@
+amends ".../config.pkl"
+
+default_agent = "test"
+
+agents {
+  ["test"] = new {
+    model = new { provider = "nonexistent"; name = "some-model" }
+    system_prompt = "hello"
+  }
+}

@@ -1,0 +1,11 @@
+amends ".../config.pkl"
+
+default_agent = "gem"
+
+agents {
+  ["gem"] = new {
+    model = new { provider = "google"; name = "gemini-3.1-pro" }
+    system_prompt = "You are a Gemini agent."
+    temperature = 1.0
+  }
+}
