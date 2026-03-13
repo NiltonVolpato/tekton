@@ -4,7 +4,7 @@ nextest_args := "--status-level fail --show-progress none --no-output-indent --c
 mock_server_config_dir := justfile_directory() / "experimental/tests/testdata/config"
 mock_server_pid_file := "/tmp/mock-server.pid"
 
-# Runs all tests. Examples: just test, just test -p my-crate, just test -E 'test(foo)'
+# Runs all tests. Any additional argument works, but may need double escaping: just test -E 'test\(foo\)'
 [group('test')]
 test +args='--workspace': _mock-server-start && _mock-server-stop
     cargo nextest run {{ nextest_args }} {{ args }}
