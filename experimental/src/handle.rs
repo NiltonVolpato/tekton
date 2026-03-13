@@ -64,7 +64,10 @@ pub(crate) fn map_chunk<R>(
         }
         Err(e) => Some(Err(e)),
         // TODO: do not silently skip other items (final response, deltas, reasoning)
-        _ => None,
+        Ok(_) => {
+            tracing::debug!("ignoring unexpected stream item");
+            None
+        }
     }
 }
 
@@ -170,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn map_chunk_tool_result_event() {
+    fn map_chunk_tool_result_event_fallback_to_id() {
         use rig::completion::message::{ToolResult, ToolResultContent};
         use rig::one_or_many::OneOrMany;
 
@@ -188,13 +191,41 @@ mod tests {
         );
         let result = map_chunk(item);
         let event = result.expect("should be Some").expect("should be Ok");
-        match event {
-            StreamEvent::ToolResult { call_id, content } => {
-                assert_eq!(call_id, "id");
-                assert_eq!(content, "result");
+        assert_eq!(
+            event,
+            StreamEvent::ToolResult {
+                call_id: "id".to_string(),
+                content: "result".to_string(),
             }
-            other => panic!("expected ToolResult, got {other:?}"),
-        }
+        );
+    }
+
+    #[test]
+    fn map_chunk_tool_result_event_prefers_call_id() {
+        use rig::completion::message::{ToolResult, ToolResultContent};
+        use rig::one_or_many::OneOrMany;
+
+        let item: Result<MultiTurnStreamItem<()>, StreamingError> = Ok(
+            MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
+                tool_result: ToolResult {
+                    id: "id".to_string(),
+                    call_id: Some("provider_call".to_string()),
+                    content: OneOrMany::one(ToolResultContent::Text(Text {
+                        text: "result".to_string(),
+                    })),
+                },
+                internal_call_id: "internal".to_string(),
+            }),
+        );
+        let result = map_chunk(item);
+        let event = result.expect("should be Some").expect("should be Ok");
+        assert_eq!(
+            event,
+            StreamEvent::ToolResult {
+                call_id: "provider_call".to_string(),
+                content: "result".to_string(),
+            }
+        );
     }
 
     #[test]

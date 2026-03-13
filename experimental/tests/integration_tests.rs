@@ -59,12 +59,22 @@ async fn integration_tool_call_stream() {
     use futures::StreamExt;
     use tekton_experimental::StreamEvent;
 
-    let events: Vec<StreamEvent> = agent
-        .stream_chat("Hello", vec![])
-        .await
-        .map(|e| e.expect("stream returned an error"))
-        .collect()
-        .await;
+    let events: Vec<StreamEvent> = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        agent
+            .stream_chat("Hello", vec![])
+            .await
+            .map(|e| e.expect("stream returned an error"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("stream collection timed out after 10s");
+
+    assert!(
+        events.len() >= 3,
+        "expected at least 3 events (ToolCall, ToolResult, Text), got {}",
+        events.len()
+    );
 
     // First event: tool call to terminal with known id.
     assert_eq!(
@@ -80,7 +90,9 @@ async fn integration_tool_call_stream() {
     match &events[1] {
         StreamEvent::ToolResult { call_id, content } => {
             assert_eq!(call_id, "call_1");
-            assert!(content.contains("\"exit_code\":0"), "expected successful exit: {content}");
+            let parsed: serde_json::Value =
+                serde_json::from_str(content).expect("tool result content should be valid JSON");
+            assert_eq!(parsed["outcome"]["exit_code"], 0, "expected successful exit: {content}");
         }
         other => panic!("expected ToolResult as second event, got {other:?}"),
     }
