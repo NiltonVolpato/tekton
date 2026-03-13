@@ -49,8 +49,11 @@ async fn main() {
                     io::stdout().flush().unwrap();
                     response.push_str(&text);
                 }
-                Ok(StreamEvent::ToolCall { name, args }) => {
-                    eprintln!("\n[tool: {name}({args})]");
+                Ok(StreamEvent::ToolCall { id, name, args }) => {
+                    eprintln!("\n[tool call {id}: {name}({args})]");
+                }
+                Ok(StreamEvent::ToolResult { call_id, content }) => {
+                    eprintln!("\n[tool result {call_id}]: {content}");
                 }
                 Err(e) => {
                     eprintln!("\nStream error: {e}");

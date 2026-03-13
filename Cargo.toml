@@ -13,6 +13,9 @@ authors = ["Nilton Volpato <nilton@volpa.to>"]
 repository = "https://github.com/NiltonVolpato/tekton"
 readme = "README.md"
 
+[workspace.dependencies]
+tracing = { version = "0.1", default-features = false, features = ["release_max_level_debug"] }
+
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
