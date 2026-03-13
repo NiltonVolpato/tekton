@@ -5,7 +5,7 @@ use rig::agent::{Agent, MultiTurnStreamItem, StreamingError};
 use rig::completion::PromptError;
 use rig::message::Message;
 use rig::providers::{anthropic, gemini, openai};
-use rig::streaming::StreamedAssistantContent;
+use rig::streaming::{StreamedAssistantContent, StreamedUserContent};
 
 pub enum AgentHandle {
     Anthropic(Agent<anthropic::completion::CompletionModel>),
@@ -17,30 +17,53 @@ pub enum AgentHandle {
 #[derive(Debug)]
 pub enum StreamEvent {
     Text(String),
-    ToolCall { name: String, args: serde_json::Value },
+    ToolCall {
+        name: String,
+        args: serde_json::Value,
+    },
+    ToolResult {
+        id: String,
+        content: String,
+    },
 }
 
-pub type TextStream =
-    Pin<Box<dyn Stream<Item = Result<StreamEvent, StreamingError>> + Send>>;
+pub type TextStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, StreamingError>> + Send>>;
 
 pub(crate) fn map_chunk<R>(
     item: Result<MultiTurnStreamItem<R>, StreamingError>,
 ) -> Option<Result<StreamEvent, StreamingError>> {
     match item {
-        Ok(MultiTurnStreamItem::StreamAssistantItem(
-            StreamedAssistantContent::Text(text),
-        )) => Some(Ok(StreamEvent::Text(text.text))),
-        Ok(MultiTurnStreamItem::StreamAssistantItem(
-            StreamedAssistantContent::ToolCall {
-                tool_call,
-                internal_call_id: _,
-            },
-        )) => Some(Ok(StreamEvent::ToolCall {
+        Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
+            Some(Ok(StreamEvent::Text(text.text)))
+        }
+        Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+            tool_call,
+            internal_call_id: _,
+        })) => Some(Ok(StreamEvent::ToolCall {
             name: tool_call.function.name,
             args: tool_call.function.arguments,
         })),
+        Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
+            tool_result,
+            internal_call_id: _,
+        })) => {
+            use rig::completion::message::ToolResultContent;
+            let content = tool_result
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    ToolResultContent::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            Some(Ok(StreamEvent::ToolResult {
+                id: tool_result.id,
+                content,
+            }))
+        }
         Err(e) => Some(Err(e)),
-        // Skip other items (user items, final response, deltas, reasoning)
+        // TODO: do not silently skip other items (final response, deltas, reasoning)
         _ => None,
     }
 }
@@ -66,11 +89,7 @@ impl AgentHandle {
     /// # Errors
     ///
     /// Returns [`PromptError`] if the provider request fails.
-    pub async fn chat(
-        &self,
-        prompt: &str,
-        history: Vec<Message>,
-    ) -> Result<String, PromptError> {
+    pub async fn chat(&self, prompt: &str, history: Vec<Message>) -> Result<String, PromptError> {
         use rig::completion::Chat;
         match self {
             Self::Anthropic(a) => a.chat(prompt, history).await,
@@ -80,11 +99,7 @@ impl AgentHandle {
         }
     }
 
-    pub async fn stream_chat(
-        &self,
-        prompt: &str,
-        history: Vec<Message>,
-    ) -> TextStream {
+    pub async fn stream_chat(&self, prompt: &str, history: Vec<Message>) -> TextStream {
         use futures::StreamExt;
         use rig::streaming::StreamingChat;
 
@@ -117,33 +132,31 @@ mod tests {
 
     #[test]
     fn map_chunk_text_event() {
-        let item: Result<MultiTurnStreamItem<()>, StreamingError> =
-            Ok(MultiTurnStreamItem::StreamAssistantItem(
-                StreamedAssistantContent::Text(Text {
-                    text: "hello".to_string(),
-                }),
-            ));
+        let item: Result<MultiTurnStreamItem<()>, StreamingError> = Ok(
+            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(Text {
+                text: "hello".to_string(),
+            })),
+        );
         let result = map_chunk(item);
         let event = result.expect("should be Some").expect("should be Ok");
         match event {
             StreamEvent::Text(t) => assert_eq!(t, "hello"),
-            StreamEvent::ToolCall { .. } => panic!("expected Text, got ToolCall"),
+            other => panic!("expected Text, got {other:?}"),
         }
     }
 
     #[test]
     fn map_chunk_tool_call_event() {
         let args = serde_json::json!({"key": "value"});
-        let item: Result<MultiTurnStreamItem<()>, StreamingError> =
-            Ok(MultiTurnStreamItem::StreamAssistantItem(
-                StreamedAssistantContent::ToolCall {
-                    tool_call: ToolCall::new(
-                        "call-1".to_string(),
-                        ToolFunction::new("my_tool".to_string(), args.clone()),
-                    ),
-                    internal_call_id: "internal-1".to_string(),
-                },
-            ));
+        let item: Result<MultiTurnStreamItem<()>, StreamingError> = Ok(
+            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+                tool_call: ToolCall::new(
+                    "call-1".to_string(),
+                    ToolFunction::new("my_tool".to_string(), args.clone()),
+                ),
+                internal_call_id: "internal-1".to_string(),
+            }),
+        );
         let result = map_chunk(item);
         let event = result.expect("should be Some").expect("should be Ok");
         match event {
@@ -151,29 +164,36 @@ mod tests {
                 assert_eq!(name, "my_tool");
                 assert_eq!(a, args);
             }
-            StreamEvent::Text(_) => panic!("expected ToolCall, got Text"),
+            other => panic!("expected ToolCall, got {other:?}"),
         }
     }
 
     #[test]
-    fn map_chunk_filters_user_items() {
+    fn map_chunk_tool_result_event() {
         use rig::completion::message::{ToolResult, ToolResultContent};
         use rig::one_or_many::OneOrMany;
 
-        let item: Result<MultiTurnStreamItem<()>, StreamingError> =
-            Ok(MultiTurnStreamItem::StreamUserItem(
-                StreamedUserContent::ToolResult {
-                    tool_result: ToolResult {
-                        id: "id".to_string(),
-                        call_id: None,
-                        content: OneOrMany::one(ToolResultContent::Text(Text {
-                            text: "result".to_string(),
-                        })),
-                    },
-                    internal_call_id: "internal".to_string(),
+        let item: Result<MultiTurnStreamItem<()>, StreamingError> = Ok(
+            MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
+                tool_result: ToolResult {
+                    id: "id".to_string(),
+                    call_id: None,
+                    content: OneOrMany::one(ToolResultContent::Text(Text {
+                        text: "result".to_string(),
+                    })),
                 },
-            ));
-        assert!(map_chunk(item).is_none());
+                internal_call_id: "internal".to_string(),
+            }),
+        );
+        let result = map_chunk(item);
+        let event = result.expect("should be Some").expect("should be Ok");
+        match event {
+            StreamEvent::ToolResult { id, content } => {
+                assert_eq!(id, "id");
+                assert_eq!(content, "result");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
     }
 
     #[test]
@@ -200,14 +220,13 @@ mod tests {
     fn map_chunk_filters_tool_call_delta() {
         use rig::streaming::ToolCallDeltaContent;
 
-        let item: Result<MultiTurnStreamItem<()>, StreamingError> =
-            Ok(MultiTurnStreamItem::StreamAssistantItem(
-                StreamedAssistantContent::ToolCallDelta {
-                    id: "id".to_string(),
-                    internal_call_id: "internal".to_string(),
-                    content: ToolCallDeltaContent::Delta("chunk".to_string()),
-                },
-            ));
+        let item: Result<MultiTurnStreamItem<()>, StreamingError> = Ok(
+            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCallDelta {
+                id: "id".to_string(),
+                internal_call_id: "internal".to_string(),
+                content: ToolCallDeltaContent::Delta("chunk".to_string()),
+            }),
+        );
         assert!(map_chunk(item).is_none());
     }
 
@@ -215,9 +234,8 @@ mod tests {
     fn map_chunk_filters_reasoning() {
         use rig::completion::message::Reasoning;
 
-        let reasoning: Reasoning =
-            serde_json::from_value(serde_json::json!({"content": []}))
-                .expect("should deserialize Reasoning");
+        let reasoning: Reasoning = serde_json::from_value(serde_json::json!({"content": []}))
+            .expect("should deserialize Reasoning");
         let item: Result<MultiTurnStreamItem<()>, StreamingError> =
             Ok(MultiTurnStreamItem::StreamAssistantItem(
                 StreamedAssistantContent::Reasoning(reasoning),
@@ -227,13 +245,12 @@ mod tests {
 
     #[test]
     fn map_chunk_filters_reasoning_delta() {
-        let item: Result<MultiTurnStreamItem<()>, StreamingError> =
-            Ok(MultiTurnStreamItem::StreamAssistantItem(
-                StreamedAssistantContent::ReasoningDelta {
-                    id: None,
-                    reasoning: "thinking...".to_string(),
-                },
-            ));
+        let item: Result<MultiTurnStreamItem<()>, StreamingError> = Ok(
+            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ReasoningDelta {
+                id: None,
+                reasoning: "thinking...".to_string(),
+            }),
+        );
         assert!(map_chunk(item).is_none());
     }
 
@@ -242,8 +259,7 @@ mod tests {
         use rig::completion::CompletionError;
 
         // Create a CompletionError via JsonError variant
-        let json_err: serde_json::Error =
-            serde_json::from_str::<()>("invalid").unwrap_err();
+        let json_err: serde_json::Error = serde_json::from_str::<()>("invalid").unwrap_err();
         let completion_err = CompletionError::from(json_err);
         let streaming_err = StreamingError::from(completion_err);
 
@@ -251,7 +267,10 @@ mod tests {
         let result = map_chunk(item);
         let err = result.expect("should be Some").unwrap_err();
         assert!(
-            matches!(err, StreamingError::Completion(CompletionError::JsonError(_))),
+            matches!(
+                err,
+                StreamingError::Completion(CompletionError::JsonError(_))
+            ),
             "expected StreamingError::Completion(CompletionError::JsonError(_)), got: {err:?}"
         );
     }

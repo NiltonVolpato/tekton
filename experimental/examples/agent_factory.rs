@@ -50,10 +50,13 @@ async fn main() {
                     response.push_str(&text);
                 }
                 Ok(StreamEvent::ToolCall { name, args }) => {
-                    eprintln!("\n[tool: {name}({args})]");
+                    eprintln!("[tool call: {name}({args})]");
+                }
+                Ok(StreamEvent::ToolResult { id, content }) => {
+                    eprintln!("[tool result {id}]: {content}");
                 }
                 Err(e) => {
-                    eprintln!("\nStream error: {e}");
+                    eprintln!("Stream error: {e}");
                     break;
                 }
             }

@@ -1,0 +1,62 @@
+{% set has_tool_result = false %}
+{% for msg in json.messages %}
+  {% if msg.role == "tool" %}
+    {% set_global has_tool_result = true %}
+  {% endif %}
+{% endfor %}
+{% if has_tool_result %}
+{
+  "id": "chatcmpl-text",
+  "object": "chat.completion",
+  "created": {{ timestamp() }},
+  "model": "{{ model }}",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "The result of the computation is 2."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 10,
+    "total_tokens": 20
+  }
+}
+{% else %}
+{
+  "id": "chatcmpl-tool",
+  "object": "chat.completion",
+  "created": {{ timestamp() }},
+  "model": "{{ model }}",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "index": 0,
+            "id": "call_{{ random_int(min=1000, max=9999) }}",
+            "type": "function",
+            "function": {
+              "name": "terminal",
+              "arguments": "{\"command\": \"echo $(( 1 + 1 ))\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 10,
+    "total_tokens": 20
+  }
+}
+{% endif %}
