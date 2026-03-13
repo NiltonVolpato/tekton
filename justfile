@@ -44,21 +44,25 @@ generate-providers:
     cd experimental/pkl/models_dev && pkl run generate-providers.pkl -- --output providers.pkl
 
 [group('demo')]
-mock-tool-call: _mock-server-start && _mock-server-stop
+mock-tool-call: (_mock-server-start '1h') && _mock-server-stop
     cargo run -p tekton-experimental --example agent_factory --quiet -- \
         experimental/tests/testdata/workspaces/mock-tool-call/tekton.pkl \
         experimental/pkl
 
 # Start mock server in background, wait for readiness
-_mock-server-start:
+_mock-server-start mock-server-timeout='5m':
     #!/usr/bin/env bash
     set -euo pipefail
     if ! command -v vidaimock &>/dev/null; then
         echo "ERROR: vidaimock not found. Install with: cargo install --git https://github.com/vidaiUK/VidaiMock" >&2
         exit 1
     fi
-    cleanup() { kill "$(cat "{{ mock_server_pid_file }}")" 2>/dev/null || true; rm -f "{{ mock_server_pid_file }}"; }
-    vidaimock --config-dir "{{ mock_server_config_dir }}" &
+    cleanup() { pkill -F "{{ mock_server_pid_file }}" vidaimock 2>/dev/null || true; rm -f "{{ mock_server_pid_file }}"; }
+    if command -v timeout &>/dev/null; then
+        timeout "{{ mock-server-timeout }}" vidaimock --config-dir "{{ mock_server_config_dir }}" &
+    else
+        vidaimock --config-dir "{{ mock_server_config_dir }}" &
+    fi
     echo $! > "{{ mock_server_pid_file }}"
     for i in $(seq 1 30); do
         if curl -sf http://localhost:8100/health > /dev/null 2>&1; then
@@ -74,6 +78,7 @@ _mock-server-start:
 _mock-server-stop:
     #!/usr/bin/env bash
     if [ -f "{{ mock_server_pid_file }}" ]; then
-        kill "$(cat "{{ mock_server_pid_file }}")" 2>/dev/null || true
+        pkill -F "{{ mock_server_pid_file }}" vidaimock 2>/dev/null || true
         rm -f "{{ mock_server_pid_file }}"
     fi
+    echo "Mock server stopped"
