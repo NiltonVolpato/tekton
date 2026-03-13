@@ -61,33 +61,55 @@ async fn integration_tool_call_stream() {
 
     let mut stream = agent.stream_chat("Hello", vec![]).await;
 
-    let mut tool_calls = Vec::new();
-    let mut tool_results = Vec::new();
-    let mut full_response = String::new();
+    #[derive(Debug)]
+    enum Event {
+        ToolCall { id: String, name: String, args: serde_json::Value },
+        ToolResult { call_id: String },
+        Text(String),
+    }
+
+    let mut events = Vec::new();
 
     while let Some(event) = stream.next().await {
         match event {
-            Ok(StreamEvent::Text(t)) => full_response.push_str(&t),
-            Ok(StreamEvent::ToolCall { name, args }) => {
-                tool_calls.push((name, args));
+            Ok(StreamEvent::Text(t)) => events.push(Event::Text(t)),
+            Ok(StreamEvent::ToolCall { id, name, args }) => {
+                events.push(Event::ToolCall { id, name, args });
             }
-            Ok(StreamEvent::ToolResult { id, content }) => {
-                tool_results.push((id, content));
+            Ok(StreamEvent::ToolResult { call_id, content: _ }) => {
+                events.push(Event::ToolResult { call_id });
             }
             Err(e) => panic!("stream returned an error: {e}"),
         }
     }
 
-    // The mock returns one tool call to the terminal tool.
-    assert_eq!(tool_calls.len(), 1);
-    assert_eq!(tool_calls[0].0, "terminal");
-    assert_eq!(
-        tool_calls[0].1,
-        serde_json::json!({"command": "echo $(( 1 + 1 ))"})
-    );
+    // Extract events by type in order.
+    let tool_call = events.iter().find_map(|e| match e {
+        Event::ToolCall { id, name, args } => Some((id, name, args)),
+        _ => None,
+    }).expect("expected a ToolCall event");
+    let tool_result = events.iter().find_map(|e| match e {
+        Event::ToolResult { call_id } => Some(call_id),
+        _ => None,
+    }).expect("expected a ToolResult event");
+    let full_response: String = events.iter().filter_map(|e| match e {
+        Event::Text(t) => Some(t.as_str()),
+        _ => None,
+    }).collect();
 
-    // The terminal tool should produce one result.
-    assert_eq!(tool_results.len(), 1);
+    // Verify the tool call.
+    assert_eq!(tool_call.1, "terminal");
+    assert_eq!(*tool_call.2, serde_json::json!({"command": "echo $(( 1 + 1 ))"}));
+
+    // The tool result's call_id must match the tool call's id.
+    assert_eq!(tool_result, tool_call.0);
+
+    // Ordering: ToolCall appears before ToolResult, which appears before Text.
+    let call_pos = events.iter().position(|e| matches!(e, Event::ToolCall { .. })).unwrap();
+    let result_pos = events.iter().position(|e| matches!(e, Event::ToolResult { .. })).unwrap();
+    let text_pos = events.iter().position(|e| matches!(e, Event::Text(_))).unwrap();
+    assert!(call_pos < result_pos, "ToolCall must come before ToolResult");
+    assert!(result_pos < text_pos, "ToolResult must come before Text");
 
     // After the tool result, the mock returns a text response.
     assert_eq!(full_response.trim_end(), MOCK_TOOL_CALL_TEXT_RESPONSE);

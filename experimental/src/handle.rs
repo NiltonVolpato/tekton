@@ -18,11 +18,12 @@ pub enum AgentHandle {
 pub enum StreamEvent {
     Text(String),
     ToolCall {
+        id: String,
         name: String,
         args: serde_json::Value,
     },
     ToolResult {
-        id: String,
+        call_id: String,
         content: String,
     },
 }
@@ -40,6 +41,7 @@ pub(crate) fn map_chunk<R>(
             tool_call,
             internal_call_id: _,
         })) => Some(Ok(StreamEvent::ToolCall {
+            id: tool_call.id,
             name: tool_call.function.name,
             args: tool_call.function.arguments,
         })),
@@ -51,14 +53,14 @@ pub(crate) fn map_chunk<R>(
             let content = tool_result
                 .content
                 .iter()
-                .filter_map(|c| match c {
-                    ToolResultContent::Text(t) => Some(t.text.as_str()),
-                    _ => None,
+                .map(|c| match c {
+                    ToolResultContent::Text(t) => t.text.as_str().into(),
+                    ToolResultContent::Image(_) => "[image]".into(),
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<std::borrow::Cow<'_, str>>>()
                 .join("");
             Some(Ok(StreamEvent::ToolResult {
-                id: tool_result.id,
+                call_id: tool_result.id,
                 content,
             }))
         }
@@ -160,7 +162,8 @@ mod tests {
         let result = map_chunk(item);
         let event = result.expect("should be Some").expect("should be Ok");
         match event {
-            StreamEvent::ToolCall { name, args: a } => {
+            StreamEvent::ToolCall { id, name, args: a } => {
+                assert_eq!(id, "call-1");
                 assert_eq!(name, "my_tool");
                 assert_eq!(a, args);
             }
@@ -188,8 +191,8 @@ mod tests {
         let result = map_chunk(item);
         let event = result.expect("should be Some").expect("should be Ok");
         match event {
-            StreamEvent::ToolResult { id, content } => {
-                assert_eq!(id, "id");
+            StreamEvent::ToolResult { call_id, content } => {
+                assert_eq!(call_id, "id");
                 assert_eq!(content, "result");
             }
             other => panic!("expected ToolResult, got {other:?}"),

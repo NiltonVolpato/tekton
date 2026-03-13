@@ -6,6 +6,6 @@ stream:
   format: '{{ chunk }}'
   lifecycle:
     on_chunk:
-       template_body: '{"id":"chatcmpl-mock","object":"chat.completion.chunk","created":1699000000,"model":"{{ model }}","choices":[{"index":0,"delta":{% if chunk is string %}{"content":"{{ chunk }}"},"finish_reason":null{% else %}{"tool_calls":{{ chunk | json_encode() }}},"finish_reason":"tool_calls"{% endif %}}]}'
+       template_body: '{"id":"chatcmpl-mock","object":"chat.completion.chunk","created":1699000000,"model":"{{ model }}","choices":[{"index":0,"delta":{% if chunk is string %}{"content":{{ chunk | json_encode() }}},"finish_reason":null{% else %}{"tool_calls":{{ chunk | json_encode() }}},"finish_reason":"tool_calls"{% endif %}}]}'
     on_stop:
        template_body: '[DONE]'

@@ -1,10 +1,5 @@
-{% set has_tool_result = false %}
-{% for msg in json.messages %}
-  {% if msg.role == "tool" %}
-    {% set_global has_tool_result = true %}
-  {% endif %}
-{% endfor %}
-{% if has_tool_result %}
+{% set last_msg = json.messages | last %}
+{% if last_msg.role == "tool" %}
 {
   "id": "chatcmpl-text",
   "object": "chat.completion",

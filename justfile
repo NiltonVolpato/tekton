@@ -3,13 +3,9 @@
 # If `timeout` is not available, install with `brew install coreutils` on Mac.
 # If `vidaimock` is not available, install with `cargo install --git https://github.com/vidaiUK/VidaiMock`.
 
-timeout := require("timeout")
-vidaimock := require("vidaimock")
 nextest_args := "--status-level fail --show-progress none --no-output-indent --cargo-quiet"
 mock_server_config_dir := justfile_directory() / "experimental/tests/testdata/config"
 mock_server_pid_file := "/tmp/mock-server.pid"
-
-# Default: run all tests (starts mock server automatically)
 
 # Runs all tests. Examples: just test, just test -p my-crate, just test -E 'test(foo)'
 [group('test')]
@@ -60,9 +56,17 @@ mock-tool-call: _mock-server-start && _mock-server-stop
 _mock-server-start:
     #!/usr/bin/env bash
     set -euo pipefail
-    cleanup() { kill "$(cat {{ mock_server_pid_file }})" 2>/dev/null || true; rm -f {{ mock_server_pid_file }}; }
-    {{ timeout }} 5m {{ vidaimock }} --config-dir {{ mock_server_config_dir }} &
-    echo $! > {{ mock_server_pid_file }}
+    if ! command -v vidaimock &>/dev/null; then
+        echo "ERROR: vidaimock not found. Install with: cargo install --git https://github.com/vidaiUK/VidaiMock" >&2
+        exit 1
+    fi
+    cleanup() { kill "$(cat "{{ mock_server_pid_file }}")" 2>/dev/null || true; rm -f "{{ mock_server_pid_file }}"; }
+    if command -v timeout &>/dev/null; then
+        timeout 5m vidaimock --config-dir "{{ mock_server_config_dir }}" &
+    else
+        vidaimock --config-dir "{{ mock_server_config_dir }}" &
+    fi
+    echo $! > "{{ mock_server_pid_file }}"
     for i in $(seq 1 30); do
         if curl -sf http://localhost:8100/health > /dev/null 2>&1; then
             exit 0
@@ -76,7 +80,7 @@ _mock-server-start:
 # Stop mock server if running
 _mock-server-stop:
     #!/usr/bin/env bash
-    if [ -f {{ mock_server_pid_file }} ]; then
-        kill "$(cat {{ mock_server_pid_file }})" 2>/dev/null || true
-        rm -f {{ mock_server_pid_file }}
+    if [ -f "{{ mock_server_pid_file }}" ]; then
+        kill "$(cat "{{ mock_server_pid_file }}")" 2>/dev/null || true
+        rm -f "{{ mock_server_pid_file }}"
     fi
