@@ -61,14 +61,17 @@ async fn integration_tool_call_stream() {
 
     let events: Vec<StreamEvent> = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        agent
-            .stream_chat("Hello", vec![])
-            .await
-            .map(|e| e.expect("stream returned an error"))
-            .collect::<Vec<_>>(),
+        async {
+            agent
+                .stream_chat("Hello", vec![])
+                .await
+                .map(|e| e.expect("stream returned an error"))
+                .collect::<Vec<_>>()
+                .await
+        },
     )
     .await
-    .expect("stream collection timed out after 10s");
+    .expect("stream timed out after 10s");
 
     assert!(
         events.len() >= 3,
