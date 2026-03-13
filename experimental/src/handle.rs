@@ -14,7 +14,7 @@ pub enum AgentHandle {
     Gemini(Agent<gemini::completion::CompletionModel>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum StreamEvent {
     Text(String),
     ToolCall {
@@ -59,10 +59,8 @@ pub(crate) fn map_chunk<R>(
                 })
                 .collect::<Vec<std::borrow::Cow<'_, str>>>()
                 .join("");
-            Some(Ok(StreamEvent::ToolResult {
-                call_id: tool_result.id,
-                content,
-            }))
+            let call_id = tool_result.call_id.unwrap_or(tool_result.id);
+            Some(Ok(StreamEvent::ToolResult { call_id, content }))
         }
         Err(e) => Some(Err(e)),
         // TODO: do not silently skip other items (final response, deltas, reasoning)

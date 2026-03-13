@@ -59,58 +59,36 @@ async fn integration_tool_call_stream() {
     use futures::StreamExt;
     use tekton_experimental::StreamEvent;
 
-    let mut stream = agent.stream_chat("Hello", vec![]).await;
+    let events: Vec<StreamEvent> = agent
+        .stream_chat("Hello", vec![])
+        .await
+        .map(|e| e.expect("stream returned an error"))
+        .collect()
+        .await;
 
-    #[derive(Debug)]
-    enum Event {
-        ToolCall { id: String, name: String, args: serde_json::Value },
-        ToolResult { call_id: String },
-        Text(String),
-    }
-
-    let mut events = Vec::new();
-
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(StreamEvent::Text(t)) => events.push(Event::Text(t)),
-            Ok(StreamEvent::ToolCall { id, name, args }) => {
-                events.push(Event::ToolCall { id, name, args });
-            }
-            Ok(StreamEvent::ToolResult { call_id, content: _ }) => {
-                events.push(Event::ToolResult { call_id });
-            }
-            Err(e) => panic!("stream returned an error: {e}"),
+    // First event: tool call to terminal with known id.
+    assert_eq!(
+        events[0],
+        StreamEvent::ToolCall {
+            id: "call_1".into(),
+            name: "terminal".into(),
+            args: serde_json::json!({"command": "echo $(( 1 + 1 ))"}),
         }
+    );
+
+    // Second event: tool result correlated to the call.
+    match &events[1] {
+        StreamEvent::ToolResult { call_id, content } => {
+            assert_eq!(call_id, "call_1");
+            assert!(content.contains("\"exit_code\":0"), "expected successful exit: {content}");
+        }
+        other => panic!("expected ToolResult as second event, got {other:?}"),
     }
 
-    // Extract events by type in order.
-    let tool_call = events.iter().find_map(|e| match e {
-        Event::ToolCall { id, name, args } => Some((id, name, args)),
-        _ => None,
-    }).expect("expected a ToolCall event");
-    let tool_result = events.iter().find_map(|e| match e {
-        Event::ToolResult { call_id } => Some(call_id),
-        _ => None,
-    }).expect("expected a ToolResult event");
-    let full_response: String = events.iter().filter_map(|e| match e {
-        Event::Text(t) => Some(t.as_str()),
-        _ => None,
+    // Remaining events: text chunks forming the final response.
+    let full_response: String = events[2..].iter().map(|e| match e {
+        StreamEvent::Text(t) => t.as_str(),
+        other => panic!("expected only Text events after ToolResult, got {other:?}"),
     }).collect();
-
-    // Verify the tool call.
-    assert_eq!(tool_call.1, "terminal");
-    assert_eq!(*tool_call.2, serde_json::json!({"command": "echo $(( 1 + 1 ))"}));
-
-    // The tool result's call_id must match the tool call's id.
-    assert_eq!(tool_result, tool_call.0);
-
-    // Ordering: ToolCall appears before ToolResult, which appears before Text.
-    let call_pos = events.iter().position(|e| matches!(e, Event::ToolCall { .. })).unwrap();
-    let result_pos = events.iter().position(|e| matches!(e, Event::ToolResult { .. })).unwrap();
-    let text_pos = events.iter().position(|e| matches!(e, Event::Text(_))).unwrap();
-    assert!(call_pos < result_pos, "ToolCall must come before ToolResult");
-    assert!(result_pos < text_pos, "ToolResult must come before Text");
-
-    // After the tool result, the mock returns a text response.
     assert_eq!(full_response.trim_end(), MOCK_TOOL_CALL_TEXT_RESPONSE);
 }

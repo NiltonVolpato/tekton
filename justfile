@@ -1,7 +1,4 @@
 # justfile for tekton
-#
-# If `timeout` is not available, install with `brew install coreutils` on Mac.
-# If `vidaimock` is not available, install with `cargo install --git https://github.com/vidaiUK/VidaiMock`.
 
 nextest_args := "--status-level fail --show-progress none --no-output-indent --cargo-quiet"
 mock_server_config_dir := justfile_directory() / "experimental/tests/testdata/config"
@@ -61,11 +58,7 @@ _mock-server-start:
         exit 1
     fi
     cleanup() { kill "$(cat "{{ mock_server_pid_file }}")" 2>/dev/null || true; rm -f "{{ mock_server_pid_file }}"; }
-    if command -v timeout &>/dev/null; then
-        timeout 5m vidaimock --config-dir "{{ mock_server_config_dir }}" &
-    else
-        vidaimock --config-dir "{{ mock_server_config_dir }}" &
-    fi
+    vidaimock --config-dir "{{ mock_server_config_dir }}" &
     echo $! > "{{ mock_server_pid_file }}"
     for i in $(seq 1 30); do
         if curl -sf http://localhost:8100/health > /dev/null 2>&1; then
