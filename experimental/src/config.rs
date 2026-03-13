@@ -36,7 +36,7 @@ pub struct ProviderMetadata {
 
 /// A provider from the models.dev catalog.
 /// Mirrors the Pkl `Provider` class in `providerSchema.pkl`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Provider {
     pub id: String,
     pub metadata: ProviderMetadata,
@@ -112,7 +112,7 @@ pub enum ModelStatus {
 
 /// A model within a provider's catalog.
 /// Mirrors the Pkl `Model` class in `providerSchema.pkl`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Model {
     pub id: String,
     pub metadata: ModelMetadata,
@@ -193,7 +193,7 @@ impl GlobalModuleReader {
 }
 
 impl PklModuleReader for GlobalModuleReader {
-    fn scheme(&self) -> &str {
+    fn scheme(&self) -> &'static str {
         "global"
     }
 

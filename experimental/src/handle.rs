@@ -14,7 +14,7 @@ pub enum AgentHandle {
     Gemini(Agent<gemini::completion::CompletionModel>),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum StreamEvent {
     Text(String),
     ToolCall {
