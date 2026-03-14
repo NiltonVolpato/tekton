@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-/// The root of the `experimental` crate (resolved at compile time).
+/// The root of the `unstable` crate (resolved at compile time).
 fn crate_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }

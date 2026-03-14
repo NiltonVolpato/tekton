@@ -1,6 +1,6 @@
 mod common;
 
-use tekton_experimental::{build_agent, load_config};
+use tekton_unstable::{build_agent, load_config};
 
 use common::{global_dir, workspace_pkl};
 
@@ -34,7 +34,7 @@ async fn integration_stream_chat() {
     let agent = build_agent(&config, "mock-agent").await.unwrap();
 
     use futures::StreamExt;
-    use tekton_experimental::StreamEvent;
+    use tekton_unstable::StreamEvent;
 
     let mut stream = agent.stream_chat("Hello", vec![]).await;
     let mut full_response = String::new();
@@ -57,7 +57,7 @@ async fn integration_tool_call_stream() {
     let agent = build_agent(&config, "tool-call-agent").await.unwrap();
 
     use futures::StreamExt;
-    use tekton_experimental::StreamEvent;
+    use tekton_unstable::StreamEvent;
 
     let events: Vec<StreamEvent> = tokio::time::timeout(
         std::time::Duration::from_secs(10),

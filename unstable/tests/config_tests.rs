@@ -1,6 +1,6 @@
 mod common;
 
-use tekton_experimental::{ClientType, load_config};
+use tekton_unstable::{ClientType, load_config};
 
 use common::{global_dir, workspace_pkl};
 

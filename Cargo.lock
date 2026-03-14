@@ -1985,22 +1985,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tekton-experimental"
-version = "0.0.0"
-dependencies = [
- "futures",
- "rig-core",
- "rpkl",
- "serde",
- "serde_json",
- "tekton-terminal-tool",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "tekton-terminal-tool"
 version = "0.0.0"
 dependencies = [
@@ -2025,6 +2009,22 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "tekton-unstable"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "rig-core",
+ "rpkl",
+ "serde",
+ "serde_json",
+ "tekton-terminal-tool",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 use std::io::{self, BufRead, Write};
 
 use futures::StreamExt;
-use tekton_experimental::{build_agent, load_config, StreamEvent};
+use tekton_unstable::{build_agent, load_config, StreamEvent};
 
 #[tokio::main]
 async fn main() {

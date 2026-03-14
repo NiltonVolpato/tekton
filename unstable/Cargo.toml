@@ -1,5 +1,5 @@
 [package]
-name = "tekton-experimental"
+name = "tekton-unstable"
 description = "Experimental agent configurations and factories for Tekton"
 version.workspace = true
 edition.workspace = true
@@ -7,7 +7,7 @@ authors.workspace = true
 # license.workspace = true
 repository.workspace = true
 readme.workspace = true
-keywords = ["agent", "llm", "experimental"]
+keywords = ["agent", "llm", "unstable"]
 categories = ["development-tools"]
 
 [lints]

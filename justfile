@@ -1,7 +1,7 @@
 # justfile for tekton
 
 nextest_args := "--status-level fail --show-progress none --no-output-indent --cargo-quiet"
-mock_server_config_dir := justfile_directory() / "experimental/tests/testdata/config"
+mock_server_config_dir := justfile_directory() / "unstable/tests/testdata/config"
 mock_server_pid_file := "/tmp/mock-server.pid"
 
 # Runs all tests. Any additional argument works, but may need double escaping: just test -E 'test\(foo\)'
@@ -41,13 +41,13 @@ fmt *args:
 # Regenerate providers list in Pkl from models.dev API
 [group('dev')]
 generate-providers:
-    cd experimental/pkl/models_dev && pkl run generate-providers.pkl -- --output providers.pkl
+    cd unstable/pkl/models_dev && pkl run generate-providers.pkl -- --output providers.pkl
 
 [group('demo')]
 mock-tool-call: (_mock-server-start '1h') && _mock-server-stop
-    cargo run -p tekton-experimental --example agent_factory --quiet -- \
-        experimental/tests/testdata/workspaces/mock-tool-call/tekton.pkl \
-        experimental/pkl
+    cargo run -p tekton-unstable --example agent_factory --quiet -- \
+        unstable/tests/testdata/workspaces/mock-tool-call/tekton.pkl \
+        unstable/pkl
 
 # Start mock server in background, wait for readiness
 _mock-server-start mock-server-timeout='5m':
